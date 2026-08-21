@@ -1,0 +1,8 @@
+/target
+**/target/
+formal/tla/states/
+states/
+*.exe
+*.pdb
+.DS_Store
+

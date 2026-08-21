@@ -1,0 +1,5 @@
+# The host GNU toolchain's default gcc is llvm-mingw (no libgcc).
+# Use rustc's bundled LLD so desktop tests can run on this machine.
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]

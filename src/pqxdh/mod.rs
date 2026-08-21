@@ -1,0 +1,364 @@
+//! PQXDH key agreement — implemented from the public specification
+//! (Revision 3, 2023-05-24, last updated 2024-01-23).
+//!
+//! No libsignal code, names, or structures were consulted.
+
+use crate::prekeys::{
+    EcPrekeyId, IdentityKeyPair, OneTimeEcPrekey, PqPrekeyId, PublicPrekeyBundle, SignedPrekey,
+};
+use crate::primitives::encoding::{encode_ec, encode_kem};
+use crate::primitives::error::PrimitiveError;
+use crate::primitives::kdf::pqxdh_kdf;
+use crate::primitives::kem::{MlKemCiphertext, MlKemPublic, MlKemSecret};
+use crate::primitives::x25519::{X25519Public, X25519Secret};
+use zeroize::Zeroize;
+
+/// Result of a successful PQXDH run (both sides obtain the same SK).
+#[derive(Zeroize)]
+pub struct PqxdhSharedSecret {
+    pub sk: [u8; 32],
+    /// Associated data that must be used with the first AEAD message.
+    pub ad: Vec<u8>,
+}
+
+impl Drop for PqxdhSharedSecret {
+    fn drop(&mut self) {
+        self.sk.zeroize();
+        self.ad.zeroize();
+    }
+}
+
+/// Alice (initiator) side of PQXDH.
+pub struct AliceInitiation {
+    pub ephemeral_public: X25519Public,
+    pub shared: PqxdhSharedSecret,
+    pub kem_ciphertext: Vec<u8>,
+    pub used_ec_opk_id: Option<EcPrekeyId>,
+    pub used_pq_prekey_id: PqPrekeyId,
+}
+
+/// Perform Alice’s side of PQXDH against a validated public bundle.
+///
+/// Spec §3.3:
+/// 1. Verify signatures (caller must have already called `bundle.validate`).
+/// 2. Generate EKA.
+/// 3. (CT, SS) = PQKEM-ENC(PQPKB)
+/// 4. DH1 = DH(IKA, SPKB)
+/// 5. DH2 = DH(EKA, IKB)
+/// 6. DH3 = DH(EKA, SPKB)
+/// 7. Optional DH4 = DH(EKA, OPKB)
+/// 8. SK = KDF(DH1 || DH2 || DH3 [|| DH4] || SS)
+/// 9. AD = EncodeEC(IKA) || EncodeEC(IKB) || EncodeKEM(PQPKB)
+pub fn alice_initiate(
+    alice_ik: &IdentityKeyPair,
+    bob_bundle: &PublicPrekeyBundle,
+) -> Result<AliceInitiation, PrimitiveError> {
+    bob_bundle.validate()?;
+
+    let eka = X25519Secret::generate()?;
+    let pq_pk = MlKemPublic::from_bytes(&bob_bundle.pq_prekey_public)?;
+    let (mut ss, kem_ct) = pq_pk.encapsulate()?;
+
+    let dh1 = alice_ik.secret.diffie_hellman(&bob_bundle.signed_prekey);
+    let dh2 = eka.diffie_hellman(&bob_bundle.identity_key);
+    let dh3 = eka.diffie_hellman(&bob_bundle.signed_prekey);
+
+    let mut km = Vec::with_capacity(32 * 5);
+    km.extend_from_slice(&dh1);
+    km.extend_from_slice(&dh2);
+    km.extend_from_slice(&dh3);
+
+    let used_ec_opk_id = if let Some((id, opk_pub)) = &bob_bundle.one_time_ec {
+        let dh4 = eka.diffie_hellman(opk_pub);
+        km.extend_from_slice(&dh4);
+        Some(*id)
+    } else {
+        None
+    };
+
+    km.extend_from_slice(&ss);
+
+    let sk = pqxdh_kdf(&km)?;
+
+    let mut ad = Vec::new();
+    ad.extend_from_slice(&encode_ec(&alice_ik.public()));
+    ad.extend_from_slice(&encode_ec(&bob_bundle.identity_key));
+    ad.extend_from_slice(&encode_kem(&pq_pk));
+
+    let ephemeral_public = eka.public_key();
+    drop(eka);
+
+    let mut dh1z = dh1;
+    let mut dh2z = dh2;
+    let mut dh3z = dh3;
+    dh1z.zeroize();
+    dh2z.zeroize();
+    dh3z.zeroize();
+    km.zeroize();
+    ss.zeroize();
+
+    Ok(AliceInitiation {
+        ephemeral_public,
+        shared: PqxdhSharedSecret { sk, ad },
+        kem_ciphertext: kem_ct.as_bytes().to_vec(),
+        used_ec_opk_id,
+        used_pq_prekey_id: bob_bundle.pq_prekey_id,
+    })
+}
+
+/// Bob’s private material needed to process an initiation.
+pub struct BobPrivateMaterial<'a> {
+    pub identity: &'a IdentityKeyPair,
+    pub signed_prekey: &'a SignedPrekey,
+    pub one_time_ec: Option<&'a OneTimeEcPrekey>,
+    pub pq_secret: &'a MlKemSecret,
+    pub pq_public: &'a MlKemPublic,
+    pub pq_prekey_id: PqPrekeyId,
+}
+
+/// Process Alice’s initiation message (Bob side). Spec §3.4.
+pub fn bob_process(
+    bob: &BobPrivateMaterial<'_>,
+    alice_ik: &X25519Public,
+    alice_ek: &X25519Public,
+    kem_ct: &[u8],
+    used_ec_opk_id: Option<EcPrekeyId>,
+) -> Result<PqxdhSharedSecret, PrimitiveError> {
+    let ct = MlKemCiphertext::from_bytes(kem_ct)?;
+    let mut ss = bob.pq_secret.decapsulate(&ct)?;
+
+    let dh1 = bob.signed_prekey.secret.diffie_hellman(alice_ik);
+    let dh2 = bob.identity.secret.diffie_hellman(alice_ek);
+    let dh3 = bob.signed_prekey.secret.diffie_hellman(alice_ek);
+
+    let mut km = Vec::with_capacity(32 * 5);
+    km.extend_from_slice(&dh1);
+    km.extend_from_slice(&dh2);
+    km.extend_from_slice(&dh3);
+
+    if let Some(id) = used_ec_opk_id {
+        let opk = bob.one_time_ec.ok_or(PrimitiveError::InvalidSecretKey)?;
+        if opk.id != id {
+            return Err(PrimitiveError::InvalidSecretKey);
+        }
+        let dh4 = opk.secret.diffie_hellman(alice_ek);
+        km.extend_from_slice(&dh4);
+    }
+
+    km.extend_from_slice(&ss);
+
+    let sk = pqxdh_kdf(&km)?;
+
+    let mut ad = Vec::new();
+    ad.extend_from_slice(&encode_ec(alice_ik));
+    ad.extend_from_slice(&encode_ec(&bob.identity.public()));
+    ad.extend_from_slice(&encode_kem(bob.pq_public));
+
+    let mut dh1z = dh1;
+    let mut dh2z = dh2;
+    let mut dh3z = dh3;
+    dh1z.zeroize();
+    dh2z.zeroize();
+    dh3z.zeroize();
+    km.zeroize();
+    ss.zeroize();
+
+    Ok(PqxdhSharedSecret { sk, ad })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prekeys::PrekeyStore;
+
+    fn handshake_pair(
+        with_opk: bool,
+    ) -> (
+        IdentityKeyPair,
+        IdentityKeyPair,
+        PrekeyStore,
+        AliceInitiation,
+        PqxdhSharedSecret,
+    ) {
+        let alice_ik = IdentityKeyPair::generate().unwrap();
+        let bob_ik = IdentityKeyPair::generate().unwrap();
+        let mut store = PrekeyStore::new(&bob_ik).unwrap();
+        if with_opk {
+            store.replenish(&bob_ik, 1, 1).unwrap();
+        }
+        let bundle = store.public_bundle(&bob_ik).unwrap();
+        let alice = alice_initiate(&alice_ik, &bundle).unwrap();
+
+        let opk;
+        let opk_ref = if let Some(id) = alice.used_ec_opk_id {
+            opk = store.consume_ec(id).unwrap();
+            Some(&opk)
+        } else {
+            None
+        };
+
+        let pq_public;
+        if bundle.is_pq_one_time {
+            let consumed = store.consume_pq(alice.used_pq_prekey_id).unwrap();
+            let pq_secret = consumed.secret.clone();
+            let pq_public = pq_secret.public_key().unwrap();
+            let bob_mat = BobPrivateMaterial {
+                identity: &bob_ik,
+                signed_prekey: &store.signed,
+                one_time_ec: opk_ref,
+                pq_secret: &pq_secret,
+                pq_public: &pq_public,
+                pq_prekey_id: alice.used_pq_prekey_id,
+            };
+            let bob_shared = bob_process(
+                &bob_mat,
+                &alice_ik.public(),
+                &alice.ephemeral_public,
+                &alice.kem_ciphertext,
+                alice.used_ec_opk_id,
+            )
+            .unwrap();
+            return (alice_ik, bob_ik, store, alice, bob_shared);
+        }
+
+        pq_public = store.last_resort_pq.public().unwrap();
+        let bob_mat = BobPrivateMaterial {
+            identity: &bob_ik,
+            signed_prekey: &store.signed,
+            one_time_ec: opk_ref,
+            pq_secret: &store.last_resort_pq.secret,
+            pq_public: &pq_public,
+            pq_prekey_id: alice.used_pq_prekey_id,
+        };
+        let bob_shared = bob_process(
+            &bob_mat,
+            &alice_ik.public(),
+            &alice.ephemeral_public,
+            &alice.kem_ciphertext,
+            alice.used_ec_opk_id,
+        )
+        .unwrap();
+        (alice_ik, bob_ik, store, alice, bob_shared)
+    }
+
+    #[test]
+    fn alice_bob_shared_secret_equal() {
+        let (_a, _b, _s, alice, bob_shared) = handshake_pair(false);
+        assert_eq!(alice.shared.sk, bob_shared.sk);
+        assert_eq!(&alice.shared.ad, &bob_shared.ad);
+    }
+
+    #[test]
+    fn alice_bob_with_one_time_ec() {
+        let (_a, _b, _s, alice, bob_shared) = handshake_pair(true);
+        assert!(alice.used_ec_opk_id.is_some());
+        assert_eq!(alice.shared.sk, bob_shared.sk);
+    }
+
+    #[test]
+    fn modified_signed_prekey_sig_fails() {
+        let bob_ik = IdentityKeyPair::generate().unwrap();
+        let store = PrekeyStore::new(&bob_ik).unwrap();
+        let mut bundle = store.public_bundle(&bob_ik).unwrap();
+        bundle.signed_prekey_sig[3] ^= 0xff;
+        let alice_ik = IdentityKeyPair::generate().unwrap();
+        assert!(alice_initiate(&alice_ik, &bundle).is_err());
+    }
+
+    #[test]
+    fn modified_pq_prekey_fails() {
+        let bob_ik = IdentityKeyPair::generate().unwrap();
+        let store = PrekeyStore::new(&bob_ik).unwrap();
+        let mut bundle = store.public_bundle(&bob_ik).unwrap();
+        bundle.pq_prekey_sig[1] ^= 0xaa;
+        let alice_ik = IdentityKeyPair::generate().unwrap();
+        assert!(alice_initiate(&alice_ik, &bundle).is_err());
+    }
+
+    #[test]
+    fn malformed_kem_ciphertext_rejected() {
+        let alice_ik = IdentityKeyPair::generate().unwrap();
+        let bob_ik = IdentityKeyPair::generate().unwrap();
+        let store = PrekeyStore::new(&bob_ik).unwrap();
+        let bundle = store.public_bundle(&bob_ik).unwrap();
+        let alice = alice_initiate(&alice_ik, &bundle).unwrap();
+        let pq_public = store.last_resort_pq.public().unwrap();
+        let bob_mat = BobPrivateMaterial {
+            identity: &bob_ik,
+            signed_prekey: &store.signed,
+            one_time_ec: None,
+            pq_secret: &store.last_resort_pq.secret,
+            pq_public: &pq_public,
+            pq_prekey_id: bundle.pq_prekey_id,
+        };
+        let mut bad = alice.kem_ciphertext.clone();
+        if let Some(b) = bad.first_mut() {
+            *b ^= 0xff;
+        }
+        let res = bob_process(
+            &bob_mat,
+            &alice_ik.public(),
+            &alice.ephemeral_public,
+            &bad,
+            None,
+        );
+        // Implicit rejection: decaps succeeds but SK differs, so we check SK mismatch
+        // by comparing to Alice. Alternatively length-invalid CT is rejected.
+        match res {
+            Ok(shared) => assert_ne!(shared.sk, alice.shared.sk),
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn wrong_recipient_identity_produces_different_sk() {
+        let alice_ik = IdentityKeyPair::generate().unwrap();
+        let bob_ik = IdentityKeyPair::generate().unwrap();
+        let store = PrekeyStore::new(&bob_ik).unwrap();
+        let bundle = store.public_bundle(&bob_ik).unwrap();
+        let alice = alice_initiate(&alice_ik, &bundle).unwrap();
+
+        let impostor = IdentityKeyPair::generate().unwrap();
+        let pq_public = store.last_resort_pq.public().unwrap();
+        let bob_mat = BobPrivateMaterial {
+            identity: &impostor,
+            signed_prekey: &store.signed,
+            one_time_ec: None,
+            pq_secret: &store.last_resort_pq.secret,
+            pq_public: &pq_public,
+            pq_prekey_id: bundle.pq_prekey_id,
+        };
+        let shared = bob_process(
+            &bob_mat,
+            &alice_ik.public(),
+            &alice.ephemeral_public,
+            &alice.kem_ciphertext,
+            None,
+        )
+        .unwrap();
+        assert_ne!(shared.sk, alice.shared.sk);
+    }
+
+    #[test]
+    fn consumed_opk_cannot_be_consumed_twice() {
+        let bob_ik = IdentityKeyPair::generate().unwrap();
+        let mut store = PrekeyStore::new(&bob_ik).unwrap();
+        store.replenish(&bob_ik, 1, 0).unwrap();
+        let id = {
+            let bundle = store.public_bundle(&bob_ik).unwrap();
+            bundle.one_time_ec.unwrap().0
+        };
+        store.consume_ec(id).unwrap();
+        assert!(store.consume_ec(id).is_err());
+    }
+
+    #[test]
+    fn ten_thousand_randomized_handshakes() {
+        for i in 0..10_000u32 {
+            let with_opk = i % 3 != 0;
+            let (_a, _b, _s, alice, bob_shared) = handshake_pair(with_opk);
+            assert_eq!(alice.shared.sk, bob_shared.sk);
+            assert_eq!(&alice.shared.ad, &bob_shared.ad);
+        }
+    }
+}

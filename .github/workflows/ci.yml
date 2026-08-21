@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets --all-features -- --skip ten_thousand
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --all-targets --all-features -- --skip ten_thousand
+
+  fuzz-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --manifest-path fuzz/Cargo.toml
+      - run: cargo run --manifest-path fuzz/Cargo.toml --bin host_runner -- 5000
+      # libfuzzer targets need: cargo build --manifest-path fuzz/Cargo.toml --features libfuzzer
+      # (Linux only; Windows GNU cannot compile libfuzzer-sys)

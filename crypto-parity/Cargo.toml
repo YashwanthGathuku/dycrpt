@@ -1,0 +1,15 @@
+[package]
+name = "crypto-parity"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Behavioral/security parity harness for VoiceChatCrypto (libsignal adapter isolated, not linked)"
+publish = false
+
+[dependencies]
+voicechat_crypto = { path = "..", default-features = false, features = ["std"] }
+
+[[bin]]
+name = "crypto-parity"
+path = "src/main.rs"

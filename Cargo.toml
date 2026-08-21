@@ -1,0 +1,70 @@
+[workspace]
+members = [".", "crypto-parity"]
+resolver = "2"
+
+[package]
+name = "voicechat_crypto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Clean-room Signal Protocol cryptographic library for VoiceChat (PQXDH + Double Ratchet)"
+readme = "README.md"
+keywords = ["crypto", "signal", "pqxdh", "ratchet"]
+categories = ["cryptography"]
+publish = false
+
+[dependencies]
+# All versions chosen for permissive licensing (see docs/LICENSE_AUDIT.md)
+x25519-dalek = { version = "2.0.0", features = ["static_secrets", "zeroize"] }
+curve25519-dalek = { version = "4.1.1", features = ["zeroize"] }
+ed25519-dalek = { version = "2.1.0", features = ["zeroize", "rand_core"] }
+# FIPS 203 ML-KEM-768. Apache-2.0 OR MIT. MSRV 1.85.
+ml-kem = { version = "0.3.2", default-features = false, features = ["zeroize", "getrandom"] }
+hkdf = "0.12.3"
+sha2 = "0.10.8"
+sha3 = "0.10.8"
+hmac = "0.12.1"
+aes-gcm = "0.10.3"
+chacha20poly1305 = "0.10.1"
+subtle = "2.5.0"
+zeroize = { version = "1.7", features = ["derive"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+getrandom = "0.2.12"
+thiserror = "1.0.57"
+hex = "0.4.3"
+
+[dev-dependencies]
+proptest = "1.4"
+hex-literal = "0.4.1"
+
+[lints.rust]
+unused_mut = "allow"
+unused_assignments = "allow"
+unused_variables = "allow"
+
+[lints.clippy]
+single_match = "allow"
+needless_late_init = "allow"
+bool_assert_comparison = "allow"
+unnecessary_to_owned = "allow"
+module_inception = "allow"
+
+[features]
+default = ["std"]
+std = []
+ffi = []
+# Experimental profiles — compiled only when requested; never auto-selected.
+hybrid = []
+header-encrypt = []
+# Incomplete Sesame mailbox (hardcoded SK). Not a production surface.
+sesame = []
+
+[[test]]
+name = "hybrid_pq"
+required-features = ["hybrid"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true

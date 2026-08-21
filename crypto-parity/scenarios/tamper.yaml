@@ -1,0 +1,15 @@
+# Implementation-neutral scenario (documentation).
+# Executed in Rust as `p0.tamper_no_commit`.
+scenario: tampered_message_does_not_advance_state
+axis: signal_core
+p0: true
+steps:
+  - establish_session
+  - send_from: alice
+    text: hello
+  - tamper_ciphertext
+  - deliver_to: bob
+expect:
+  delivery: rejected
+  bob_state_advanced: false
+  # SK/CT bytes are NOT compared across backends
