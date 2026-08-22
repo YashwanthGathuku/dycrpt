@@ -1,30 +1,16 @@
-#![allow(
-    unsafe_code,
-    dead_code,
-    unused_assignments,
-    unused_imports,
-    clippy::missing_safety_doc
-)]
+#![allow(unsafe_code, dead_code, clippy::missing_safety_doc)]
 
 //! Stable C ABI for Android (Kotlin) and iOS (Swift).
 //!
-//! # Security boundary
-//!
-//! Raw secret material NEVER crosses this boundary:
-//! - root keys, chain keys, message keys
-//! - identity private keys
-//! - ML-KEM private keys
-//! - PQXDH shared secrets
-//!
-//! Handshake (PQXDH) and ratchet state live only inside
-//! [`VoiceChatCryptoEngine`]. Callers pass public bundles / initiation
-//! packets and receive opaque engine handles plus public data.
-//!
-//! Gate: enable for production only after the full desktop test suite passes.
+//! Foreign memory is copied into bounded owned Rust buffers before parsing;
+//! no borrowed raw-pointer slice is ever assigned a fabricated `'static`
+//! lifetime. Every fallible ABI entry point catches Rust panics. Registry locks
+//! are short-lived: expensive crypto locks only the selected engine handle.
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::engine::{
     CryptoEngineApi, CryptoError, DeviceConfig, InitiationPacket, SealedMessage, SessionId,
@@ -35,10 +21,8 @@ use crate::policy::CryptoProfile;
 use crate::prekeys::PublicPrekeyBundle;
 use crate::primitives::x25519::X25519Public;
 
-/// Opaque handle type visible to foreign code (non-zero on success).
 pub type VcHandle = u64;
 
-/// Error codes returned across the FFI (stable ABI).
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VcError {
@@ -66,9 +50,11 @@ impl From<CryptoError> for VcError {
     }
 }
 
+type SharedEngine = Arc<Mutex<VoiceChatCryptoEngine>>;
+
 struct Registry {
     next: u64,
-    engines: HashMap<VcHandle, VoiceChatCryptoEngine>,
+    engines: HashMap<VcHandle, SharedEngine>,
 }
 
 impl Registry {
@@ -80,9 +66,9 @@ impl Registry {
     }
 
     fn alloc(&mut self) -> Result<VcHandle, VcError> {
-        let h = self.next;
+        let handle = self.next;
         self.next = self.next.checked_add(1).ok_or(VcError::LimitExceeded)?;
-        Ok(h)
+        Ok(handle)
     }
 }
 
@@ -91,13 +77,83 @@ fn registry() -> &'static Mutex<Registry> {
     REG.get_or_init(|| Mutex::new(Registry::new()))
 }
 
-/// Conservative encoded sizes so a size query never commits crypto state.
-const BUNDLE_BOUND: usize = 4096;
-fn packet_bound(pt_len: usize) -> Result<usize, VcError> {
-    8192usize.checked_add(pt_len).ok_or(VcError::LimitExceeded)
+fn engine_for(handle: VcHandle) -> Result<SharedEngine, VcError> {
+    let reg = registry().lock().map_err(|_| VcError::Internal)?;
+    reg.engines.get(&handle).cloned().ok_or(VcError::NotFound)
 }
+
+fn with_engine<R>(
+    handle: VcHandle,
+    f: impl FnOnce(&mut VoiceChatCryptoEngine) -> Result<R, VcError>,
+) -> Result<R, VcError> {
+    let engine = engine_for(handle)?;
+    let mut guard = engine.lock().map_err(|_| VcError::Internal)?;
+    f(&mut guard)
+}
+
+fn ffi_guard(f: impl FnOnce() -> i32) -> i32 {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(code) => code,
+        Err(_) => VcError::Internal as i32,
+    }
+}
+
+const BUNDLE_BOUND: usize = 4096;
+const MAX_FFI_DEVICE_ID: usize = 4 * 1024;
+const MAX_FFI_PEER_ID: usize = 4 * 1024;
+const MAX_FFI_CONVERSATION: usize = 64 * 1024;
+const MAX_FFI_AD: usize = 1024 * 1024;
+const MAX_FFI_MESSAGE: usize = 64 * 1024 * 1024;
+const MAX_FFI_PACKET: usize = MAX_FFI_MESSAGE + 128 * 1024;
+
+fn packet_bound(pt_len: usize) -> Result<usize, VcError> {
+    128usize
+        .checked_mul(1024)
+        .and_then(|n| n.checked_add(pt_len))
+        .filter(|n| *n <= MAX_FFI_PACKET)
+        .ok_or(VcError::LimitExceeded)
+}
+
 fn sealed_bound(pt_len: usize) -> Result<usize, VcError> {
-    4096usize.checked_add(pt_len).ok_or(VcError::LimitExceeded)
+    64usize
+        .checked_mul(1024)
+        .and_then(|n| n.checked_add(pt_len))
+        .filter(|n| *n <= MAX_FFI_PACKET)
+        .ok_or(VcError::LimitExceeded)
+}
+
+fn read_owned(ptr: *const u8, len: usize, max: usize) -> Result<Vec<u8>, VcError> {
+    if len > max {
+        return Err(VcError::LimitExceeded);
+    }
+    if ptr.is_null() {
+        return if len == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(VcError::InvalidArgument)
+        };
+    }
+    Ok(unsafe { slice::from_raw_parts(ptr, len) }.to_vec())
+}
+
+fn read_sid(ptr: *const u8) -> Result<SessionId, VcError> {
+    if ptr.is_null() {
+        return Err(VcError::InvalidArgument);
+    }
+    let mut sid = [0u8; 16];
+    unsafe { std::ptr::copy_nonoverlapping(ptr, sid.as_mut_ptr(), 16) };
+    Ok(SessionId(sid))
+}
+
+fn reserve_output(dst: *mut u8, dst_len: *mut usize, bound: usize) -> Result<bool, VcError> {
+    if dst_len.is_null() {
+        return Err(VcError::InvalidArgument);
+    }
+    if dst.is_null() || unsafe { *dst_len } < bound {
+        unsafe { *dst_len = bound };
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn copy_out(src: &[u8], dst: *mut u8, dst_len: *mut usize) -> i32 {
@@ -105,9 +161,7 @@ fn copy_out(src: &[u8], dst: *mut u8, dst_len: *mut usize) -> i32 {
         return VcError::InvalidArgument as i32;
     }
     if dst.is_null() || unsafe { *dst_len } < src.len() {
-        unsafe {
-            *dst_len = src.len();
-        }
+        unsafe { *dst_len = src.len() };
         return VcError::InvalidArgument as i32;
     }
     unsafe {
@@ -117,33 +171,13 @@ fn copy_out(src: &[u8], dst: *mut u8, dst_len: *mut usize) -> i32 {
     VcError::Ok as i32
 }
 
-/// Size query with a conservative bound. Returns true if the caller should
-/// stop (no crypto). Never used after a mutating engine call.
-unsafe fn need_buffer(dst: *mut u8, dst_len: *mut usize, bound: usize) -> bool {
-    if dst_len.is_null() {
-        return true;
+fn result_code(result: Result<(), VcError>) -> i32 {
+    match result {
+        Ok(()) => VcError::Ok as i32,
+        Err(e) => e as i32,
     }
-    if dst.is_null() || *dst_len < bound {
-        *dst_len = bound;
-        return true;
-    }
-    false
 }
 
-fn read_bytes(ptr: *const u8, len: usize) -> Result<&'static [u8], VcError> {
-    if ptr.is_null() {
-        if len == 0 {
-            return Ok(&[]);
-        }
-        return Err(VcError::InvalidArgument);
-    }
-    Ok(unsafe { slice::from_raw_parts(ptr, len) })
-}
-
-/// Create a device engine (identity + prekeys). Writes 32-byte public identity.
-///
-/// # Safety
-/// `out_handle` must be valid. `out_public` may be null or point to 32 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn vc_engine_create(
     device_id: *const u8,
@@ -152,42 +186,47 @@ pub unsafe extern "C" fn vc_engine_create(
     out_handle: *mut VcHandle,
     out_public: *mut u8,
 ) -> i32 {
-    if out_handle.is_null() {
-        return VcError::InvalidArgument as i32;
-    }
-    let profile = match CryptoProfile::from_u8(profile) {
-        Ok(p) => p,
-        Err(_) => return VcError::InvalidArgument as i32,
-    };
-    let dev_id = match read_bytes(device_id, device_id_len) {
-        Ok(b) => b.to_vec(),
-        Err(e) => return e as i32,
-    };
-    let engine = match VoiceChatCryptoEngine::initialize_device(DeviceConfig {
-        device_id: dev_id,
-        profile,
-    }) {
-        Ok(e) => e,
-        Err(e) => return VcError::from(e) as i32,
-    };
-    if !out_public.is_null() {
+    ffi_guard(|| {
+        if out_handle.is_null() {
+            return VcError::InvalidArgument as i32;
+        }
+        let profile = match CryptoProfile::from_u8(profile) {
+            Ok(p) => p,
+            Err(_) => return VcError::InvalidArgument as i32,
+        };
+        let dev_id = match read_owned(device_id, device_id_len, MAX_FFI_DEVICE_ID) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        let engine = match VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+            device_id: dev_id,
+            profile,
+        }) {
+            Ok(v) => v,
+            Err(e) => return VcError::from(e) as i32,
+        };
         let pk = engine.local_identity_public();
-        std::ptr::copy_nonoverlapping(pk.as_ptr(), out_public, 32);
-    }
-    let mut reg = match registry().lock() {
-        Ok(g) => g,
-        Err(_) => return VcError::Internal as i32,
-    };
-    let h = match reg.alloc() {
-        Ok(h) => h,
-        Err(e) => return e as i32,
-    };
-    reg.engines.insert(h, engine);
-    *out_handle = h;
-    VcError::Ok as i32
+        let shared = Arc::new(Mutex::new(engine));
+        let handle = {
+            let mut reg = match registry().lock() {
+                Ok(v) => v,
+                Err(_) => return VcError::Internal as i32,
+            };
+            let handle = match reg.alloc() {
+                Ok(v) => v,
+                Err(e) => return e as i32,
+            };
+            reg.engines.insert(handle, shared);
+            handle
+        };
+        if !out_public.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(pk.as_ptr(), out_public, 32) };
+        }
+        unsafe { *out_handle = handle };
+        VcError::Ok as i32
+    })
 }
 
-/// Alias for [`vc_engine_create`] with classical profile.
 #[no_mangle]
 pub unsafe extern "C" fn vc_create_device_identity(
     device_id: *const u8,
@@ -198,45 +237,42 @@ pub unsafe extern "C" fn vc_create_device_identity(
     vc_engine_create(device_id, device_id_len, 1, out_handle, out_public)
 }
 
-/// Destroy an engine and zeroize its secrets (via Drop).
 #[no_mangle]
 pub unsafe extern "C" fn vc_engine_destroy(engine: VcHandle) -> i32 {
-    let mut reg = match registry().lock() {
-        Ok(g) => g,
-        Err(_) => return VcError::Internal as i32,
-    };
-    match reg.engines.remove(&engine) {
-        Some(_) => VcError::Ok as i32,
-        None => VcError::NotFound as i32,
-    }
+    ffi_guard(|| {
+        let mut reg = match registry().lock() {
+            Ok(v) => v,
+            Err(_) => return VcError::Internal as i32,
+        };
+        if reg.engines.remove(&engine).is_some() {
+            VcError::Ok as i32
+        } else {
+            VcError::NotFound as i32
+        }
+    })
 }
 
-/// Alias for [`vc_engine_destroy`].
 #[no_mangle]
 pub unsafe extern "C" fn vc_delete_identity(identity: VcHandle) -> i32 {
     vc_engine_destroy(identity)
 }
 
-/// Write the 32-byte local identity public key.
 #[no_mangle]
 pub unsafe extern "C" fn vc_engine_public_identity(engine: VcHandle, out_public: *mut u8) -> i32 {
-    if out_public.is_null() {
-        return VcError::InvalidArgument as i32;
-    }
-    let reg = match registry().lock() {
-        Ok(g) => g,
-        Err(_) => return VcError::Internal as i32,
-    };
-    let eng = match reg.engines.get(&engine) {
-        Some(e) => e,
-        None => return VcError::NotFound as i32,
-    };
-    let pk = eng.local_identity_public();
-    std::ptr::copy_nonoverlapping(pk.as_ptr(), out_public, 32);
-    VcError::Ok as i32
+    ffi_guard(|| {
+        if out_public.is_null() {
+            return VcError::InvalidArgument as i32;
+        }
+        match with_engine(engine, |eng| Ok(eng.local_identity_public())) {
+            Ok(pk) => {
+                unsafe { std::ptr::copy_nonoverlapping(pk.as_ptr(), out_public, 32) };
+                VcError::Ok as i32
+            }
+            Err(e) => e as i32,
+        }
+    })
 }
 
-/// Publish a public prekey bundle (no secrets).
 #[no_mangle]
 pub unsafe extern "C" fn vc_generate_bundle(
     engine: VcHandle,
@@ -244,30 +280,27 @@ pub unsafe extern "C" fn vc_generate_bundle(
     out: *mut u8,
     out_len: *mut usize,
 ) -> i32 {
-    let mut reg = match registry().lock() {
-        Ok(g) => g,
-        Err(_) => return VcError::Internal as i32,
-    };
-    let eng = match reg.engines.get_mut(&engine) {
-        Some(e) => e,
-        None => return VcError::NotFound as i32,
-    };
-    if need_buffer(out, out_len, BUNDLE_BOUND) {
-        return VcError::InvalidArgument as i32;
-    }
-    let bundle = match eng.generate_public_prekey_bundle(one_time_count) {
-        Ok(b) => b,
-        Err(e) => return VcError::from(e) as i32,
-    };
-    copy_out(&bundle.encode(), out, out_len)
+    ffi_guard(|| {
+        match reserve_output(out, out_len, BUNDLE_BOUND) {
+            Ok(true) => {}
+            Ok(false) => return VcError::InvalidArgument as i32,
+            Err(e) => return e as i32,
+        }
+        let encoded = match with_engine(engine, |eng| {
+            eng.generate_public_prekey_bundle(one_time_count)
+                .map(|b| b.encode())
+                .map_err(VcError::from)
+        }) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        copy_out(&encoded, out, out_len)
+    })
 }
 
-/// Alice: PQXDH + first ratchet ciphertext. Returns session id (16) + packet.
-///
-/// Secrets never leave the engine.
-#[no_mangle]
-pub unsafe extern "C" fn vc_establish_outbound(
+fn establish_outbound_inner(
     engine: VcHandle,
+    peer: Option<(Vec<u8>, Option<Vec<u8>>)>,
     bundle: *const u8,
     bundle_len: usize,
     conversation: *const u8,
@@ -283,60 +316,153 @@ pub unsafe extern "C" fn vc_establish_outbound(
     if out_session.is_null() {
         return VcError::InvalidArgument as i32;
     }
-    let bundle_bytes = match read_bytes(bundle, bundle_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
-    let conv = match read_bytes(conversation, conversation_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
-    let pt = match read_bytes(first_pt, first_pt_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
-    let aad = match read_bytes(ad, ad_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
     let bound = match packet_bound(first_pt_len) {
-        Ok(b) => b,
+        Ok(v) => v,
         Err(e) => return e as i32,
     };
-    if need_buffer(out_packet, out_packet_len, bound) {
-        return VcError::InvalidArgument as i32;
+    match reserve_output(out_packet, out_packet_len, bound) {
+        Ok(true) => {}
+        Ok(false) => return VcError::InvalidArgument as i32,
+        Err(e) => return e as i32,
     }
-    let parsed = match PublicPrekeyBundle::decode(bundle_bytes) {
-        Ok(b) => b,
-        Err(_) => return VcError::CryptoFailure as i32,
+    let bundle = match read_owned(bundle, bundle_len, BUNDLE_BOUND) {
+        Ok(v) => match PublicPrekeyBundle::decode(&v) {
+            Ok(b) => b,
+            Err(_) => return VcError::CryptoFailure as i32,
+        },
+        Err(e) => return e as i32,
     };
-    let mut reg = match registry().lock() {
-        Ok(g) => g,
-        Err(_) => return VcError::Internal as i32,
-    };
-    let eng = match reg.engines.get_mut(&engine) {
-        Some(e) => e,
-        None => return VcError::NotFound as i32,
-    };
-    let (sid, packet) = match eng.establish_outbound_session(&parsed, conv, pt, aad) {
+    let conversation = match read_owned(conversation, conversation_len, MAX_FFI_CONVERSATION) {
         Ok(v) => v,
-        Err(e) => return VcError::from(e) as i32,
+        Err(e) => return e as i32,
+    };
+    let first_pt = match read_owned(first_pt, first_pt_len, MAX_FFI_MESSAGE) {
+        Ok(v) => v,
+        Err(e) => return e as i32,
+    };
+    let ad = match read_owned(ad, ad_len, MAX_FFI_AD) {
+        Ok(v) => v,
+        Err(e) => return e as i32,
+    };
+
+    let result = with_engine(engine, |eng| {
+        let value = match &peer {
+            Some((peer_id, remote_device)) => eng.establish_outbound_session_for_peer(
+                peer_id,
+                remote_device.as_deref(),
+                &bundle,
+                &conversation,
+                &first_pt,
+                &ad,
+            ),
+            None => eng.establish_outbound_session(&bundle, &conversation, &first_pt, &ad),
+        };
+        value.map_err(VcError::from)
+    });
+    let (sid, packet) = match result {
+        Ok(v) => v,
+        Err(e) => return e as i32,
     };
     let encoded = packet.encode();
-    if encoded.len() > *out_packet_len {
-        *out_packet_len = encoded.len();
+    if out_packet_len.is_null() || encoded.len() > unsafe { *out_packet_len } {
         return VcError::Internal as i32;
     }
-    std::ptr::copy_nonoverlapping(sid.0.as_ptr(), out_session, 16);
-    std::ptr::copy_nonoverlapping(encoded.as_ptr(), out_packet, encoded.len());
-    *out_packet_len = encoded.len();
+    unsafe {
+        std::ptr::copy_nonoverlapping(sid.0.as_ptr(), out_session, 16);
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), out_packet, encoded.len());
+        *out_packet_len = encoded.len();
+    }
     VcError::Ok as i32
 }
 
-/// Bob: consume initiation packet. Returns session id (16) + first plaintext.
 #[no_mangle]
-pub unsafe extern "C" fn vc_process_inbound(
+pub unsafe extern "C" fn vc_establish_outbound(
     engine: VcHandle,
+    bundle: *const u8,
+    bundle_len: usize,
+    conversation: *const u8,
+    conversation_len: usize,
+    first_pt: *const u8,
+    first_pt_len: usize,
+    ad: *const u8,
+    ad_len: usize,
+    out_session: *mut u8,
+    out_packet: *mut u8,
+    out_packet_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        establish_outbound_inner(
+            engine,
+            None,
+            bundle,
+            bundle_len,
+            conversation,
+            conversation_len,
+            first_pt,
+            first_pt_len,
+            ad,
+            ad_len,
+            out_session,
+            out_packet,
+            out_packet_len,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vc_establish_outbound_for_peer(
+    engine: VcHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+    remote_device: *const u8,
+    remote_device_len: usize,
+    bundle: *const u8,
+    bundle_len: usize,
+    conversation: *const u8,
+    conversation_len: usize,
+    first_pt: *const u8,
+    first_pt_len: usize,
+    ad: *const u8,
+    ad_len: usize,
+    out_session: *mut u8,
+    out_packet: *mut u8,
+    out_packet_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        let peer_id = match read_owned(peer_id, peer_id_len, MAX_FFI_PEER_ID) {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => return VcError::InvalidArgument as i32,
+            Err(e) => return e as i32,
+        };
+        let remote_device = if remote_device.is_null() {
+            None
+        } else {
+            match read_owned(remote_device, remote_device_len, MAX_FFI_DEVICE_ID) {
+                Ok(v) => Some(v),
+                Err(e) => return e as i32,
+            }
+        };
+        establish_outbound_inner(
+            engine,
+            Some((peer_id, remote_device)),
+            bundle,
+            bundle_len,
+            conversation,
+            conversation_len,
+            first_pt,
+            first_pt_len,
+            ad,
+            ad_len,
+            out_session,
+            out_packet,
+            out_packet_len,
+        )
+    })
+}
+
+fn process_inbound_inner(
+    engine: VcHandle,
+    peer: Option<(Vec<u8>, Option<Vec<u8>>)>,
     packet: *const u8,
     packet_len: usize,
     conversation: *const u8,
@@ -350,48 +476,132 @@ pub unsafe extern "C" fn vc_process_inbound(
     if out_session.is_null() {
         return VcError::InvalidArgument as i32;
     }
-    let pkt_bytes = match read_bytes(packet, packet_len) {
-        Ok(b) => b,
+    let packet = match read_owned(packet, packet_len, MAX_FFI_PACKET) {
+        Ok(v) => match InitiationPacket::decode(&v) {
+            Ok(p) => p,
+            Err(e) => return VcError::from(e) as i32,
+        },
         Err(e) => return e as i32,
     };
-    let conv = match read_bytes(conversation, conversation_len) {
-        Ok(b) => b,
+    let output_bound = packet.first_message.ciphertext.len();
+    match reserve_output(out_pt, out_pt_len, output_bound) {
+        Ok(true) => {}
+        Ok(false) => return VcError::InvalidArgument as i32,
         Err(e) => return e as i32,
-    };
-    let aad = match read_bytes(ad, ad_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
-    if need_buffer(out_pt, out_pt_len, 4096) {
-        return VcError::InvalidArgument as i32;
     }
-    let parsed = match InitiationPacket::decode(pkt_bytes) {
-        Ok(p) => p,
-        Err(e) => return VcError::from(e) as i32,
-    };
-    let mut reg = match registry().lock() {
-        Ok(g) => g,
-        Err(_) => return VcError::Internal as i32,
-    };
-    let eng = match reg.engines.get_mut(&engine) {
-        Some(e) => e,
-        None => return VcError::NotFound as i32,
-    };
-    let (sid, pt) = match eng.process_inbound_session(&parsed, conv, aad) {
+    let conversation = match read_owned(conversation, conversation_len, MAX_FFI_CONVERSATION) {
         Ok(v) => v,
-        Err(e) => return VcError::from(e) as i32,
+        Err(e) => return e as i32,
     };
-    if pt.len() > *out_pt_len {
-        *out_pt_len = pt.len();
+    let ad = match read_owned(ad, ad_len, MAX_FFI_AD) {
+        Ok(v) => v,
+        Err(e) => return e as i32,
+    };
+    let result = with_engine(engine, |eng| {
+        let value = match &peer {
+            Some((peer_id, remote_device)) => eng.process_inbound_session_from_peer(
+                peer_id,
+                remote_device.as_deref(),
+                &packet,
+                &conversation,
+                &ad,
+            ),
+            None => eng.process_inbound_session(&packet, &conversation, &ad),
+        };
+        value.map_err(VcError::from)
+    });
+    let (sid, pt) = match result {
+        Ok(v) => v,
+        Err(e) => return e as i32,
+    };
+    if out_pt_len.is_null() || pt.len() > unsafe { *out_pt_len } {
         return VcError::Internal as i32;
     }
-    std::ptr::copy_nonoverlapping(sid.0.as_ptr(), out_session, 16);
-    std::ptr::copy_nonoverlapping(pt.as_ptr(), out_pt, pt.len());
-    *out_pt_len = pt.len();
+    unsafe {
+        std::ptr::copy_nonoverlapping(sid.0.as_ptr(), out_session, 16);
+        std::ptr::copy_nonoverlapping(pt.as_ptr(), out_pt, pt.len());
+        *out_pt_len = pt.len();
+    }
     VcError::Ok as i32
 }
 
-/// Encrypt. Output is a sealed-message blob (no secrets).
+#[no_mangle]
+pub unsafe extern "C" fn vc_process_inbound(
+    engine: VcHandle,
+    packet: *const u8,
+    packet_len: usize,
+    conversation: *const u8,
+    conversation_len: usize,
+    ad: *const u8,
+    ad_len: usize,
+    out_session: *mut u8,
+    out_pt: *mut u8,
+    out_pt_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        process_inbound_inner(
+            engine,
+            None,
+            packet,
+            packet_len,
+            conversation,
+            conversation_len,
+            ad,
+            ad_len,
+            out_session,
+            out_pt,
+            out_pt_len,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vc_process_inbound_from_peer(
+    engine: VcHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+    remote_device: *const u8,
+    remote_device_len: usize,
+    packet: *const u8,
+    packet_len: usize,
+    conversation: *const u8,
+    conversation_len: usize,
+    ad: *const u8,
+    ad_len: usize,
+    out_session: *mut u8,
+    out_pt: *mut u8,
+    out_pt_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        let peer_id = match read_owned(peer_id, peer_id_len, MAX_FFI_PEER_ID) {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => return VcError::InvalidArgument as i32,
+            Err(e) => return e as i32,
+        };
+        let remote_device = if remote_device.is_null() {
+            None
+        } else {
+            match read_owned(remote_device, remote_device_len, MAX_FFI_DEVICE_ID) {
+                Ok(v) => Some(v),
+                Err(e) => return e as i32,
+            }
+        };
+        process_inbound_inner(
+            engine,
+            Some((peer_id, remote_device)),
+            packet,
+            packet_len,
+            conversation,
+            conversation_len,
+            ad,
+            ad_len,
+            out_session,
+            out_pt,
+            out_pt_len,
+        )
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vc_encrypt(
     engine: VcHandle,
@@ -403,42 +613,38 @@ pub unsafe extern "C" fn vc_encrypt(
     out: *mut u8,
     out_len: *mut usize,
 ) -> i32 {
-    if session_id.is_null() {
-        return VcError::InvalidArgument as i32;
-    }
-    let mut sid = [0u8; 16];
-    std::ptr::copy_nonoverlapping(session_id, sid.as_mut_ptr(), 16);
-    let pt = match read_bytes(plaintext, plaintext_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
-    let aad = match read_bytes(ad, ad_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
-    let bound = match sealed_bound(plaintext_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
-    if need_buffer(out, out_len, bound) {
-        return VcError::InvalidArgument as i32;
-    }
-    let mut reg = match registry().lock() {
-        Ok(g) => g,
-        Err(_) => return VcError::Internal as i32,
-    };
-    let eng = match reg.engines.get_mut(&engine) {
-        Some(e) => e,
-        None => return VcError::NotFound as i32,
-    };
-    let sealed = match eng.encrypt(&SessionId(sid), pt, aad) {
-        Ok(s) => s,
-        Err(e) => return VcError::from(e) as i32,
-    };
-    copy_out(&sealed.encode(), out, out_len)
+    ffi_guard(|| {
+        let sid = match read_sid(session_id) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        let bound = match sealed_bound(plaintext_len) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        match reserve_output(out, out_len, bound) {
+            Ok(true) => {}
+            Ok(false) => return VcError::InvalidArgument as i32,
+            Err(e) => return e as i32,
+        }
+        let pt = match read_owned(plaintext, plaintext_len, MAX_FFI_MESSAGE) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        let ad = match read_owned(ad, ad_len, MAX_FFI_AD) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        let sealed = match with_engine(engine, |eng| {
+            eng.encrypt(&sid, &pt, &ad).map_err(VcError::from)
+        }) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        copy_out(&sealed.encode(), out, out_len)
+    })
 }
 
-/// Decrypt a sealed-message blob. State is unchanged on auth failure.
 #[no_mangle]
 pub unsafe extern "C" fn vc_decrypt(
     engine: VcHandle,
@@ -450,42 +656,83 @@ pub unsafe extern "C" fn vc_decrypt(
     out_pt: *mut u8,
     out_pt_len: *mut usize,
 ) -> i32 {
-    if session_id.is_null() {
-        return VcError::InvalidArgument as i32;
-    }
-    let mut sid = [0u8; 16];
-    std::ptr::copy_nonoverlapping(session_id, sid.as_mut_ptr(), 16);
-    let blob = match read_bytes(sealed, sealed_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
-    let aad = match read_bytes(ad, ad_len) {
-        Ok(b) => b,
-        Err(e) => return e as i32,
-    };
-    if need_buffer(out_pt, out_pt_len, 4096) {
-        return VcError::InvalidArgument as i32;
-    }
-    let parsed = match SealedMessage::decode(blob) {
-        Ok(s) => s,
-        Err(e) => return VcError::from(e) as i32,
-    };
-    let mut reg = match registry().lock() {
-        Ok(g) => g,
-        Err(_) => return VcError::Internal as i32,
-    };
-    let eng = match reg.engines.get_mut(&engine) {
-        Some(e) => e,
-        None => return VcError::NotFound as i32,
-    };
-    let pt = match eng.decrypt(&SessionId(sid), &parsed, aad) {
-        Ok(p) => p,
-        Err(e) => return VcError::from(e) as i32,
-    };
-    copy_out(&pt, out_pt, out_pt_len)
+    ffi_guard(|| {
+        let sid = match read_sid(session_id) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        let sealed = match read_owned(sealed, sealed_len, MAX_FFI_PACKET) {
+            Ok(v) => match SealedMessage::decode(&v) {
+                Ok(s) => s,
+                Err(e) => return VcError::from(e) as i32,
+            },
+            Err(e) => return e as i32,
+        };
+        match reserve_output(out_pt, out_pt_len, sealed.ciphertext.len()) {
+            Ok(true) => {}
+            Ok(false) => return VcError::InvalidArgument as i32,
+            Err(e) => return e as i32,
+        }
+        let ad = match read_owned(ad, ad_len, MAX_FFI_AD) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        let pt = match with_engine(engine, |eng| {
+            eng.decrypt(&sid, &sealed, &ad).map_err(VcError::from)
+        }) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        copy_out(&pt, out_pt, out_pt_len)
+    })
 }
 
-/// Compute safety fingerprint for two public identity keys (32 bytes each).
+#[no_mangle]
+pub unsafe extern "C" fn vc_pending_outbound_initiation(
+    engine: VcHandle,
+    session_id: *const u8,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    ffi_guard(|| {
+        let sid = match read_sid(session_id) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        let packet = match with_engine(engine, |eng| {
+            eng.pending_outbound_initiation(&sid)
+                .map_err(VcError::from)
+        }) {
+            Ok(Some(v)) => v.encode(),
+            Ok(None) => {
+                if !out_len.is_null() {
+                    unsafe { *out_len = 0 };
+                }
+                return VcError::NotFound as i32;
+            }
+            Err(e) => return e as i32,
+        };
+        copy_out(&packet, out, out_len)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vc_acknowledge_outbound_initiation(
+    engine: VcHandle,
+    session_id: *const u8,
+) -> i32 {
+    ffi_guard(|| {
+        let sid = match read_sid(session_id) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        result_code(with_engine(engine, |eng| {
+            eng.acknowledge_outbound_initiation(&sid)
+                .map_err(VcError::from)
+        }))
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vc_fingerprint(
     public_a: *const u8,
@@ -498,80 +745,82 @@ pub unsafe extern "C" fn vc_fingerprint(
     out_numeric: *mut u8,
     out_numeric_len: *mut usize,
 ) -> i32 {
-    if public_a.is_null() || public_b.is_null() || out_binary.is_null() {
-        return VcError::InvalidArgument as i32;
-    }
-    let mut pa = [0u8; 32];
-    let mut pb = [0u8; 32];
-    std::ptr::copy_nonoverlapping(public_a, pa.as_mut_ptr(), 32);
-    std::ptr::copy_nonoverlapping(public_b, pb.as_mut_ptr(), 32);
-    let a = match X25519Public::from_bytes(pa) {
-        Ok(p) => p,
-        Err(_) => return VcError::CryptoFailure as i32,
-    };
-    let b = match X25519Public::from_bytes(pb) {
-        Ok(p) => p,
-        Err(_) => return VcError::CryptoFailure as i32,
-    };
-    let da = if device_a.is_null() {
-        None
-    } else {
-        Some(slice::from_raw_parts(device_a, device_a_len).to_vec())
-    };
-    let db = if device_b.is_null() {
-        None
-    } else {
-        Some(slice::from_raw_parts(device_b, device_b_len).to_vec())
-    };
-    let fp = match compute_fingerprint(
-        &IdentityMaterial {
-            identity_key: a,
-            device_id: da,
-        },
-        &IdentityMaterial {
-            identity_key: b,
-            device_id: db,
-        },
-    ) {
-        Ok(f) => f,
-        Err(_) => return VcError::CryptoFailure as i32,
-    };
-    std::ptr::copy_nonoverlapping(fp.binary.as_ptr(), out_binary, 32);
-    if !out_numeric.is_null() && !out_numeric_len.is_null() {
-        let digits = fp.numeric.as_bytes();
-        if *out_numeric_len < digits.len() {
-            *out_numeric_len = digits.len();
+    ffi_guard(|| {
+        if public_a.is_null() || public_b.is_null() || out_binary.is_null() {
             return VcError::InvalidArgument as i32;
         }
-        std::ptr::copy_nonoverlapping(digits.as_ptr(), out_numeric, digits.len());
-        *out_numeric_len = digits.len();
-    }
-    VcError::Ok as i32
+        let mut pa = [0u8; 32];
+        let mut pb = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(public_a, pa.as_mut_ptr(), 32);
+            std::ptr::copy_nonoverlapping(public_b, pb.as_mut_ptr(), 32);
+        }
+        let a = match X25519Public::from_bytes(pa) {
+            Ok(v) => v,
+            Err(_) => return VcError::CryptoFailure as i32,
+        };
+        let b = match X25519Public::from_bytes(pb) {
+            Ok(v) => v,
+            Err(_) => return VcError::CryptoFailure as i32,
+        };
+        let da = if device_a.is_null() {
+            None
+        } else {
+            match read_owned(device_a, device_a_len, MAX_FFI_DEVICE_ID) {
+                Ok(v) => Some(v),
+                Err(e) => return e as i32,
+            }
+        };
+        let db = if device_b.is_null() {
+            None
+        } else {
+            match read_owned(device_b, device_b_len, MAX_FFI_DEVICE_ID) {
+                Ok(v) => Some(v),
+                Err(e) => return e as i32,
+            }
+        };
+        let fp = match compute_fingerprint(
+            &IdentityMaterial {
+                identity_key: a,
+                device_id: da,
+            },
+            &IdentityMaterial {
+                identity_key: b,
+                device_id: db,
+            },
+        ) {
+            Ok(v) => v,
+            Err(_) => return VcError::CryptoFailure as i32,
+        };
+        unsafe { std::ptr::copy_nonoverlapping(fp.binary.as_ptr(), out_binary, 32) };
+        if !out_numeric_len.is_null() {
+            let digits = fp.numeric.as_bytes();
+            if out_numeric.is_null() || unsafe { *out_numeric_len } < digits.len() {
+                unsafe { *out_numeric_len = digits.len() };
+                return VcError::InvalidArgument as i32;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(digits.as_ptr(), out_numeric, digits.len());
+                *out_numeric_len = digits.len();
+            }
+        }
+        VcError::Ok as i32
+    })
 }
 
-/// Delete one session inside an engine.
 #[no_mangle]
 pub unsafe extern "C" fn vc_delete_session(engine: VcHandle, session_id: *const u8) -> i32 {
-    if session_id.is_null() {
-        return VcError::InvalidArgument as i32;
-    }
-    let mut sid = [0u8; 16];
-    std::ptr::copy_nonoverlapping(session_id, sid.as_mut_ptr(), 16);
-    let mut reg = match registry().lock() {
-        Ok(g) => g,
-        Err(_) => return VcError::Internal as i32,
-    };
-    let eng = match reg.engines.get_mut(&engine) {
-        Some(e) => e,
-        None => return VcError::NotFound as i32,
-    };
-    match eng.delete_session(&SessionId(sid)) {
-        Ok(()) => VcError::Ok as i32,
-        Err(e) => VcError::from(e) as i32,
-    }
+    ffi_guard(|| {
+        let sid = match read_sid(session_id) {
+            Ok(v) => v,
+            Err(e) => return e as i32,
+        };
+        result_code(with_engine(engine, |eng| {
+            eng.delete_session(&sid).map_err(VcError::from)
+        }))
+    })
 }
 
-/// Protocol version constant for interoperability checks.
 #[no_mangle]
 pub extern "C" fn vc_protocol_version() -> u16 {
     crate::policy::PROTOCOL_VERSION
@@ -582,15 +831,19 @@ mod tests {
     use super::*;
 
     unsafe fn create_engine(id: &[u8]) -> (VcHandle, [u8; 32]) {
-        let mut h = 0u64;
+        let mut handle = 0u64;
         let mut pk = [0u8; 32];
         assert_eq!(
-            vc_engine_create(id.as_ptr(), id.len(), 1, &mut h, pk.as_mut_ptr()),
-            0
+            vc_engine_create(
+                id.as_ptr(),
+                id.len(),
+                1,
+                &mut handle,
+                pk.as_mut_ptr(),
+            ),
+            VcError::Ok as i32
         );
-        assert_ne!(h, 0);
-        assert_ne!(pk, [0u8; 32]);
-        (h, pk)
+        (handle, pk)
     }
 
     unsafe fn size_query_then_copy(f: impl Fn(*mut u8, *mut usize) -> i32) -> Vec<u8> {
@@ -601,24 +854,28 @@ mod tests {
         );
         assert!(n > 0);
         let mut buf = vec![0u8; n];
-        assert_eq!(f(buf.as_mut_ptr(), &mut n), 0);
+        assert_eq!(f(buf.as_mut_ptr(), &mut n), VcError::Ok as i32);
         buf.truncate(n);
         buf
     }
 
     #[test]
-    fn protocol_version_nonzero() {
-        assert_eq!(vc_protocol_version(), crate::policy::PROTOCOL_VERSION);
+    fn panic_guard_maps_panic_to_internal() {
+        let code = ffi_guard(|| panic!("ffi-test-panic"));
+        assert_eq!(code, VcError::Internal as i32);
     }
 
     #[test]
-    fn alice_bob_ffi_pqxdh_no_secrets_cross() {
+    fn protocol_version_is_v2() {
+        assert_eq!(vc_protocol_version(), 2);
+    }
+
+    #[test]
+    fn alice_bob_ffi_interop_and_pending_retry() {
         unsafe {
-            let (h_alice, alice_pk) = create_engine(b"alice");
-            let (h_bob, bob_pk) = create_engine(b"bob");
-
-            let bundle = size_query_then_copy(|out, n| vc_generate_bundle(h_bob, 2, out, n));
-
+            let (alice, alice_pk) = create_engine(b"alice");
+            let (bob, bob_pk) = create_engine(b"bob");
+            let bundle = size_query_then_copy(|out, n| vc_generate_bundle(bob, 2, out, n));
             let conv = b"conv";
             let ad = b"ad";
             let first = b"A1";
@@ -627,7 +884,7 @@ mod tests {
                 let mut n = 0usize;
                 assert_eq!(
                     vc_establish_outbound(
-                        h_alice,
+                        alice,
                         bundle.as_ptr(),
                         bundle.len(),
                         conv.as_ptr(),
@@ -642,10 +899,10 @@ mod tests {
                     ),
                     VcError::InvalidArgument as i32
                 );
-                let mut pkt = vec![0u8; n];
+                let mut buf = vec![0u8; n];
                 assert_eq!(
                     vc_establish_outbound(
-                        h_alice,
+                        alice,
                         bundle.as_ptr(),
                         bundle.len(),
                         conv.as_ptr(),
@@ -655,21 +912,27 @@ mod tests {
                         ad.as_ptr(),
                         ad.len(),
                         sid_a.as_mut_ptr(),
-                        pkt.as_mut_ptr(),
+                        buf.as_mut_ptr(),
                         &mut n,
                     ),
-                    0
+                    VcError::Ok as i32
                 );
-                pkt.truncate(n);
-                pkt
+                buf.truncate(n);
+                buf
             };
-            assert_ne!(sid_a, [0u8; 16]);
 
+            let pending = size_query_then_copy(|out, n| {
+                vc_pending_outbound_initiation(alice, sid_a.as_ptr(), out, n)
+            });
+            assert_eq!(packet, pending);
+
+            let parsed = InitiationPacket::decode(&packet).unwrap();
             let mut sid_b = [0u8; 16];
-            let mut pt_len = 0usize;
+            let mut pt_bound = parsed.first_message.ciphertext.len();
+            let mut first_out = vec![0u8; pt_bound];
             assert_eq!(
                 vc_process_inbound(
-                    h_bob,
+                    bob,
                     packet.as_ptr(),
                     packet.len(),
                     conv.as_ptr(),
@@ -677,32 +940,16 @@ mod tests {
                     ad.as_ptr(),
                     ad.len(),
                     sid_b.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                    &mut pt_len,
+                    first_out.as_mut_ptr(),
+                    &mut pt_bound,
                 ),
-                VcError::InvalidArgument as i32
+                VcError::Ok as i32
             );
-            let mut pt = vec![0u8; pt_len];
-            assert_eq!(
-                vc_process_inbound(
-                    h_bob,
-                    packet.as_ptr(),
-                    packet.len(),
-                    conv.as_ptr(),
-                    conv.len(),
-                    ad.as_ptr(),
-                    ad.len(),
-                    sid_b.as_mut_ptr(),
-                    pt.as_mut_ptr(),
-                    &mut pt_len,
-                ),
-                0
-            );
-            assert_eq!(&pt[..pt_len], b"A1");
+            assert_eq!(&first_out[..pt_bound], first);
 
             let sealed = size_query_then_copy(|out, n| {
                 vc_encrypt(
-                    h_bob,
+                    bob,
                     sid_b.as_ptr(),
                     b"B1".as_ptr(),
                     2,
@@ -712,24 +959,12 @@ mod tests {
                     n,
                 )
             });
-            let mut out_len = 0usize;
-            assert_eq!(
-                vc_decrypt(
-                    h_alice,
-                    sid_a.as_ptr(),
-                    sealed.as_ptr(),
-                    sealed.len(),
-                    ad.as_ptr(),
-                    ad.len(),
-                    std::ptr::null_mut(),
-                    &mut out_len,
-                ),
-                VcError::InvalidArgument as i32
-            );
+            let parsed_sealed = SealedMessage::decode(&sealed).unwrap();
+            let mut out_len = parsed_sealed.ciphertext.len();
             let mut out = vec![0u8; out_len];
             assert_eq!(
                 vc_decrypt(
-                    h_alice,
+                    alice,
                     sid_a.as_ptr(),
                     sealed.as_ptr(),
                     sealed.len(),
@@ -738,13 +973,24 @@ mod tests {
                     out.as_mut_ptr(),
                     &mut out_len,
                 ),
-                0
+                VcError::Ok as i32
             );
             assert_eq!(&out[..out_len], b"B1");
 
-            let mut bin = [0u8; 32];
-            let mut num = [0u8; 64];
-            let mut nlen = 64usize;
+            let mut no_pending_len = 0usize;
+            assert_eq!(
+                vc_pending_outbound_initiation(
+                    alice,
+                    sid_a.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut no_pending_len,
+                ),
+                VcError::NotFound as i32
+            );
+
+            let mut binary = [0u8; 32];
+            let mut numeric = [0u8; 60];
+            let mut numeric_len = numeric.len();
             assert_eq!(
                 vc_fingerprint(
                     alice_pk.as_ptr(),
@@ -753,29 +999,17 @@ mod tests {
                     5,
                     b"bob".as_ptr(),
                     3,
-                    bin.as_mut_ptr(),
-                    num.as_mut_ptr(),
-                    &mut nlen,
+                    binary.as_mut_ptr(),
+                    numeric.as_mut_ptr(),
+                    &mut numeric_len,
                 ),
-                0
+                VcError::Ok as i32
             );
-            assert_ne!(bin, [0u8; 32]);
-            assert_eq!(nlen, 60);
+            assert_eq!(numeric_len, 60);
 
-            assert_eq!(vc_delete_session(h_alice, sid_a.as_ptr()), 0);
-            assert_eq!(vc_engine_destroy(h_alice), 0);
-            assert_eq!(vc_engine_destroy(h_bob), 0);
+            assert_eq!(vc_delete_session(alice, sid_a.as_ptr()), VcError::Ok as i32);
+            assert_eq!(vc_engine_destroy(alice), VcError::Ok as i32);
+            assert_eq!(vc_engine_destroy(bob), VcError::Ok as i32);
         }
-    }
-
-    #[test]
-    fn identity_session_encrypt_decrypt_delete() {
-        // Same path as interop; kept so existing suite names still exist.
-        alice_bob_ffi_pqxdh_no_secrets_cross();
-    }
-
-    #[test]
-    fn alice_bob_ffi_encrypt_decrypt_interop() {
-        alice_bob_ffi_pqxdh_no_secrets_cross();
     }
 }
