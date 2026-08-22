@@ -57,7 +57,9 @@ ffi = []
 # Experimental profiles — compiled only when requested; never auto-selected.
 hybrid = []
 header-encrypt = []
-# Incomplete Sesame mailbox (hardcoded SK). Not a production surface.
+# Experimental Sesame mailbox. Retry no longer uses a hardcoded secret, but
+# local/remote session-id semantics are not v2 SessionTag semantics; this is
+# intentionally not a production surface.
 sesame = []
 
 [[test]]
