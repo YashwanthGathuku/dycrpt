@@ -1,25 +1,36 @@
 //! Monotonic counter abstraction for rollback resistance.
 //!
-//! Commodity phones do not expose a trusted increment-only counter to
-//! userspace. Implementations should bind this trait to:
-//!   * Android StrongBox / Keystore hardware counters when present
-//!   * iOS Secure Enclave monotonic values when present
-//!   * otherwise a local counter that **cannot** survive backup restore
+//! The crypto engine binds every durable state commit to one strictly
+//! increasing counter value. A restored snapshot is accepted only when the
+//! counter value stored with the snapshot exactly matches the external
+//! monotonic counter.
 //!
-//! Residual risk without hardware is documented in KNOWN_LIMITATIONS.
+//! Production implementations should bind this trait to a value that is not
+//! restored together with application data (hardware/TEE backed where the
+//! platform provides a suitable primitive). `MemoryCounter` is intentionally
+//! test/dev only and does not survive process recreation.
 
 use crate::primitives::error::PrimitiveError;
 
-/// Strictly increasing counter. Implementations must not wrap.
-pub trait MonotonicCounter {
+/// Strictly increasing counter. Implementations must not wrap or move backwards.
+///
+/// The trait is `Send + Sync` because mobile FFI calls may arrive from multiple
+/// threads even though the engine serializes a given state transition.
+pub trait MonotonicCounter: Send + Sync {
     fn current(&self) -> Result<u64, PrimitiveError>;
     fn increment(&mut self) -> Result<u64, PrimitiveError>;
 }
 
-/// Process-local counter (tests / hosts without TEE).
+/// Process-local counter (tests / hosts without a trusted monotonic source).
 #[derive(Default)]
 pub struct MemoryCounter {
     n: u64,
+}
+
+impl MemoryCounter {
+    pub fn with_value(n: u64) -> Self {
+        Self { n }
+    }
 }
 
 impl MonotonicCounter for MemoryCounter {
@@ -28,7 +39,10 @@ impl MonotonicCounter for MemoryCounter {
     }
 
     fn increment(&mut self) -> Result<u64, PrimitiveError> {
-        self.n = self.n.checked_add(1).ok_or(PrimitiveError::LimitExceeded)?;
+        self.n = self
+            .n
+            .checked_add(1)
+            .ok_or(PrimitiveError::LimitExceeded)?;
         Ok(self.n)
     }
 }
@@ -43,5 +57,12 @@ mod tests {
         assert_eq!(c.increment().unwrap(), 1);
         assert_eq!(c.increment().unwrap(), 2);
         assert_eq!(c.current().unwrap(), 2);
+    }
+
+    #[test]
+    fn seeded_counter_continues_monotonically() {
+        let mut c = MemoryCounter::with_value(41);
+        assert_eq!(c.current().unwrap(), 41);
+        assert_eq!(c.increment().unwrap(), 42);
     }
 }
