@@ -36,6 +36,7 @@ pub use fingerprint::{
     compute_fingerprint, IdentityChangeReason, IdentityMaterial, IdentityState, IdentityTracker,
     SafetyFingerprint, TrustStore, VerificationMethod,
 };
+pub use identity::{PeerIdentityStore, PeerTrustRecord};
 pub use policy::{
     available_profiles, enforce_profile, select_profile, CryptoProfile, PROFILE_PREFERENCE,
     PROTOCOL_VERSION,
