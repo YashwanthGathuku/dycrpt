@@ -1,7 +1,9 @@
-//! Sesame send / receive / retry / delivery-receipt (Rev 2 §§3.3–3.4, 4.1).
+//! Sesame send / receive / retry / delivery-receipt (experimental).
 //!
-//! Uses [`super::SessionManager`] for records and a [`Directory`] for the
-//! server. Encryption is classical Double Ratchet (Sesame is session-generic).
+//! This module is compiled only for tests or the explicit `sesame` feature.
+//! It is not the production application engine. Retry state keeps the original
+//! session secret for the queued message and zeroizes it with the plaintext on
+//! drop; there is no synthetic/hard-coded retry key.
 
 use super::mailbox::{Directory, MailboxBody, MailboxEnvelope};
 use super::{DeviceId, SessionId, SessionManager, UserId};
@@ -9,19 +11,22 @@ use crate::fingerprint::IdentityMaterial;
 use crate::primitives::error::PrimitiveError;
 use crate::primitives::kdf::sha256;
 use crate::primitives::x25519::X25519Public;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const MAX_SEND_LOOPS: u32 = 8;
 
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct MessageRecord {
     message_id: [u8; 16],
     plaintext: Vec<u8>,
+    #[zeroize(skip)]
     recipient_user: UserId,
+    #[zeroize(skip)]
     session_id: SessionId,
     attempts: u32,
+    session_secret: [u8; 32],
 }
 
-/// Per-device Sesame sender/receiver sitting on a [`SessionManager`].
 pub struct SesameNode {
     pub user: UserId,
     pub device: DeviceId,
@@ -39,8 +44,6 @@ impl SesameNode {
         }
     }
 
-    /// Sesame §3.3 — encrypt plaintext to every current device of `recipients`
-    /// (including the sender’s other devices when listed).
     #[allow(clippy::too_many_arguments)]
     pub fn send<D: Directory>(
         &mut self,
@@ -64,19 +67,17 @@ impl SesameNode {
                 if user == &self.user && dev == &self.device {
                     continue;
                 }
-                let sid =
-                    self.mgr
-                        .prepare_outbound(user, dev, remote_identity, sk, remote_dh, now)?;
-                let ratchet = {
-                    let rec = self
-                        .mgr
-                        .users
-                        .get_mut(user)
-                        .and_then(|u| u.devices.get_mut(dev))
-                        .and_then(|d| d.active.as_mut())
-                        .ok_or(PrimitiveError::Internal)?;
-                    &mut rec.ratchet
-                };
+                let sid = self
+                    .mgr
+                    .prepare_outbound(user, dev, remote_identity, sk, remote_dh, now)?;
+                let ratchet = self
+                    .mgr
+                    .users
+                    .get_mut(user)
+                    .and_then(|u| u.devices.get_mut(dev))
+                    .and_then(|d| d.active.as_mut())
+                    .map(|r| &mut r.ratchet)
+                    .ok_or(PrimitiveError::Internal)?;
                 let (header, ct) = ratchet.encrypt(plaintext, b"sesame")?;
                 let message_id = msg_id(&sid, now, sent as u64);
                 dir.send(
@@ -100,6 +101,7 @@ impl SesameNode {
                     recipient_user: user.clone(),
                     session_id: sid,
                     attempts: 1,
+                    session_secret: *sk,
                 });
                 ids.push(message_id);
                 sent += 1;
@@ -108,8 +110,6 @@ impl SesameNode {
         Ok(ids)
     }
 
-    /// Sesame §3.4 — fetch and decrypt. Undecryptable messages emit retry
-    /// requests. Successful decrypts emit delivery receipts.
     pub fn receive_all<D: Directory>(
         &mut self,
         dir: &mut D,
@@ -128,14 +128,13 @@ impl SesameNode {
                     ..
                 } => {
                     let hdr = crate::ratchet::Header::decode(&header)?;
-                    let pt = self.try_decrypt(
+                    match self.try_decrypt(
                         &env.from_user,
                         &env.from_device,
                         &session_id,
                         &hdr,
                         &ciphertext,
-                    );
-                    match pt {
+                    ) {
                         Ok(p) => {
                             let _ = self.mgr.receive_on_session(
                                 &env.from_user,
@@ -212,7 +211,10 @@ impl SesameNode {
         if let Some(rec) = d.inactive.iter_mut().find(|s| s.id == *session_id) {
             return try_one(rec);
         }
-        // Matching session may have a different local id (recipient created it).
+        // Experimental Sesame still has a local-id mismatch limitation between
+        // independently created sender/recipient records. This compatibility
+        // fallback is why the feature remains non-production; VoiceChatCryptoEngine
+        // v2 uses an authenticated shared SessionTag instead.
         if let Some(rec) = d.active.as_mut() {
             return try_one(rec);
         }
@@ -241,42 +243,47 @@ impl SesameNode {
         }
         self.records[idx].attempts += 1;
         let plaintext = self.records[idx].plaintext.clone();
+        let mut retry_sk = self.records[idx].session_secret;
         let dh = remote_identity.identity_key;
-        let sid = self.mgr.prepare_outbound(
-            from_user,
-            from_device,
-            remote_identity,
-            &[9u8; 32],
-            &dh,
-            now,
-        )?;
-        let rec = self
-            .mgr
-            .users
-            .get_mut(from_user)
-            .and_then(|u| u.devices.get_mut(from_device))
-            .and_then(|d| d.active.as_mut())
-            .ok_or(PrimitiveError::Internal)?;
-        let (header, ct) = rec.ratchet.encrypt(&plaintext, b"sesame")?;
-        let new_id = msg_id(&sid, now, self.records[idx].attempts as u64);
-        self.records[idx].message_id = new_id;
-        self.records[idx].session_id = sid;
-        dir.send(
-            from_user,
-            from_device,
-            MailboxEnvelope {
-                from_user: self.user.clone(),
-                from_device: self.device.clone(),
-                body: MailboxBody::Encrypted {
-                    message_id: new_id,
-                    session_id: sid,
-                    header: header.encode(),
-                    ciphertext: ct,
-                    initiation: true,
+        let result = (|| {
+            let sid = self.mgr.prepare_outbound(
+                from_user,
+                from_device,
+                remote_identity,
+                &retry_sk,
+                &dh,
+                now,
+            )?;
+            let rec = self
+                .mgr
+                .users
+                .get_mut(from_user)
+                .and_then(|u| u.devices.get_mut(from_device))
+                .and_then(|d| d.active.as_mut())
+                .ok_or(PrimitiveError::Internal)?;
+            let (header, ct) = rec.ratchet.encrypt(&plaintext, b"sesame")?;
+            let new_id = msg_id(&sid, now, self.records[idx].attempts as u64);
+            self.records[idx].message_id = new_id;
+            self.records[idx].session_id = sid;
+            dir.send(
+                from_user,
+                from_device,
+                MailboxEnvelope {
+                    from_user: self.user.clone(),
+                    from_device: self.device.clone(),
+                    body: MailboxBody::Encrypted {
+                        message_id: new_id,
+                        session_id: sid,
+                        header: header.encode(),
+                        ciphertext: ct,
+                        initiation: true,
+                    },
                 },
-            },
-        )?;
-        Ok(())
+            )?;
+            Ok(())
+        })();
+        retry_sk.zeroize();
+        result
     }
 }
 
@@ -296,7 +303,6 @@ mod tests {
     use super::*;
     use crate::primitives::x25519::X25519Secret;
     use crate::session::mailbox::MemoryDirectory;
-    use crate::session::SessionManager;
 
     fn mat(seed: u8) -> IdentityMaterial {
         let mut b = [seed; 32];
@@ -324,7 +330,6 @@ mod tests {
             b_id.identity_key.to_bytes(),
         )
         .unwrap();
-
         let mut alice = SesameNode::new(
             b"alice".to_vec(),
             b"a1".to_vec(),
@@ -335,7 +340,6 @@ mod tests {
             b"b1".to_vec(),
             SessionManager::new(b"bob".to_vec(), b"b1".to_vec(), b_id.clone()),
         );
-
         let bob_dh = X25519Secret::generate().unwrap();
         let sk = [9u8; 32];
         alice
@@ -349,7 +353,6 @@ mod tests {
                 1,
             )
             .unwrap();
-
         bob.mgr
             .prepare_inbound(
                 &b"alice".to_vec(),
@@ -362,7 +365,6 @@ mod tests {
             .unwrap();
         let first = bob.receive_all(&mut dir, &a_id, 3).unwrap();
         assert_eq!(first, vec![b"hello-sesame".to_vec()]);
-
         let _ = alice.receive_all(&mut dir, &b_id, 4);
     }
 
