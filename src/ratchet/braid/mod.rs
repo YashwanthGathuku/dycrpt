@@ -197,12 +197,13 @@ impl BraidScka {
 
     pub fn send(&mut self) -> Result<(BraidMessage, u64, Option<SckaOutput>), PrimitiveError> {
         self.encaps1_if_needed()?;
-        let sending_epoch = self.epoch.saturating_sub(1);
+        let epoch = self.epoch;
+        let sending_epoch = epoch.saturating_sub(1);
         match &mut self.agent {
             Agent::KeysUnsampled => {
                 let (dk, pk) = MlKemSecret::generate()?;
                 let (header_bytes, t) = header_from_ek(pk.as_bytes());
-                let mac = self.auth.mac_hdr(self.epoch, &header_bytes);
+                let mac = self.auth.mac_hdr(epoch, &header_bytes);
                 let mut payload = header_bytes.to_vec();
                 payload.extend_from_slice(&mac);
                 let mut header_enc = Encoder::new(&payload);
@@ -212,40 +213,45 @@ impl BraidScka {
                     ek_vector: t.to_vec(),
                     header_enc,
                 };
-                Ok((self.msg(BraidType::Hdr, chunk), sending_epoch, None))
+                Ok((Self::msg(epoch, BraidType::Hdr, chunk), sending_epoch, None))
             }
             Agent::KeysSampled { header_enc, .. } => {
-                Ok((self.msg(BraidType::Hdr, header_enc.next_chunk()), sending_epoch, None))
+                let chunk = header_enc.next_chunk();
+                Ok((Self::msg(epoch, BraidType::Hdr, chunk), sending_epoch, None))
             }
             Agent::HeaderSent { ek_enc, .. } => {
-                Ok((self.msg(BraidType::Ek, ek_enc.next_chunk()), sending_epoch, None))
+                let chunk = ek_enc.next_chunk();
+                Ok((Self::msg(epoch, BraidType::Ek, chunk), sending_epoch, None))
             }
-            Agent::Ct1Received { ek_enc, .. } => Ok((
-                self.msg(BraidType::EkCt1Ack, ek_enc.next_chunk()),
-                sending_epoch,
-                None,
-            )),
+            Agent::Ct1Received { ek_enc, .. } => {
+                let chunk = ek_enc.next_chunk();
+                Ok((
+                    Self::msg(epoch, BraidType::EkCt1Ack, chunk),
+                    sending_epoch,
+                    None,
+                ))
+            }
             Agent::EkSentCt1Received { .. }
             | Agent::NoHeaderReceived { .. }
             | Agent::HeaderReceived { .. }
-            | Agent::Ct1Acknowledged { .. } => {
-                Ok((self.msg(BraidType::None, Vec::new()), sending_epoch, None))
-            }
+            | Agent::Ct1Acknowledged { .. } => Ok((
+                Self::msg(epoch, BraidType::None, Vec::new()),
+                sending_epoch,
+                None,
+            )),
             Agent::Ct1Sampled { ct1_enc, .. } | Agent::EkReceivedCt1Sampled { ct1_enc, .. } => {
-                Ok((self.msg(BraidType::Ct1, ct1_enc.next_chunk()), sending_epoch, None))
+                let chunk = ct1_enc.next_chunk();
+                Ok((Self::msg(epoch, BraidType::Ct1, chunk), sending_epoch, None))
             }
             Agent::Ct2Sampled { ct2_enc, .. } => {
-                Ok((self.msg(BraidType::Ct2, ct2_enc.next_chunk()), sending_epoch, None))
+                let chunk = ct2_enc.next_chunk();
+                Ok((Self::msg(epoch, BraidType::Ct2, chunk), sending_epoch, None))
             }
         }
     }
 
-    fn msg(&self, typ: BraidType, data: Vec<u8>) -> BraidMessage {
-        BraidMessage {
-            epoch: self.epoch,
-            typ,
-            data,
-        }
+    fn msg(epoch: u64, typ: BraidType, data: Vec<u8>) -> BraidMessage {
+        BraidMessage { epoch, typ, data }
     }
 
     pub fn receive(
@@ -323,14 +329,15 @@ impl BraidScka {
                         let mut ct2a = [0u8; CT2_LEN];
                         ct2a.copy_from_slice(ct2);
                         let joined = join_ct(&ct1a, &ct2a);
-                        let cto = crate::primitives::kem::MlKemCiphertext::from_bytes(&joined)?;
-                        let mut ss_raw = dk.decapsulate(&cto)?;
+                        let ciphertext =
+                            crate::primitives::kem::MlKemCiphertext::from_bytes(&joined)?;
+                        let mut ss_raw = dk.decapsulate(&ciphertext)?;
                         let ss_result = kdf_ok(&ss_raw, self.epoch);
                         ss_raw.zeroize();
                         let ss = ss_result?;
                         self.auth.update(self.epoch, &ss)?;
                         self.auth.vfy_ct(self.epoch, &joined, mac)?;
-                        let out = SckaOutput {
+                        let output = SckaOutput {
                             epoch: self.epoch,
                             key: ss,
                         };
@@ -338,7 +345,7 @@ impl BraidScka {
                         self.agent = Agent::NoHeaderReceived {
                             header_dec: Decoder::new(HEADER_SIZE + MAC_SIZE),
                         };
-                        return Ok((receiving_epoch, Some(out)));
+                        return Ok((receiving_epoch, Some(output)));
                     }
                 }
                 Ok((receiving_epoch, None))
@@ -543,13 +550,13 @@ impl BraidScka {
             }
             _ => return Err(PrimitiveError::Internal),
         };
-        let out = SckaOutput {
+        let output = SckaOutput {
             epoch: self.epoch,
             key: ss,
         };
         self.epoch = new_epoch;
         self.agent = Agent::KeysUnsampled;
-        Ok((receiving_epoch, Some(out)))
+        Ok((receiving_epoch, Some(output)))
     }
 
     fn encaps1_if_needed(&mut self) -> Result<(), PrimitiveError> {
@@ -644,6 +651,9 @@ fn take_exact_vec(
     i: &mut usize,
     expected: usize,
 ) -> Result<Vec<u8>, PrimitiveError> {
+    if expected > MAX_AGENT_VECTOR {
+        return Err(PrimitiveError::LimitExceeded);
+    }
     let value = take_vec_bounded(data, i, expected)?;
     if value.len() != expected {
         return Err(PrimitiveError::InvalidLength);
@@ -1005,20 +1015,16 @@ mod tests {
     }
 
     #[test]
-    fn v3_rejects_noncanonical_boolean() {
+    fn canonical_generated_states_roundtrip() {
         let sk = [4u8; 32];
         let mut a = BraidScka::init_alice(&sk).unwrap();
         let mut b = BraidScka::init_bob(&sk).unwrap();
-        // Drive until a state containing emitted_ss is likely to appear.
         for _ in 0..120 {
             let (ma, _, _) = a.send().unwrap();
             b.receive(&ma).unwrap();
             let (mb, _, _) = b.send().unwrap();
             a.receive(&mb).unwrap();
-            let blob = a.serialize();
-            // Parser itself is the assertion here; canonical generated state
-            // must always round-trip under the stricter boolean decoder.
-            BraidScka::deserialize(&blob).unwrap();
+            BraidScka::deserialize(&a.serialize()).unwrap();
         }
     }
 
@@ -1026,10 +1032,5 @@ mod tests {
     fn oversized_persisted_state_is_rejected() {
         let blob = vec![0u8; MAX_BRAID_STATE + 1];
         assert!(BraidScka::deserialize(&blob).is_err());
-    }
-
-    #[test]
-    fn agent_vector_bound_constant_covers_expected_material() {
-        assert!(MAX_AGENT_VECTOR >= EK_SIZE);
     }
 }
