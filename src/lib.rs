@@ -44,3 +44,19 @@ pub use policy::{
 pub use primitives::kdf::LABELS;
 pub use session::SessionManager;
 pub use storage::{RollbackGuard, StorageEpoch};
+
+/// Debug representation intentionally summarizes the public bundle instead of
+/// dumping the full 1184-byte ML-KEM public key into logs/test failures.
+impl std::fmt::Debug for prekeys::PublicPrekeyBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicPrekeyBundle")
+            .field("identity_key", &self.identity_key)
+            .field("signed_prekey_id", &self.signed_prekey_id)
+            .field("signed_prekey", &self.signed_prekey)
+            .field("has_one_time_ec", &self.one_time_ec.is_some())
+            .field("pq_prekey_id", &self.pq_prekey_id)
+            .field("pq_prekey_public_len", &self.pq_prekey_public.len())
+            .field("is_pq_one_time", &self.is_pq_one_time)
+            .finish()
+    }
+}
