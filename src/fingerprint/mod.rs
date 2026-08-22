@@ -24,6 +24,12 @@ pub const NUMERIC_GROUP_SIZE: usize = 5;
 /// How many SHA-512 iterations for key stretching (independent of any
 /// external implementation; chosen for reasonable verification cost).
 const FINGERPRINT_ITERATIONS: u32 = 5200;
+/// Domain separator for the human-readable numeric representation.
+///
+/// This is deliberately versioned because the original v1 encoder only had
+/// seven 5-byte chunks available from the 32-byte binary fingerprint and
+/// padded the final 25 digits with zeroes.
+const NUMERIC_V2_LABEL: &[u8] = b"VoiceChat/Fingerprint/v2/Numeric60";
 
 /// Stable cryptographic fingerprint of a relationship between two parties.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,7 +89,7 @@ pub fn compute_fingerprint(
         material.extend_from_slice(&0u16.to_le_bytes());
     }
 
-    // Iterated hash for stretching
+    // Iterated hash for stretching.
     let mut hash = sha512(&material);
     for _ in 1..FINGERPRINT_ITERATIONS {
         hash = sha512(&hash);
@@ -92,7 +98,8 @@ pub fn compute_fingerprint(
     let mut binary = [0u8; 32];
     binary.copy_from_slice(&hash[0..32]);
 
-    // Numeric: interpret the 32 bytes as big-endian chunks → decimal digits
+    // The numeric form is a deterministic, domain-separated expansion of the
+    // binary fingerprint. It is intentionally not Signal wire-compatible.
     let numeric = binary_to_numeric(&binary);
 
     material.zeroize();
@@ -110,7 +117,7 @@ fn canonical_order<'a>(
     } else if b_bytes < a_bytes {
         (b, a)
     } else {
-        // Same identity key — order by device_id
+        // Same identity key — order by device_id.
         let a_dev = a.device_id.as_deref().unwrap_or(&[]);
         let b_dev = b.device_id.as_deref().unwrap_or(&[]);
         if a_dev <= b_dev {
@@ -122,21 +129,22 @@ fn canonical_order<'a>(
 }
 
 fn binary_to_numeric(binary: &[u8; 32]) -> String {
-    // Produce NUMERIC_DIGIT_COUNT decimal digits from the binary value.
-    // Simple, stable mapping: take successive 5-byte windows as u64 mod 10^5
-    // and emit 5 digits each (12 groups × 5 = 60).
+    // 12 groups × 5 decimal digits = 60 digits. Expand the entire binary
+    // fingerprint to 64 bytes first, then use twelve independent 5-byte
+    // windows. This removes the v1 bug where the last 25 digits were padding.
+    let mut input = Vec::with_capacity(NUMERIC_V2_LABEL.len() + binary.len());
+    input.extend_from_slice(NUMERIC_V2_LABEL);
+    input.extend_from_slice(binary);
+    let expanded = sha512(&input);
+
     let mut digits = String::with_capacity(NUMERIC_DIGIT_COUNT);
-    for chunk in binary.chunks(5).take(12) {
+    for chunk in expanded[..60].chunks_exact(5) {
         let mut buf = [0u8; 8];
-        buf[..chunk.len()].copy_from_slice(chunk);
+        buf[..5].copy_from_slice(chunk);
         let n = u64::from_le_bytes(buf) % 100_000;
-        digits.push_str(&format!("{:05}", n));
+        digits.push_str(&format!("{n:05}"));
     }
-    // Ensure exact length
-    digits.truncate(NUMERIC_DIGIT_COUNT);
-    while digits.len() < NUMERIC_DIGIT_COUNT {
-        digits.push('0');
-    }
+    debug_assert_eq!(digits.len(), NUMERIC_DIGIT_COUNT);
     digits
 }
 
@@ -338,7 +346,11 @@ impl TrustStore {
                 Some(data[i..i + dlen].to_vec())
             };
             i += dlen;
-            let acknowledged = data[i] != 0;
+            let acknowledged = match data[i] {
+                0 => false,
+                1 => true,
+                _ => return Err(PrimitiveError::InvalidLength),
+            };
             i += 1;
             let acknowledged_unix = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
             i += 8;
@@ -378,7 +390,6 @@ mod tests {
         let mut bytes = [seed; 32];
         bytes[0] = seed;
         bytes[31] = seed.wrapping_add(1);
-        // Ensure non-zero
         if bytes == [0u8; 32] {
             bytes[0] = 1;
         }
@@ -413,7 +424,7 @@ mod tests {
     fn device_change_affects_fingerprint() {
         let a = material(1, Some(b"device-1"));
         let b1 = material(2, Some(b"device-X"));
-        let b2 = material(2, Some(b"device-Y")); // same key, different device
+        let b2 = material(2, Some(b"device-Y"));
         let f1 = compute_fingerprint(&a, &b1).unwrap();
         let f2 = compute_fingerprint(&a, &b2).unwrap();
         assert_ne!(f1.binary, f2.binary);
@@ -426,8 +437,18 @@ mod tests {
         let fp = compute_fingerprint(&a, &b).unwrap();
         assert_eq!(fp.numeric.len(), NUMERIC_DIGIT_COUNT);
         assert!(fp.numeric.chars().all(|c| c.is_ascii_digit()));
-        let display = fp.numeric_display();
-        assert!(display.contains(' '));
+        assert_eq!(fp.numeric_display().split(' ').count(), 12);
+    }
+
+    #[test]
+    fn numeric_tail_is_data_bearing_not_zero_padding() {
+        let a = material(5, None);
+        let b = material(9, None);
+        let c = material(11, None);
+        let f1 = compute_fingerprint(&a, &b).unwrap();
+        let f2 = compute_fingerprint(&a, &c).unwrap();
+        assert_ne!(&f1.numeric[35..], "0000000000000000000000000");
+        assert_ne!(&f1.numeric[35..], &f2.numeric[35..]);
     }
 
     #[test]
@@ -446,11 +467,8 @@ mod tests {
 
     #[test]
     fn identity_change_on_key_swap() {
-        // SIM-swap-like: same “phone” is irrelevant; crypto identity changes.
         let original = material(10, Some(b"device-1"));
         let mut tracker = IdentityTracker::with_acknowledged(original.clone());
-
-        // Same device id, different identity key (attacker replaced the account)
         let attacker = material(99, Some(b"device-1"));
         let state = tracker.observe(&attacker);
         match state {
@@ -459,14 +477,10 @@ mod tests {
             }
             other => panic!("expected IdentityChanged, got {:?}", other),
         }
-
-        // Must NOT be trusted until acknowledge
         assert!(matches!(
             tracker.observe(&attacker),
             IdentityState::IdentityChanged { .. }
         ));
-
-        // Explicit acknowledgement clears the state
         tracker.acknowledge(attacker.clone());
         assert_eq!(tracker.observe(&attacker), IdentityState::Verified);
     }
@@ -474,8 +488,8 @@ mod tests {
     #[test]
     fn device_change_detected() {
         let original = material(10, Some(b"device-old"));
-        let mut tracker = IdentityTracker::with_acknowledged(original.clone());
-        let new_device = material(10, Some(b"device-new")); // same key, new device
+        let tracker = IdentityTracker::with_acknowledged(original.clone());
+        let new_device = material(10, Some(b"device-new"));
         let state = tracker.observe(&new_device);
         assert!(matches!(
             state,
@@ -488,9 +502,6 @@ mod tests {
 
     #[test]
     fn phone_number_irrelevant() {
-        // There is no phone-number field. Two different crypto identities
-        // always produce IdentityChanged regardless of any external
-        // phone-number “reauthentication”.
         let a = material(1, None);
         let b = material(2, None);
         let tracker = IdentityTracker::with_acknowledged(a);
@@ -498,5 +509,16 @@ mod tests {
             tracker.observe(&b),
             IdentityState::IdentityChanged { .. }
         ));
+    }
+
+    #[test]
+    fn trust_deserialize_rejects_noncanonical_boolean() {
+        let mut s = TrustStore::new();
+        let id = material(4, Some(b"d"));
+        s.record_seen(id);
+        let mut blob = s.serialize();
+        // Header(12) + identity(32) + device-len(2) + device(1) = boolean offset 47.
+        blob[47] = 2;
+        assert!(TrustStore::deserialize(&blob).is_err());
     }
 }
