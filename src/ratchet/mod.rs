@@ -17,7 +17,6 @@ pub mod spqr;
 pub mod triple;
 
 use std::collections::HashMap;
-
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::primitives::aead::{self, AeadKey};
@@ -25,12 +24,8 @@ use crate::primitives::error::PrimitiveError;
 use crate::primitives::kdf::{hkdf_extract_expand, LABELS};
 use crate::primitives::x25519::{X25519Public, X25519Secret};
 
-/// Configurable hard limit on skipped message keys per chain.
-/// An attacker cannot force more than this many stored keys or
-/// more than this many KDF steps in a single SkipMessageKeys call.
 pub const DEFAULT_MAX_SKIP: u32 = 1000;
 
-/// Message header as defined by the public specification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
     pub dh: X25519Public,
@@ -40,7 +35,7 @@ pub struct Header {
 
 impl Header {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 + 4 + 4);
+        let mut out = Vec::with_capacity(40);
         out.extend_from_slice(&self.dh.to_bytes());
         out.extend_from_slice(&self.pn.to_le_bytes());
         out.extend_from_slice(&self.n.to_le_bytes());
@@ -52,46 +47,32 @@ impl Header {
             return Err(PrimitiveError::InvalidLength);
         }
         let mut pk = [0u8; 32];
-        pk.copy_from_slice(&data[0..32]);
-        let dh = X25519Public::from_bytes(pk)?;
-        let pn = u32::from_le_bytes(data[32..36].try_into().unwrap());
-        let n = u32::from_le_bytes(data[36..40].try_into().unwrap());
-        Ok(Self { dh, pn, n })
+        pk.copy_from_slice(&data[..32]);
+        Ok(Self {
+            dh: X25519Public::from_bytes(pk)?,
+            pn: u32::from_le_bytes(data[32..36].try_into().unwrap()),
+            n: u32::from_le_bytes(data[36..40].try_into().unwrap()),
+        })
     }
 }
 
-/// Index for skipped message keys: (ratchet public key bytes, message number).
 type SkipKey = ([u8; 32], u32);
 
-/// Classical Double Ratchet state.
-///
-/// All secret material implements Zeroize / ZeroizeOnDrop.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DoubleRatchetState {
-    /// Sending DH ratchet key pair.
     dhs: Option<X25519Secret>,
-    /// Received (remote) DH ratchet public key (public, not secret).
     #[zeroize(skip)]
     dhr: Option<X25519Public>,
-    /// 32-byte root key.
     rk: [u8; 32],
-    /// Sending chain key.
     cks: Option<[u8; 32]>,
-    /// Receiving chain key.
     ckr: Option<[u8; 32]>,
-    /// Sending message number.
     ns: u32,
-    /// Receiving message number.
     nr: u32,
-    /// Previous sending chain length.
     pn: u32,
-    /// Skipped message keys. Hard-bounded by max_skip. Zeroized on drop.
     mkskipped: SkippedKeys,
-    /// Hard limit on skipped keys / skip distance.
     max_skip: u32,
 }
 
-/// HashMap of skipped message keys with explicit zeroization of every MK.
 #[derive(Clone, Default)]
 struct SkippedKeys(HashMap<SkipKey, [u8; 32]>);
 
@@ -115,8 +96,13 @@ impl SkippedKeys {
         self.0.remove(key)
     }
 
-    fn insert_unique(&mut self, key: SkipKey, mk: [u8; 32]) -> Result<(), PrimitiveError> {
+    fn insert_unique(
+        &mut self,
+        key: SkipKey,
+        mut mk: [u8; 32],
+    ) -> Result<(), PrimitiveError> {
         if self.0.contains_key(&key) {
+            mk.zeroize();
             return Err(PrimitiveError::Internal);
         }
         self.0.insert(key, mk);
@@ -132,9 +118,6 @@ impl SkippedKeys {
     }
 }
 
-/// Scalar/constant-size snapshot used to roll back a failed authenticated
-/// receive. Deliberately excludes the skipped-key map so normal in-order
-/// decrypt does not copy O(total skipped keys) secret state.
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct RatchetScalarSnapshot {
     dhs: Option<X25519Secret>,
@@ -166,9 +149,6 @@ impl RatchetScalarSnapshot {
     }
 }
 
-/// Only skipped-key mutations made by one speculative receive. On rollback,
-/// newly derived keys are removed/zeroized and a consumed skipped key is put
-/// back. This keeps failure atomicity without cloning the entire skipped map.
 #[derive(Default)]
 struct SkippedMutationJournal {
     inserted: Vec<SkipKey>,
@@ -188,8 +168,6 @@ pub(crate) fn checked_inc(n: u32) -> Result<u32, PrimitiveError> {
 }
 
 impl DoubleRatchetState {
-    /// Initialize Alice (initiator) after PQXDH shared secret SK is known
-    /// and Bob’s first ratchet public key is available.
     pub fn init_alice(
         sk: &[u8; 32],
         bob_dh_public: &X25519Public,
@@ -212,8 +190,6 @@ impl DoubleRatchetState {
         })
     }
 
-    /// Initialize Bob (responder). Bob still has the DH key pair that Alice used
-    /// (the signed prekey advertised in the bundle).
     pub fn init_bob(sk: &[u8; 32], bob_dh_keypair: X25519Secret, max_skip: u32) -> Self {
         Self {
             dhs: Some(bob_dh_keypair),
@@ -229,9 +205,6 @@ impl DoubleRatchetState {
         }
     }
 
-    /// Encrypt a plaintext. Only the sending chain key/counter can change.
-    /// They are restored if any later step fails, so an AEAD error never burns
-    /// a message key silently.
     pub fn encrypt(
         &mut self,
         plaintext: &[u8],
@@ -247,7 +220,6 @@ impl DoubleRatchetState {
                 return Err(e);
             }
         };
-
         let result = (|| {
             let dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
             let header = Header {
@@ -261,7 +233,6 @@ impl DoubleRatchetState {
             Ok((header, ct))
         })();
         mk.zeroize();
-
         if result.is_err() {
             self.cks = old_cks;
             self.ns = old_ns;
@@ -269,11 +240,6 @@ impl DoubleRatchetState {
         result
     }
 
-    /// Decrypt a ciphertext.
-    ///
-    /// **Critical invariant:** if key derivation or authentication fails, the
-    /// state is restored. The common in-order path snapshots only constant-size
-    /// scalar state; skipped keys are journaled only when actually touched.
     pub fn decrypt(
         &mut self,
         header: &Header,
@@ -289,15 +255,12 @@ impl DoubleRatchetState {
                 return Err(e);
             }
         };
-
         let associated = concat_ad(ad, header);
-        let key_nonce = aead_from_mk(&mk);
-        let plaintext = match key_nonce {
+        let plaintext = match aead_from_mk(&mk) {
             Ok((key, nonce)) => aead::open(&key, &nonce, ciphertext, &associated),
             Err(e) => Err(e),
         };
         mk.zeroize();
-
         match plaintext {
             Ok(pt) => Ok(pt),
             Err(e) => {
@@ -307,30 +270,25 @@ impl DoubleRatchetState {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Internal algorithms from the public specification
-    // ------------------------------------------------------------------
-
-    /// Derive the next sending message key without AEAD (Triple Ratchet).
     pub fn send_message_key(&mut self) -> Result<(Header, [u8; 32]), PrimitiveError> {
         let (ns, mk) = self.ratchet_send_key()?;
         let dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
-        let header = Header {
-            dh: dhs.public_key(),
-            pn: self.pn,
-            n: ns,
-        };
-        Ok((header, mk))
+        Ok((
+            Header {
+                dh: dhs.public_key(),
+                pn: self.pn,
+                n: ns,
+            },
+            mk,
+        ))
     }
 
-    /// Derive the receiving message key for `header` without AEAD (Triple Ratchet).
     pub fn receive_message_key(&mut self, header: &Header) -> Result<[u8; 32], PrimitiveError> {
         self.ratchet_receive_key(header)
     }
 
     fn ratchet_send_key(&mut self) -> Result<(u32, [u8; 32]), PrimitiveError> {
         let cks = self.cks.ok_or(PrimitiveError::Internal)?;
-        // Check the counter before committing the new chain key.
         let next_ns = checked_inc(self.ns)?;
         let (new_cks, mk) = kdf_ck(&cks)?;
         let ns = self.ns;
@@ -380,8 +338,7 @@ impl DoubleRatchetState {
     }
 
     fn try_skipped_message_keys(&mut self, header: &Header) -> Option<[u8; 32]> {
-        let key = (header.dh.to_bytes(), header.n);
-        self.mkskipped.remove(&key)
+        self.mkskipped.remove(&(header.dh.to_bytes(), header.n))
     }
 
     fn skip_message_keys(&mut self, until: u32) -> Result<(), PrimitiveError> {
@@ -446,13 +403,11 @@ impl DoubleRatchetState {
         self.ns = 0;
         self.nr = 0;
         self.dhr = Some(header.dh);
-
         let dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
         let dh_out1 = dhs.diffie_hellman(&header.dh);
         let (rk1, ckr) = kdf_rk(&self.rk, &dh_out1)?;
         self.rk = rk1;
         self.ckr = Some(ckr);
-
         let new_dhs = X25519Secret::generate()?;
         let dh_out2 = new_dhs.diffie_hellman(&header.dh);
         let (rk2, cks) = kdf_rk(&self.rk, &dh_out2)?;
@@ -467,7 +422,6 @@ impl DoubleRatchetState {
         snapshot: &RatchetScalarSnapshot,
         journal: &mut SkippedMutationJournal,
     ) -> Result<(), PrimitiveError> {
-        // Undo inserted skipped keys first and zeroize their derived MKs.
         for key in journal.inserted.drain(..).rev() {
             let mut mk = self
                 .mkskipped
@@ -478,7 +432,6 @@ impl DoubleRatchetState {
         if let Some((key, mk)) = journal.removed.take() {
             self.mkskipped.insert_unique(key, mk)?;
         }
-
         self.dhs = snapshot
             .dhs
             .as_ref()
@@ -493,8 +446,6 @@ impl DoubleRatchetState {
         Ok(())
     }
 
-    /// Full snapshot retained for the experimental Triple Ratchet path.
-    /// Classical engine decrypt no longer needs to clone the whole skipped map.
     pub fn clone_for_trial(&self) -> Self {
         Self {
             dhs: self
@@ -513,12 +464,6 @@ impl DoubleRatchetState {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Serialization (for reload tests after every transition)
-    // ------------------------------------------------------------------
-
-    /// Serialize state for persistence / crash recovery. Entries in the
-    /// skipped-key map are sorted so equivalent states have canonical bytes.
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match &self.dhs {
@@ -542,11 +487,10 @@ impl DoubleRatchetState {
         out.extend_from_slice(&self.nr.to_le_bytes());
         out.extend_from_slice(&self.pn.to_le_bytes());
         out.extend_from_slice(&self.max_skip.to_le_bytes());
-
         let mut skipped: Vec<(SkipKey, [u8; 32])> = self
             .mkskipped
             .iter()
-            .map(|(k, mk)| (*k, *mk))
+            .map(|(key, mk)| (*key, *mk))
             .collect();
         skipped.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         out.extend_from_slice(&(skipped.len() as u32).to_le_bytes());
@@ -563,10 +507,9 @@ impl DoubleRatchetState {
         let mut i = 0usize;
         let dhs = read_opt32(data, &mut i)?.map(X25519Secret::from_bytes);
         let dhr = match read_opt32(data, &mut i)? {
-            Some(b) => Some(X25519Public::from_bytes(b)?),
+            Some(bytes) => Some(X25519Public::from_bytes(bytes)?),
             None => None,
         };
-
         let mut rk = [0u8; 32];
         rk.copy_from_slice(take(data, &mut i, 32)?);
         let cks = read_opt32(data, &mut i)?;
@@ -588,7 +531,6 @@ impl DoubleRatchetState {
         if data.len().saturating_sub(i) != needed {
             return Err(PrimitiveError::InvalidLength);
         }
-
         let mut mkskipped = SkippedKeys::default();
         for _ in 0..count {
             let mut pk = [0u8; 32];
@@ -603,7 +545,6 @@ impl DoubleRatchetState {
         if i != data.len() {
             return Err(PrimitiveError::InvalidLength);
         }
-
         Ok(Self {
             dhs,
             dhr,
@@ -618,7 +559,6 @@ impl DoubleRatchetState {
         })
     }
 
-    /// Number of currently skipped keys (for tests / bounds checks).
     pub fn skipped_count(&self) -> usize {
         self.mkskipped.len()
     }
@@ -629,9 +569,9 @@ fn take<'a>(data: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8], Primiti
     if end > data.len() {
         return Err(PrimitiveError::InvalidLength);
     }
-    let s = &data[*i..end];
+    let out = &data[*i..end];
     *i = end;
-    Ok(s)
+    Ok(out)
 }
 
 fn read_u32(data: &[u8], i: &mut usize) -> Result<u32, PrimitiveError> {
@@ -649,8 +589,7 @@ fn write_opt32(out: &mut Vec<u8>, value: Option<&[u8; 32]>) {
 }
 
 fn read_opt32(data: &[u8], i: &mut usize) -> Result<Option<[u8; 32]>, PrimitiveError> {
-    let tag = take(data, i, 1)?[0];
-    match tag {
+    match take(data, i, 1)?[0] {
         0 => Ok(None),
         1 => {
             let mut out = [0u8; 32];
@@ -661,17 +600,13 @@ fn read_opt32(data: &[u8], i: &mut usize) -> Result<Option<[u8; 32]>, PrimitiveE
     }
 }
 
-// ---------------------------------------------------------------------------
-// KDF helpers matching the public specification’s KDF_RK / KDF_CK
-// ---------------------------------------------------------------------------
-
 fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), PrimitiveError> {
     let mut okm = [0u8; 64];
     hkdf_extract_expand(Some(rk), dh_out, LABELS::DR_ROOT, &mut okm)?;
     let mut new_rk = [0u8; 32];
     let mut ck = [0u8; 32];
-    new_rk.copy_from_slice(&okm[0..32]);
-    ck.copy_from_slice(&okm[32..64]);
+    new_rk.copy_from_slice(&okm[..32]);
+    ck.copy_from_slice(&okm[32..]);
     okm.zeroize();
     Ok((new_rk, ck))
 }
@@ -682,7 +617,6 @@ fn kdf_ck(ck: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), PrimitiveError> {
     Ok((new_ck, mk))
 }
 
-/// Derive an independent AEAD key and nonce from a unique message key.
 fn aead_from_mk(mk: &[u8; 32]) -> Result<(AeadKey, [u8; 12]), PrimitiveError> {
     let salt = [0u8; 32];
     let mut okm = [0u8; 44];
@@ -690,7 +624,7 @@ fn aead_from_mk(mk: &[u8; 32]) -> Result<(AeadKey, [u8; 12]), PrimitiveError> {
     let mut key = [0u8; 32];
     let mut nonce = [0u8; 12];
     key.copy_from_slice(&okm[..32]);
-    nonce.copy_from_slice(&okm[32..44]);
+    nonce.copy_from_slice(&okm[32..]);
     okm.zeroize();
     Ok((AeadKey::from_bytes(key), nonce))
 }
@@ -703,19 +637,14 @@ fn concat_ad(ad: &[u8], header: &Header) -> Vec<u8> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::x25519::X25519Secret;
 
     fn fresh_sk() -> [u8; 32] {
-        let mut s = [0u8; 32];
-        crate::primitives::random::fill_random(&mut s).unwrap();
-        s
+        let mut sk = [0u8; 32];
+        crate::primitives::random::fill_random(&mut sk).unwrap();
+        sk
     }
 
     #[test]
@@ -725,19 +654,16 @@ mod tests {
         let bob_pub = bob_dh.public_key();
         let mut alice = DoubleRatchetState::init_alice(&sk, &bob_pub, DEFAULT_MAX_SKIP).unwrap();
         let mut bob = DoubleRatchetState::init_bob(&sk, bob_dh, DEFAULT_MAX_SKIP);
-
-        let (h1, c1) = alice.encrypt(b"A1", b"ad").unwrap();
-        assert_eq!(bob.decrypt(&h1, &c1, b"ad").unwrap(), b"A1");
-        let (h2, c2) = alice.encrypt(b"A2", b"ad").unwrap();
-        assert_eq!(bob.decrypt(&h2, &c2, b"ad").unwrap(), b"A2");
-        let (h3, c3) = alice.encrypt(b"A3", b"ad").unwrap();
-        assert_eq!(bob.decrypt(&h3, &c3, b"ad").unwrap(), b"A3");
-        let (hb1, cb1) = bob.encrypt(b"B1", b"ad").unwrap();
-        assert_eq!(alice.decrypt(&hb1, &cb1, b"ad").unwrap(), b"B1");
-        let (hb2, cb2) = bob.encrypt(b"B2", b"ad").unwrap();
-        assert_eq!(alice.decrypt(&hb2, &cb2, b"ad").unwrap(), b"B2");
-        let (h4, c4) = alice.encrypt(b"A4", b"ad").unwrap();
-        assert_eq!(bob.decrypt(&h4, &c4, b"ad").unwrap(), b"A4");
+        for msg in [b"A1".as_slice(), b"A2", b"A3"] {
+            let (h, c) = alice.encrypt(msg, b"ad").unwrap();
+            assert_eq!(bob.decrypt(&h, &c, b"ad").unwrap(), msg);
+        }
+        for msg in [b"B1".as_slice(), b"B2"] {
+            let (h, c) = bob.encrypt(msg, b"ad").unwrap();
+            assert_eq!(alice.decrypt(&h, &c, b"ad").unwrap(), msg);
+        }
+        let (h, c) = alice.encrypt(b"A4", b"ad").unwrap();
+        assert_eq!(bob.decrypt(&h, &c, b"ad").unwrap(), b"A4");
     }
 
     #[test]
@@ -749,7 +675,9 @@ mod tests {
         let mut bob = DoubleRatchetState::init_bob(&sk, bob_dh, DEFAULT_MAX_SKIP);
         let (h, mut ct) = alice.encrypt(b"secret", b"ad").unwrap();
         let before = bob.serialize();
-        ct.last_mut().map(|b| *b ^= 0xff);
+        if let Some(byte) = ct.last_mut() {
+            *byte ^= 0xff;
+        }
         assert!(bob.decrypt(&h, &ct, b"ad").is_err());
         assert_eq!(before, bob.serialize());
     }
@@ -784,22 +712,6 @@ mod tests {
         h.n = 10_000;
         assert!(bob.decrypt(&h, &c, b"ad").is_err());
         assert!(bob.skipped_count() <= 5);
-    }
-
-    #[test]
-    fn forward_secrecy_after_deletion() {
-        let sk = fresh_sk();
-        let bob_dh = X25519Secret::generate().unwrap();
-        let mut alice =
-            DoubleRatchetState::init_alice(&sk, &bob_dh.public_key(), DEFAULT_MAX_SKIP).unwrap();
-        let mut bob = DoubleRatchetState::init_bob(&sk, bob_dh, DEFAULT_MAX_SKIP);
-        let (h1, c1) = alice.encrypt(b"old", b"ad").unwrap();
-        assert_eq!(bob.decrypt(&h1, &c1, b"ad").unwrap(), b"old");
-        for _ in 0..5 {
-            let (h, c) = alice.encrypt(b"next", b"ad").unwrap();
-            assert_eq!(bob.decrypt(&h, &c, b"ad").unwrap(), b"next");
-        }
-        assert!(bob.decrypt(&h1, &c1, b"ad").is_err());
     }
 
     #[test]
@@ -846,8 +758,9 @@ mod tests {
         let sk = fresh_sk();
         let bob_dh = X25519Secret::generate().unwrap();
         let bob = DoubleRatchetState::init_bob(&sk, bob_dh, DEFAULT_MAX_SKIP);
-        let blob = bob.serialize();
-        assert!(DoubleRatchetState::deserialize(&blob, DEFAULT_MAX_SKIP - 1).is_err());
+        assert!(
+            DoubleRatchetState::deserialize(&bob.serialize(), DEFAULT_MAX_SKIP - 1).is_err()
+        );
     }
 
     #[test]
