@@ -30,7 +30,7 @@ pub mod testing;
 
 pub use engine::{
     CryptoEngineApi, CryptoError, DeviceConfig, InboundSessionMessage, InitiationPacket,
-    SealedMessage, SessionId, VoiceChatCryptoEngine,
+    SealedMessage, SessionId, SessionTag, VoiceChatCryptoEngine,
 };
 pub use fingerprint::{
     compute_fingerprint, IdentityChangeReason, IdentityMaterial, IdentityState, IdentityTracker,
@@ -46,7 +46,7 @@ pub use session::SessionManager;
 pub use storage::{RollbackGuard, StorageEpoch};
 
 /// Debug representation intentionally summarizes the public bundle instead of
-/// dumping the full 1184-byte ML-KEM public key into logs/test failures.
+/// dumping the full ML-KEM public key into logs/test failures.
 impl std::fmt::Debug for prekeys::PublicPrekeyBundle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PublicPrekeyBundle")
