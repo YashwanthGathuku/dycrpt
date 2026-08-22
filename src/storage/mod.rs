@@ -2,6 +2,11 @@
 //!
 //! Invariant: never produce externally sendable ciphertext unless the
 //! corresponding ratchet-state transition can be committed safely.
+//!
+//! The storage transaction itself is only one half of rollback resistance.
+//! The engine also binds every successful commit to an external monotonic
+//! counter (`storage::monotonic::MonotonicCounter`). If the counter advances
+//! but a storage commit has an unknown/failed outcome, the engine fails closed.
 
 pub mod monotonic;
 
@@ -23,6 +28,12 @@ pub struct StorageEpoch(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransactionId(pub u64);
 
+/// Minimal durable-store contract required by the crypto engine.
+///
+/// Implementations must provide atomic transaction semantics: after a
+/// successful `commit`, every staged put/delete is durable together; after a
+/// successful `abort`, none of them are. If commit outcome is uncertain, return
+/// an error — the engine will poison itself and refuse further crypto work.
 pub trait TransactionalStorage: Send + Sync {
     fn begin(&mut self) -> Result<TransactionId, PrimitiveError>;
     fn put(
@@ -35,6 +46,13 @@ pub trait TransactionalStorage: Send + Sync {
     fn commit(&mut self, tx: TransactionId) -> Result<(), PrimitiveError>;
     fn abort(&mut self, tx: TransactionId) -> Result<(), PrimitiveError>;
     fn get(&self, key: &[u8]) -> Result<Option<StateBlob>, PrimitiveError>;
+
+    /// Enumerate committed keys so sessions can be restored/deleted without
+    /// requiring an implementation-specific downcast.
+    fn keys(&self) -> Result<Vec<Vec<u8>>, PrimitiveError>;
+
+    /// Legacy/local epoch helpers retained for tests and adapters. The crypto
+    /// engine does not treat these as a trusted anti-rollback primitive.
     fn epoch(&self) -> Result<StorageEpoch, PrimitiveError>;
     fn advance_epoch(&mut self) -> Result<StorageEpoch, PrimitiveError>;
 }
@@ -51,13 +69,27 @@ pub struct MemoryStorage {
     epoch: u64,
 }
 
+fn zeroize_staged(
+    staged: &mut std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
+) {
+    for value in staged.values_mut() {
+        if let Some(bytes) = value.as_mut() {
+            bytes.zeroize();
+        }
+    }
+    staged.clear();
+}
+
 impl TransactionalStorage for MemoryStorage {
     fn begin(&mut self) -> Result<TransactionId, PrimitiveError> {
         if self.staged.is_some() {
             return Err(PrimitiveError::Internal);
         }
         let id = TransactionId(self.next_tx);
-        self.next_tx += 1;
+        self.next_tx = self
+            .next_tx
+            .checked_add(1)
+            .ok_or(PrimitiveError::LimitExceeded)?;
         self.staged = Some((id, std::collections::HashMap::new()));
         Ok(id)
     }
@@ -72,7 +104,9 @@ impl TransactionalStorage for MemoryStorage {
         if staged.0 != tx {
             return Err(PrimitiveError::Internal);
         }
-        staged.1.insert(key.to_vec(), Some(value.0.clone()));
+        if let Some(Some(mut old)) = staged.1.insert(key.to_vec(), Some(value.0.clone())) {
+            old.zeroize();
+        }
         Ok(())
     }
 
@@ -81,7 +115,9 @@ impl TransactionalStorage for MemoryStorage {
         if staged.0 != tx {
             return Err(PrimitiveError::Internal);
         }
-        staged.1.insert(key.to_vec(), None);
+        if let Some(Some(mut old)) = staged.1.insert(key.to_vec(), None) {
+            old.zeroize();
+        }
         Ok(())
     }
 
@@ -94,10 +130,14 @@ impl TransactionalStorage for MemoryStorage {
         for (k, v) in staged.1 {
             match v {
                 Some(val) => {
-                    self.committed.insert(k, val);
+                    if let Some(mut old) = self.committed.insert(k, val) {
+                        old.zeroize();
+                    }
                 }
                 None => {
-                    self.committed.remove(&k);
+                    if let Some(mut old) = self.committed.remove(&k) {
+                        old.zeroize();
+                    }
                 }
             }
         }
@@ -105,17 +145,25 @@ impl TransactionalStorage for MemoryStorage {
     }
 
     fn abort(&mut self, tx: TransactionId) -> Result<(), PrimitiveError> {
-        if let Some((id, _)) = &self.staged {
-            if *id == tx {
-                self.staged = None;
-                return Ok(());
+        match self.staged.take() {
+            Some((id, mut staged)) if id == tx => {
+                zeroize_staged(&mut staged);
+                Ok(())
             }
+            Some(other) => {
+                self.staged = Some(other);
+                Err(PrimitiveError::Internal)
+            }
+            None => Err(PrimitiveError::Internal),
         }
-        Err(PrimitiveError::Internal)
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<StateBlob>, PrimitiveError> {
         Ok(self.committed.get(key).map(|v| StateBlob(v.clone())))
+    }
+
+    fn keys(&self) -> Result<Vec<Vec<u8>>, PrimitiveError> {
+        Ok(self.committed.keys().cloned().collect())
     }
 
     fn epoch(&self) -> Result<StorageEpoch, PrimitiveError> {
@@ -131,7 +179,11 @@ impl TransactionalStorage for MemoryStorage {
     }
 }
 
-/// Detects restoration of an older storage epoch (backup / rollback).
+/// Detects restoration of an older storage epoch within a running process.
+///
+/// Production anti-rollback additionally compares the durable epoch stored in
+/// the transaction with an external monotonic counter that is not restored by
+/// application backup/rollback.
 #[derive(Clone, Debug, Default)]
 pub struct RollbackGuard {
     last_seen: u64,
@@ -153,18 +205,22 @@ impl RollbackGuard {
 }
 
 impl MemoryStorage {
-    /// Committed keys (for crash-reload of all sessions).
+    /// Committed keys (test convenience wrapper).
     pub fn keys(&self) -> Vec<Vec<u8>> {
         self.committed.keys().cloned().collect()
     }
 
-    /// Drop every committed blob (delete-all-sessions).
+    /// Drop every committed blob. This is intentionally not part of the
+    /// `TransactionalStorage` trait because the crypto engine must not erase
+    /// identity/prekey/trust state when a user only requests session deletion.
     pub fn clear(&mut self) {
         for v in self.committed.values_mut() {
-            v.fill(0);
+            v.zeroize();
         }
         self.committed.clear();
-        self.staged = None;
+        if let Some((_, mut staged)) = self.staged.take() {
+            zeroize_staged(&mut staged);
+        }
     }
 }
 
@@ -215,8 +271,19 @@ mod tests {
         store
             .put(tx, b"k", &StateBlob(b"uncommitted".to_vec()))
             .unwrap();
-        // Process crash ≈ drop staged transaction without commit.
         store.abort(tx).unwrap();
         assert!(store.get(b"k").unwrap().is_none());
+    }
+
+    #[test]
+    fn trait_key_enumeration_matches_committed_state() {
+        let mut store = MemoryStorage::default();
+        let tx = store.begin().unwrap();
+        store.put(tx, b"a", &StateBlob(vec![1])).unwrap();
+        store.put(tx, b"b", &StateBlob(vec![2])).unwrap();
+        store.commit(tx).unwrap();
+        let mut keys = TransactionalStorage::keys(&store).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
     }
 }
