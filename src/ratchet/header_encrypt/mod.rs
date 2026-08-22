@@ -9,7 +9,7 @@
 //! This is an **optional** profile. See docs/HEADER_ENCRYPTION.md for the
 //! full tradeoff analysis.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -21,6 +21,56 @@ use crate::ratchet::Header;
 #[cfg(test)]
 use crate::ratchet::DEFAULT_MAX_SKIP;
 
+type HeSkipKey = ([u8; 32], u32);
+
+/// Header-encryption skipped keys contain message-key secrets and must be
+/// zeroized on destruction. The old raw HashMap was intentionally skipped by
+/// the parent derive and therefore did not wipe its values.
+#[derive(Clone, Default)]
+struct HeSkippedKeys(HashMap<HeSkipKey, [u8; 32]>);
+
+impl Zeroize for HeSkippedKeys {
+    fn zeroize(&mut self) {
+        for mk in self.0.values_mut() {
+            mk.zeroize();
+        }
+        self.0.clear();
+    }
+}
+
+impl Drop for HeSkippedKeys {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl HeSkippedKeys {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn remove(&mut self, key: &HeSkipKey) -> Option<[u8; 32]> {
+        self.0.remove(key)
+    }
+
+    fn insert_unique(&mut self, key: HeSkipKey, mut mk: [u8; 32]) -> Result<(), PrimitiveError> {
+        if self.0.contains_key(&key) {
+            mk.zeroize();
+            return Err(PrimitiveError::Internal);
+        }
+        self.0.insert(key, mk);
+        Ok(())
+    }
+
+    fn header_keys(&self) -> HashSet<[u8; 32]> {
+        self.0.keys().map(|(hk, _)| *hk).collect()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&HeSkipKey, &[u8; 32])> {
+        self.0.iter()
+    }
+}
+
 /// Additional state for the Header Encryption variant.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HeaderEncryptState {
@@ -30,18 +80,17 @@ pub struct HeaderEncryptState {
     rk: [u8; 32],
     cks: Option<[u8; 32]>,
     ckr: Option<[u8; 32]>,
-    /// Sending / receiving header keys
+    /// Sending / receiving header keys.
     hks: Option<[u8; 32]>,
     hkr: Option<[u8; 32]>,
-    /// Next header keys
+    /// Next header keys.
     nhks: Option<[u8; 32]>,
     nhkr: Option<[u8; 32]>,
     ns: u32,
     nr: u32,
     pn: u32,
-    /// Skipped message keys indexed by (header_key_bytes, n)
-    #[zeroize(skip)]
-    mkskipped: HashMap<([u8; 32], u32), [u8; 32]>,
+    /// Skipped message keys indexed by (header_key_bytes, n).
+    mkskipped: HeSkippedKeys,
     max_skip: u32,
 }
 
@@ -70,7 +119,7 @@ impl HeaderEncryptState {
             ns: 0,
             nr: 0,
             pn: 0,
-            mkskipped: HashMap::new(),
+            mkskipped: HeSkippedKeys::default(),
             max_skip,
         })
     }
@@ -96,37 +145,48 @@ impl HeaderEncryptState {
             ns: 0,
             nr: 0,
             pn: 0,
-            mkskipped: HashMap::new(),
+            mkskipped: HeSkippedKeys::default(),
             max_skip,
         }
     }
 
-    /// Encrypt: returns (encrypted_header, ciphertext).
+    /// Encrypt: returns (encrypted_header, ciphertext). Sending-chain state is
+    /// restored if header encryption or payload AEAD fails.
     pub fn encrypt(
         &mut self,
         plaintext: &[u8],
         ad: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), PrimitiveError> {
+        let old_cks = self.cks;
+        let old_ns = self.ns;
         let cks = self.cks.ok_or(PrimitiveError::Internal)?;
-        let (new_cks, mk) = kdf_ck(&cks)?;
-        self.cks = Some(new_cks);
+        let next_ns = crate::ratchet::checked_inc(self.ns)?;
+        let (new_cks, mut mk) = kdf_ck(&cks)?;
         let ns = self.ns;
-        self.ns = crate::ratchet::checked_inc(self.ns)?;
+        self.cks = Some(new_cks);
+        self.ns = next_ns;
 
-        let dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
-        let header = Header {
-            dh: dhs.public_key(),
-            pn: self.pn,
-            n: ns,
-        };
-        let hks = self.hks.ok_or(PrimitiveError::Internal)?;
-        let enc_header = hencrypt(&hks, &header.encode())?;
-
-        let associated = concat_ad(ad, &enc_header);
-        let key = AeadKey::from_bytes(mk);
-        let nonce = derive_nonce(&mk);
-        let ct = aead::seal(&key, &nonce, plaintext, &associated)?;
-        Ok((enc_header, ct))
+        let result = (|| {
+            let dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
+            let header = Header {
+                dh: dhs.public_key(),
+                pn: self.pn,
+                n: ns,
+            };
+            let hks = self.hks.ok_or(PrimitiveError::Internal)?;
+            let enc_header = hencrypt(&hks, &header.encode())?;
+            let associated = concat_ad(ad, &enc_header);
+            let key = AeadKey::from_bytes(mk);
+            let nonce = derive_nonce(&mk);
+            let ct = aead::seal(&key, &nonce, plaintext, &associated)?;
+            Ok((enc_header, ct))
+        })();
+        mk.zeroize();
+        if result.is_err() {
+            self.cks = old_cks;
+            self.ns = old_ns;
+        }
+        result
     }
 
     /// Decrypt. Transactional: on AEAD failure state is left unchanged.
@@ -137,43 +197,44 @@ impl HeaderEncryptState {
         ad: &[u8],
     ) -> Result<Vec<u8>, PrimitiveError> {
         let mut trial = self.clone_for_trial();
-        let mk = trial.receive_key(enc_header)?;
+        let mut mk = trial.receive_key(enc_header)?;
         let associated = concat_ad(ad, enc_header);
         let key = AeadKey::from_bytes(mk);
         let nonce = derive_nonce(&mk);
-        let plaintext = aead::open(&key, &nonce, ciphertext, &associated)?;
+        let plaintext = aead::open(&key, &nonce, ciphertext, &associated);
+        mk.zeroize();
+        let plaintext = plaintext?;
         *self = trial;
         Ok(plaintext)
     }
 
     fn receive_key(&mut self, enc_header: &[u8]) -> Result<[u8; 32], PrimitiveError> {
-        // Try skipped first (indexed by header key)
         if let Some(mk) = self.try_skipped(enc_header)? {
             return Ok(mk);
         }
 
-        // Try current HKr
         if let Some(hkr) = self.hkr {
             if let Ok(header) = hdecrypt(&hkr, enc_header) {
                 self.skip_message_keys(header.n)?;
                 let ckr = self.ckr.ok_or(PrimitiveError::Internal)?;
+                let next_nr = crate::ratchet::checked_inc(self.nr)?;
                 let (new_ckr, mk) = kdf_ck(&ckr)?;
                 self.ckr = Some(new_ckr);
-                self.nr = crate::ratchet::checked_inc(self.nr)?;
+                self.nr = next_nr;
                 return Ok(mk);
             }
         }
 
-        // Try next header key → triggers DH ratchet
         if let Some(nhkr) = self.nhkr {
             if let Ok(header) = hdecrypt(&nhkr, enc_header) {
                 self.skip_message_keys(header.pn)?;
                 self.dh_ratchet(&header)?;
                 self.skip_message_keys(header.n)?;
                 let ckr = self.ckr.ok_or(PrimitiveError::Internal)?;
+                let next_nr = crate::ratchet::checked_inc(self.nr)?;
                 let (new_ckr, mk) = kdf_ck(&ckr)?;
                 self.ckr = Some(new_ckr);
-                self.nr = crate::ratchet::checked_inc(self.nr)?;
+                self.nr = next_nr;
                 return Ok(mk);
             }
         }
@@ -182,12 +243,10 @@ impl HeaderEncryptState {
     }
 
     fn try_skipped(&mut self, enc_header: &[u8]) -> Result<Option<[u8; 32]>, PrimitiveError> {
-        // Attempt decrypt under each stored header key (bounded)
-        let keys: Vec<[u8; 32]> = self.mkskipped.keys().map(|(hk, _)| *hk).collect();
-        for hk in keys {
+        // Attempt each distinct stored header key at most once.
+        for hk in self.mkskipped.header_keys() {
             if let Ok(header) = hdecrypt(&hk, enc_header) {
-                let key = (hk, header.n);
-                if let Some(mk) = self.mkskipped.remove(&key) {
+                if let Some(mk) = self.mkskipped.remove(&(hk, header.n)) {
                     return Ok(Some(mk));
                 }
             }
@@ -196,18 +255,23 @@ impl HeaderEncryptState {
     }
 
     fn skip_message_keys(&mut self, until: u32) -> Result<(), PrimitiveError> {
-        if self.nr.saturating_add(self.max_skip) < until {
-            return Err(PrimitiveError::InvalidLength);
+        let limit = self
+            .nr
+            .checked_add(self.max_skip)
+            .ok_or(PrimitiveError::LimitExceeded)?;
+        if limit < until {
+            return Err(PrimitiveError::LimitExceeded);
         }
         if let (Some(mut ckr), Some(hkr)) = (self.ckr, self.hkr) {
             while self.nr < until {
                 if self.mkskipped.len() as u32 >= self.max_skip {
-                    return Err(PrimitiveError::InvalidLength);
+                    return Err(PrimitiveError::LimitExceeded);
                 }
+                let next_nr = crate::ratchet::checked_inc(self.nr)?;
                 let (new_ckr, mk) = kdf_ck(&ckr)?;
-                self.mkskipped.insert((hkr, self.nr), mk);
+                self.mkskipped.insert_unique((hkr, self.nr), mk)?;
                 ckr = new_ckr;
-                self.nr = crate::ratchet::checked_inc(self.nr)?;
+                self.nr = next_nr;
             }
             self.ckr = Some(ckr);
         }
@@ -218,7 +282,6 @@ impl HeaderEncryptState {
         self.pn = self.ns;
         self.ns = 0;
         self.nr = 0;
-        // Shift header keys
         self.hks = self.nhks;
         self.hkr = self.nhkr;
         self.dhr = Some(header.dh);
@@ -278,16 +341,19 @@ impl HeaderEncryptState {
         }
         let tag = data[*i];
         *i += 1;
-        if tag == 0 {
-            return Ok(None);
+        match tag {
+            0 => Ok(None),
+            1 => {
+                if *i + 32 > data.len() {
+                    return Err(PrimitiveError::InvalidLength);
+                }
+                let mut b = [0u8; 32];
+                b.copy_from_slice(&data[*i..*i + 32]);
+                *i += 32;
+                Ok(Some(b))
+            }
+            _ => Err(PrimitiveError::InvalidLength),
         }
-        if tag != 1 || *i + 32 > data.len() {
-            return Err(PrimitiveError::InvalidLength);
-        }
-        let mut b = [0u8; 32];
-        b.copy_from_slice(&data[*i..*i + 32]);
-        *i += 32;
-        Ok(Some(b))
     }
 
     /// Persist HE ratchet (DH, root/chain/header keys, skipped MKs).
@@ -318,18 +384,26 @@ impl HeaderEncryptState {
         out.extend_from_slice(&self.nr.to_le_bytes());
         out.extend_from_slice(&self.pn.to_le_bytes());
         out.extend_from_slice(&self.max_skip.to_le_bytes());
-        out.extend_from_slice(&(self.mkskipped.len() as u32).to_le_bytes());
-        for ((hk, n), mk) in &self.mkskipped {
-            out.extend_from_slice(hk);
+
+        let mut skipped: Vec<(HeSkipKey, [u8; 32])> = self
+            .mkskipped
+            .iter()
+            .map(|(key, mk)| (*key, *mk))
+            .collect();
+        skipped.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        out.extend_from_slice(&(skipped.len() as u32).to_le_bytes());
+        for ((hk, n), mut mk) in skipped {
+            out.extend_from_slice(&hk);
             out.extend_from_slice(&n.to_le_bytes());
-            out.extend_from_slice(mk);
+            out.extend_from_slice(&mk);
+            mk.zeroize();
         }
         out
     }
 
     /// Restore HE ratchet from [`Self::serialize`].
     pub fn deserialize(data: &[u8], max_skip: u32) -> Result<Self, PrimitiveError> {
-        let mut i = 0;
+        let mut i = 0usize;
         let dhs = Self::read_opt32(data, &mut i)?.map(X25519Secret::from_bytes);
         let dhr = match Self::read_opt32(data, &mut i)? {
             Some(b) => Some(X25519Public::from_bytes(b)?),
@@ -347,7 +421,7 @@ impl HeaderEncryptState {
         let hkr = Self::read_opt32(data, &mut i)?;
         let nhks = Self::read_opt32(data, &mut i)?;
         let nhkr = Self::read_opt32(data, &mut i)?;
-        if i + 16 > data.len() {
+        if i + 20 > data.len() {
             return Err(PrimitiveError::InvalidLength);
         }
         let ns = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
@@ -356,18 +430,25 @@ impl HeaderEncryptState {
         i += 4;
         let pn = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
         i += 4;
-        let _stored_max = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        let stored_max = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
         i += 4;
-        if i + 4 > data.len() {
+        if stored_max != max_skip {
             return Err(PrimitiveError::InvalidLength);
         }
         let count = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
         i += 4;
-        let mut mkskipped = HashMap::new();
+        if count > max_skip as usize {
+            return Err(PrimitiveError::LimitExceeded);
+        }
+        let needed = count
+            .checked_mul(68)
+            .ok_or(PrimitiveError::LimitExceeded)?;
+        if data.len().saturating_sub(i) != needed {
+            return Err(PrimitiveError::InvalidLength);
+        }
+
+        let mut mkskipped = HeSkippedKeys::default();
         for _ in 0..count {
-            if i + 68 > data.len() {
-                return Err(PrimitiveError::InvalidLength);
-            }
             let mut hk = [0u8; 32];
             hk.copy_from_slice(&data[i..i + 32]);
             i += 32;
@@ -376,7 +457,9 @@ impl HeaderEncryptState {
             let mut mk = [0u8; 32];
             mk.copy_from_slice(&data[i..i + 32]);
             i += 32;
-            mkskipped.insert((hk, n), mk);
+            if mkskipped.insert_unique((hk, n), mk).is_err() {
+                return Err(PrimitiveError::InvalidLength);
+            }
         }
         if i != data.len() {
             return Err(PrimitiveError::InvalidLength);
@@ -417,6 +500,7 @@ fn kdf_rk_he(
     new_rk.copy_from_slice(&okm[0..32]);
     ck.copy_from_slice(&okm[32..64]);
     nhk.copy_from_slice(&okm[64..96]);
+    okm.zeroize();
     Ok((new_rk, ck, nhk))
 }
 
@@ -428,12 +512,14 @@ fn kdf_ck(ck: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), PrimitiveError> {
     new_ck.copy_from_slice(&okm[0..32]);
     mk.copy_from_slice(&okm[32..64]);
     let mut mk2 = [0u8; 32];
-    hkdf_extract_expand(None, &mk, LABELS::DR_MESSAGE, &mut mk2)?;
+    let result = hkdf_extract_expand(None, &mk, LABELS::DR_MESSAGE, &mut mk2);
+    mk.zeroize();
+    okm.zeroize();
+    result?;
     Ok((new_ck, mk2))
 }
 
 fn hencrypt(hk: &[u8; 32], header_bytes: &[u8]) -> Result<Vec<u8>, PrimitiveError> {
-    // Random 12-byte nonce (spec: ≥128 bits entropy or stateful non-repeating)
     let mut nonce = [0u8; 12];
     crate::primitives::random::fill_random(&mut nonce)?;
     let key = AeadKey::from_bytes(*hk);
@@ -472,13 +558,12 @@ fn derive_nonce(mk: &[u8; 32]) -> [u8; 12] {
 mod tests {
     use super::*;
 
-    #[test]
-    fn he_roundtrip() {
+    fn pair() -> (HeaderEncryptState, HeaderEncryptState) {
         let sk = [5u8; 32];
         let shared_hka = [1u8; 32];
         let shared_nhkb = [2u8; 32];
         let bob_dh = X25519Secret::generate().unwrap();
-        let mut alice = HeaderEncryptState::init_alice(
+        let alice = HeaderEncryptState::init_alice(
             &sk,
             &bob_dh.public_key(),
             &shared_hka,
@@ -486,9 +571,14 @@ mod tests {
             DEFAULT_MAX_SKIP,
         )
         .unwrap();
-        let mut bob =
+        let bob =
             HeaderEncryptState::init_bob(&sk, bob_dh, &shared_hka, &shared_nhkb, DEFAULT_MAX_SKIP);
+        (alice, bob)
+    }
 
+    #[test]
+    fn he_roundtrip() {
+        let (mut alice, mut bob) = pair();
         let (eh, ct) = alice.encrypt(b"secret", b"ad").unwrap();
         assert_eq!(bob.decrypt(&eh, &ct, b"ad").unwrap(), b"secret");
         let (eh2, ct2) = bob.encrypt(b"reply", b"ad").unwrap();
@@ -499,5 +589,27 @@ mod tests {
         let mut bob = HeaderEncryptState::deserialize(&bob.serialize(), DEFAULT_MAX_SKIP).unwrap();
         let (eh3, ct3) = alice.encrypt(b"after-reload", b"ad").unwrap();
         assert_eq!(bob.decrypt(&eh3, &ct3, b"ad").unwrap(), b"after-reload");
+    }
+
+    #[test]
+    fn deserialize_rejects_noncanonical_presence_tag() {
+        let (_, bob) = pair();
+        let mut blob = bob.serialize();
+        blob[0] = 2;
+        assert!(HeaderEncryptState::deserialize(&blob, DEFAULT_MAX_SKIP).is_err());
+    }
+
+    #[test]
+    fn deserialize_rejects_max_skip_mismatch() {
+        let (_, bob) = pair();
+        assert!(HeaderEncryptState::deserialize(&bob.serialize(), DEFAULT_MAX_SKIP - 1).is_err());
+    }
+
+    #[test]
+    fn deserialize_rejects_trailing_bytes() {
+        let (_, bob) = pair();
+        let mut blob = bob.serialize();
+        blob.push(0);
+        assert!(HeaderEncryptState::deserialize(&blob, DEFAULT_MAX_SKIP).is_err());
     }
 }
