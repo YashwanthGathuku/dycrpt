@@ -14,6 +14,13 @@ use crate::primitives::error::PrimitiveError;
 
 /// Strictly increasing counter. Implementations must not wrap or move backwards.
 ///
+/// **Failure contract:** if `increment()` returns `Err`, the implementation must
+/// guarantee that the durable counter value did not change. A backend whose
+/// increment outcome can become "unknown" after an error is not compatible with
+/// this trait; it needs an adapter/protocol that resolves the outcome before
+/// returning control to the crypto engine. This prevents an unobserved counter
+/// advance from desynchronizing the durable ratchet-state epoch.
+///
 /// The trait is `Send + Sync` because mobile FFI calls may arrive from multiple
 /// threads even though the engine serializes a given state transition.
 pub trait MonotonicCounter: Send + Sync {
