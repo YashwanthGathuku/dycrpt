@@ -13,11 +13,9 @@ use crate::primitives::random::fill_random;
 use std::collections::HashMap;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Maximum epochs of skipped keys retained (mirrors classical MAX_SKIP spirit).
 pub const SPQR_MAX_SKIP_EPOCHS: u32 = 32;
 const SPQR_MAX_SKIPPED_KEYS: usize = 256;
 
-/// One epoch’s message-key chain (symmetric ratchet within an epoch).
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct EpochChain {
     epoch: u32,
@@ -44,10 +42,6 @@ impl Drop for SpqrSkippedKeys {
 }
 
 impl SpqrSkippedKeys {
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
     fn remove(&mut self, key: &(u32, u32)) -> Option<[u8; 32]> {
         self.0.remove(key)
     }
@@ -66,22 +60,16 @@ impl SpqrSkippedKeys {
     }
 
     fn retain_recent(&mut self, current_epoch: u32, max_skip_epochs: u32) {
-        let mut removed = Vec::new();
-        self.0.retain(|&(e, n), _| {
-            let keep = e.saturating_add(max_skip_epochs) >= current_epoch;
-            if !keep {
-                removed.push((e, n));
+        let stale: Vec<(u32, u32)> = self
+            .0
+            .keys()
+            .copied()
+            .filter(|(epoch, _)| epoch.saturating_add(max_skip_epochs) < current_epoch)
+            .collect();
+        for key in stale {
+            if let Some(mut mk) = self.0.remove(&key) {
+                mk.zeroize();
             }
-            keep
-        });
-        // Values removed by HashMap::retain are dropped without zeroization.
-        // We therefore do the real secret-wiping retention below if anything
-        // was selected for removal.
-        if !removed.is_empty() {
-            // `retain` above already dropped values, so this branch only
-            // documents the invariant; normal epoch window (<=32) keeps this
-            // map bounded. Explicit zeroization happens for remaining values on
-            // Drop. Future refactors should prefer `extract_if` when MSRV allows.
         }
     }
 
@@ -90,7 +78,6 @@ impl SpqrSkippedKeys {
     }
 }
 
-/// SPQR state — produces post-quantum message keys over successive epochs.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SpqrState {
     sending: Option<EpochChain>,
@@ -102,7 +89,6 @@ pub struct SpqrState {
 }
 
 impl SpqrState {
-    /// Initialize from the PQ portion of the PQXDH shared secret.
     pub fn init(sk_pq: &[u8; 32], max_skip_epochs: u32) -> Self {
         Self {
             sending: None,
@@ -114,14 +100,12 @@ impl SpqrState {
         }
     }
 
-    /// Advance by mixing a fresh SCKA (ML-KEM) shared secret into the root.
     pub fn advance_epoch(&mut self, scka_shared_secret: &[u8; 32]) -> Result<u32, PrimitiveError> {
         if self.max_skip_epochs > SPQR_MAX_SKIP_EPOCHS {
             return Err(PrimitiveError::LimitExceeded);
         }
         let epoch = self.next_epoch;
         let next_epoch = crate::ratchet::checked_inc(self.next_epoch)?;
-
         let mut okm = [0u8; 64];
         hkdf_extract_expand(
             Some(&self.root),
@@ -131,8 +115,8 @@ impl SpqrState {
         )?;
         let mut new_root = [0u8; 32];
         let mut chain = [0u8; 32];
-        new_root.copy_from_slice(&okm[0..32]);
-        chain.copy_from_slice(&okm[32..64]);
+        new_root.copy_from_slice(&okm[..32]);
+        chain.copy_from_slice(&okm[32..]);
         okm.zeroize();
 
         self.next_epoch = next_epoch;
@@ -142,15 +126,13 @@ impl SpqrState {
             chain_key: chain,
             n: 0,
         });
-        // This role-symmetric chain remains the documented experimental SPQR
-        // approximation; it is not being presented as production Triple Ratchet.
+        // Still an explicitly experimental role-symmetric approximation.
         self.receiving = Some(EpochChain {
             epoch,
             chain_key: chain,
             n: 0,
         });
-        self.skipped
-            .retain_recent(epoch, self.max_skip_epochs);
+        self.skipped.retain_recent(epoch, self.max_skip_epochs);
         Ok(epoch)
     }
 
@@ -187,7 +169,6 @@ impl SpqrState {
         {
             return Err(PrimitiveError::LimitExceeded);
         }
-
         while chain.n < n {
             let next_n = crate::ratchet::checked_inc(chain.n)?;
             let (new_ck, mk) = kdf_ck_spqr(&chain.chain_key)?;
@@ -261,7 +242,6 @@ impl SpqrState {
         out.extend_from_slice(&self.max_skip_epochs.to_le_bytes());
         Self::write_chain(&mut out, &self.sending);
         Self::write_chain(&mut out, &self.receiving);
-
         let mut skipped: Vec<((u32, u32), [u8; 32])> = self
             .skipped
             .iter()
@@ -303,13 +283,10 @@ impl SpqrState {
         if count > SPQR_MAX_SKIPPED_KEYS {
             return Err(PrimitiveError::LimitExceeded);
         }
-        let needed = count
-            .checked_mul(40)
-            .ok_or(PrimitiveError::LimitExceeded)?;
+        let needed = count.checked_mul(40).ok_or(PrimitiveError::LimitExceeded)?;
         if data.len().saturating_sub(i) != needed {
             return Err(PrimitiveError::InvalidLength);
         }
-
         let mut skipped = SpqrSkippedKeys::default();
         for _ in 0..count {
             let e = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
@@ -349,7 +326,7 @@ fn kdf_ck_spqr(ck: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), PrimitiveError> {
     hkdf_extract_expand(None, ck, LABELS::DR_CHAIN, &mut okm)?;
     let mut new_ck = [0u8; 32];
     let mut mk = [0u8; 32];
-    new_ck.copy_from_slice(&okm[0..32]);
+    new_ck.copy_from_slice(&okm[..32]);
     mk.copy_from_slice(&okm[32..64]);
     okm.zeroize();
     Ok((new_ck, mk))
@@ -377,7 +354,6 @@ mod tests {
     fn deserialize_rejects_noncanonical_chain_tag() {
         let spqr = SpqrState::init(&[7u8; 32], SPQR_MAX_SKIP_EPOCHS);
         let mut blob = spqr.serialize();
-        // root(32) + next_epoch(4) + max_skip(4) = sending tag at 40.
         blob[40] = 2;
         assert!(SpqrState::deserialize(&blob).is_err());
     }
