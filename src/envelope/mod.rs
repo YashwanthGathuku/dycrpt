@@ -8,9 +8,11 @@
 //! - Strict canonical serialization (deterministic field order, no duplicates).
 //! - Sensitive routing/application metadata is placed in AEAD associated data.
 //! - The payload body is AEAD plaintext, while its exact length is authenticated.
+//! - The authenticated suite identifier must match the engine CryptoProfile.
 //! - Parser is fail-closed: unknown critical fields, overflows, oversized
 //!   payloads, invalid UTF-8, malformed lengths, unsupported versions → error.
 
+use crate::policy::CryptoProfile;
 use crate::primitives::error::PrimitiveError;
 
 pub const ENVELOPE_VERSION: u8 = 1;
@@ -18,23 +20,56 @@ pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 pub const MAX_ID_LEN: usize = 128;
 const ENVELOPE_AD_DOMAIN: &[u8] = b"VCENV-AD-v1";
 
+/// Authenticated application-envelope suite identifier.
+///
+/// Value `1` is retained for the existing experimental Triple encoding. New
+/// Classical traffic uses value `2`; this avoids relabeling historical value 1
+/// while making the default production profile describe itself accurately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CryptoSuite {
-    /// X25519 + ML-KEM-768 + Triple Ratchet + AES-256-GCM.
+    /// Experimental PQXDH + Triple Ratchet + AES-256-GCM.
     PqxdhTripleAes256Gcm = 1,
+    /// Default PQXDH + classical Double Ratchet + AES-256-GCM.
+    PqxdhClassicalDoubleRatchetAes256Gcm = 2,
+    /// Experimental classical Double Ratchet with encrypted headers.
+    PqxdhClassicalHeaderEncryptedAes256Gcm = 3,
 }
 
 impl CryptoSuite {
     pub fn from_u8(v: u8) -> Result<Self, PrimitiveError> {
         match v {
             1 => Ok(Self::PqxdhTripleAes256Gcm),
+            2 => Ok(Self::PqxdhClassicalDoubleRatchetAes256Gcm),
+            3 => Ok(Self::PqxdhClassicalHeaderEncryptedAes256Gcm),
             _ => Err(PrimitiveError::InvalidLength),
         }
     }
 
     pub fn as_u8(self) -> u8 {
         self as u8
+    }
+
+    /// Exact envelope suite for an engine profile compiled into this build.
+    pub fn from_profile(profile: CryptoProfile) -> Self {
+        match profile {
+            CryptoProfile::ClassicalV1 => Self::PqxdhClassicalDoubleRatchetAes256Gcm,
+            #[cfg(feature = "header-encrypt")]
+            CryptoProfile::ClassicalHeV1 => Self::PqxdhClassicalHeaderEncryptedAes256Gcm,
+            #[cfg(feature = "hybrid")]
+            CryptoProfile::HybridPqV1 => Self::PqxdhTripleAes256Gcm,
+        }
+    }
+
+    /// Fail closed if application metadata does not describe the active engine
+    /// profile. Callers should check this before handing `associated_data()` to
+    /// the engine.
+    pub fn enforce_profile(self, profile: CryptoProfile) -> Result<(), PrimitiveError> {
+        if self == Self::from_profile(profile) {
+            Ok(())
+        } else {
+            Err(PrimitiveError::InvalidLength)
+        }
     }
 }
 
@@ -176,8 +211,7 @@ impl Envelope {
     ///
     /// This binds every routing field, payload type, voice metadata, and the
     /// exact payload length while deliberately omitting the payload body because
-    /// that body is the AEAD plaintext. Unlike the old clone-and-clear shortcut,
-    /// SyntheticVoice metadata remains self-consistent and authenticated.
+    /// that body is the AEAD plaintext.
     pub fn associated_data(&self) -> Result<Vec<u8>, PrimitiveError> {
         self.validate_limits()?;
         self.validate_payload_metadata()?;
@@ -185,6 +219,15 @@ impl Envelope {
         out.extend_from_slice(ENVELOPE_AD_DOMAIN);
         self.write_authenticated_metadata(&mut out)?;
         Ok(out)
+    }
+
+    /// Produce AD only if the envelope suite matches the active engine profile.
+    pub fn associated_data_for_profile(
+        &self,
+        profile: CryptoProfile,
+    ) -> Result<Vec<u8>, PrimitiveError> {
+        self.crypto_suite.enforce_profile(profile)?;
+        self.associated_data()
     }
 
     fn write_authenticated_metadata(&self, out: &mut Vec<u8>) -> Result<(), PrimitiveError> {
@@ -320,7 +363,7 @@ mod tests {
     fn sample_envelope() -> Envelope {
         Envelope {
             protocol_version: ENVELOPE_VERSION,
-            crypto_suite: CryptoSuite::PqxdhTripleAes256Gcm,
+            crypto_suite: CryptoSuite::from_profile(CryptoProfile::ClassicalV1),
             conversation_id: b"conv-abc".to_vec(),
             sender_user_id: b"user-alice".to_vec(),
             sender_device_id: b"device-1".to_vec(),
@@ -339,7 +382,7 @@ mod tests {
     fn voice_envelope() -> Envelope {
         Envelope {
             protocol_version: ENVELOPE_VERSION,
-            crypto_suite: CryptoSuite::PqxdhTripleAes256Gcm,
+            crypto_suite: CryptoSuite::from_profile(CryptoProfile::ClassicalV1),
             conversation_id: b"c".to_vec(),
             sender_user_id: b"a".to_vec(),
             sender_device_id: b"d1".to_vec(),
@@ -365,6 +408,27 @@ mod tests {
         let bytes = env.canonical_bytes().unwrap();
         let parsed = Envelope::parse(&bytes).unwrap();
         assert_eq!(env, parsed);
+    }
+
+    #[test]
+    fn classical_profile_uses_classical_suite_metadata() {
+        assert_eq!(
+            CryptoSuite::from_profile(CryptoProfile::ClassicalV1),
+            CryptoSuite::PqxdhClassicalDoubleRatchetAes256Gcm
+        );
+    }
+
+    #[test]
+    fn profile_mismatch_is_rejected_before_ad_use() {
+        let mut env = sample_envelope();
+        env.crypto_suite = CryptoSuite::PqxdhTripleAes256Gcm;
+        assert!(env
+            .associated_data_for_profile(CryptoProfile::ClassicalV1)
+            .is_err());
+        env.crypto_suite = CryptoSuite::from_profile(CryptoProfile::ClassicalV1);
+        assert!(env
+            .associated_data_for_profile(CryptoProfile::ClassicalV1)
+            .is_ok());
     }
 
     #[test]
@@ -433,8 +497,6 @@ mod tests {
         changed_duration.synthetic_voice.as_mut().unwrap().duration_ms += 1;
         assert_ne!(ad, changed_duration.associated_data().unwrap());
 
-        // Payload contents are plaintext, not AD. Same-length payload content
-        // therefore does not alter metadata AD; AEAD authenticates the body.
         let mut changed_body = env.clone();
         changed_body.payload = b"other".to_vec();
         assert_eq!(ad, changed_body.associated_data().unwrap());
