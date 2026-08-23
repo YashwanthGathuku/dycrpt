@@ -23,9 +23,6 @@ use crate::ratchet::DEFAULT_MAX_SKIP;
 
 type HeSkipKey = ([u8; 32], u32);
 
-/// Header-encryption skipped keys contain message-key secrets and must be
-/// zeroized on destruction. The old raw HashMap was intentionally skipped by
-/// the parent derive and therefore did not wipe its values.
 #[derive(Clone, Default)]
 struct HeSkippedKeys(HashMap<HeSkipKey, [u8; 32]>);
 
@@ -71,7 +68,6 @@ impl HeSkippedKeys {
     }
 }
 
-/// Additional state for the Header Encryption variant.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HeaderEncryptState {
     dhs: Option<X25519Secret>,
@@ -80,22 +76,18 @@ pub struct HeaderEncryptState {
     rk: [u8; 32],
     cks: Option<[u8; 32]>,
     ckr: Option<[u8; 32]>,
-    /// Sending / receiving header keys.
     hks: Option<[u8; 32]>,
     hkr: Option<[u8; 32]>,
-    /// Next header keys.
     nhks: Option<[u8; 32]>,
     nhkr: Option<[u8; 32]>,
     ns: u32,
     nr: u32,
     pn: u32,
-    /// Skipped message keys indexed by (header_key_bytes, n).
     mkskipped: HeSkippedKeys,
     max_skip: u32,
 }
 
 impl HeaderEncryptState {
-    /// Alice init with shared header-key material from the handshake.
     pub fn init_alice(
         sk: &[u8; 32],
         bob_dh_public: &X25519Public,
@@ -104,8 +96,10 @@ impl HeaderEncryptState {
         max_skip: u32,
     ) -> Result<Self, PrimitiveError> {
         let dhs = X25519Secret::generate()?;
-        let dh_out = dhs.diffie_hellman(bob_dh_public);
-        let (rk, cks, nhks) = kdf_rk_he(sk, &dh_out)?;
+        let mut dh_out = dhs.diffie_hellman_checked(bob_dh_public)?;
+        let result = kdf_rk_he(sk, &dh_out);
+        dh_out.zeroize();
+        let (rk, cks, nhks) = result?;
         Ok(Self {
             dhs: Some(dhs),
             dhr: Some(*bob_dh_public),
@@ -124,7 +118,6 @@ impl HeaderEncryptState {
         })
     }
 
-    /// Bob init with the matching shared header-key material.
     pub fn init_bob(
         sk: &[u8; 32],
         bob_dh_keypair: X25519Secret,
@@ -150,8 +143,6 @@ impl HeaderEncryptState {
         }
     }
 
-    /// Encrypt: returns (encrypted_header, ciphertext). Sending-chain state is
-    /// restored if header encryption or payload AEAD fails.
     pub fn encrypt(
         &mut self,
         plaintext: &[u8],
@@ -189,7 +180,6 @@ impl HeaderEncryptState {
         result
     }
 
-    /// Decrypt. Transactional: on AEAD failure state is left unchanged.
     pub fn decrypt(
         &mut self,
         enc_header: &[u8],
@@ -243,7 +233,6 @@ impl HeaderEncryptState {
     }
 
     fn try_skipped(&mut self, enc_header: &[u8]) -> Result<Option<[u8; 32]>, PrimitiveError> {
-        // Attempt each distinct stored header key at most once.
         for hk in self.mkskipped.header_keys() {
             if let Ok(header) = hdecrypt(&hk, enc_header) {
                 if let Some(mk) = self.mkskipped.remove(&(hk, header.n)) {
@@ -279,24 +268,30 @@ impl HeaderEncryptState {
     }
 
     fn dh_ratchet(&mut self, header: &Header) -> Result<(), PrimitiveError> {
+        let dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
+        let mut dh_out1 = dhs.diffie_hellman_checked(&header.dh)?;
+        let first = kdf_rk_he(&self.rk, &dh_out1);
+        dh_out1.zeroize();
+        let (rk1, ckr, nhkr) = first?;
+
+        let new_dhs = X25519Secret::generate()?;
+        let mut dh_out2 = new_dhs.diffie_hellman_checked(&header.dh)?;
+        let second = kdf_rk_he(&rk1, &dh_out2);
+        dh_out2.zeroize();
+        let (rk2, cks, nhks) = second?;
+
+        // Only commit the ratchet transition after both contributory DH terms
+        // and both KDFs succeed. Low-order/network-invalid DH therefore leaves
+        // the live ratchet state unchanged.
         self.pn = self.ns;
         self.ns = 0;
         self.nr = 0;
         self.hks = self.nhks;
         self.hkr = self.nhkr;
         self.dhr = Some(header.dh);
-
-        let dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
-        let dh_out1 = dhs.diffie_hellman(&header.dh);
-        let (rk1, ckr, nhkr) = kdf_rk_he(&self.rk, &dh_out1)?;
-        self.rk = rk1;
+        self.rk = rk2;
         self.ckr = Some(ckr);
         self.nhkr = Some(nhkr);
-
-        let new_dhs = X25519Secret::generate()?;
-        let dh_out2 = new_dhs.diffie_hellman(&header.dh);
-        let (rk2, cks, nhks) = kdf_rk_he(&self.rk, &dh_out2)?;
-        self.rk = rk2;
         self.cks = Some(cks);
         self.nhks = Some(nhks);
         self.dhs = Some(new_dhs);
@@ -356,7 +351,6 @@ impl HeaderEncryptState {
         }
     }
 
-    /// Persist HE ratchet (DH, root/chain/header keys, skipped MKs).
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match &self.dhs {
@@ -401,7 +395,6 @@ impl HeaderEncryptState {
         out
     }
 
-    /// Restore HE ratchet from [`Self::serialize`].
     pub fn deserialize(data: &[u8], max_skip: u32) -> Result<Self, PrimitiveError> {
         let mut i = 0usize;
         let dhs = Self::read_opt32(data, &mut i)?.map(X25519Secret::from_bytes);
@@ -482,10 +475,6 @@ impl HeaderEncryptState {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// KDFs and header AEAD
-// ---------------------------------------------------------------------------
 
 #[allow(clippy::type_complexity)]
 fn kdf_rk_he(
@@ -589,6 +578,44 @@ mod tests {
         let mut bob = HeaderEncryptState::deserialize(&bob.serialize(), DEFAULT_MAX_SKIP).unwrap();
         let (eh3, ct3) = alice.encrypt(b"after-reload", b"ad").unwrap();
         assert_eq!(bob.decrypt(&eh3, &ct3, b"ad").unwrap(), b"after-reload");
+    }
+
+    #[test]
+    fn init_rejects_nonzero_low_order_dh() {
+        let sk = [5u8; 32];
+        let shared_hka = [1u8; 32];
+        let shared_nhkb = [2u8; 32];
+        let mut low_order = [0u8; 32];
+        low_order[0] = 1;
+        let low_order = X25519Public::from_bytes(low_order).unwrap();
+        assert!(matches!(
+            HeaderEncryptState::init_alice(
+                &sk,
+                &low_order,
+                &shared_hka,
+                &shared_nhkb,
+                DEFAULT_MAX_SKIP,
+            ),
+            Err(PrimitiveError::InvalidPublicKey)
+        ));
+    }
+
+    #[test]
+    fn dh_ratchet_rejects_low_order_transactionally() {
+        let (_, mut bob) = pair();
+        let before = bob.serialize();
+        let mut low_order = [0u8; 32];
+        low_order[0] = 1;
+        let header = Header {
+            dh: X25519Public::from_bytes(low_order).unwrap(),
+            pn: 0,
+            n: 0,
+        };
+        assert!(matches!(
+            bob.dh_ratchet(&header),
+            Err(PrimitiveError::InvalidPublicKey)
+        ));
+        assert_eq!(bob.serialize(), before);
     }
 
     #[test]
