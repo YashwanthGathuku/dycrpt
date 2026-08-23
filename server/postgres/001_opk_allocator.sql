@@ -66,6 +66,15 @@ CREATE INDEX IF NOT EXISTS one_time_ec_prekeys_fifo
 CREATE INDEX IF NOT EXISTS one_time_pq_prekeys_fifo
     ON voicechat_crypto.one_time_pq_prekeys(device_id, prekey_id);
 
+-- Defense in depth: even if allocator code is later modified incorrectly, the
+-- database refuses to record the same one-time ID for two unique requests.
+CREATE UNIQUE INDEX IF NOT EXISTS allocation_receipt_ec_once
+    ON voicechat_crypto.allocation_receipts(device_id, ec_opk_id)
+    WHERE ec_opk_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS allocation_receipt_pq_once
+    ON voicechat_crypto.allocation_receipts(device_id, pq_prekey_id)
+    WHERE pq_is_one_time;
+
 CREATE OR REPLACE FUNCTION voicechat_crypto.allocate_prekey_bundle(
     p_device_id bytea,
     p_request_token uuid
