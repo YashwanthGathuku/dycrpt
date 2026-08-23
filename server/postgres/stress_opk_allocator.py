@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """Concurrency/invariant test for 001_opk_allocator.sql.
 
-Usage:
-  DATABASE_URL=postgresql://... python server/postgres/stress_opk_allocator.py \
-      --device-hex 6465766963652d31 --requests 10000 --workers 100
-
-Prerequisite: populate the device with at least `requests` EC and PQ one-time
-prekeys when testing zero-fallback uniqueness. The script does not fabricate
-cryptographic keys; it tests the allocator against real uploaded inventory.
+Release mode requires at least 10,000 unique allocation tokens and at least 100
+concurrent workers. A smaller run is permitted only with `--allow-smoke` for PR
+smoke testing and cannot satisfy the final release gate.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import os
+import re
 import sys
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     import psycopg
 except ImportError as exc:  # pragma: no cover - operator setup path
     raise SystemExit("psycopg v3 is required: pip install 'psycopg[binary]'") from exc
+
+SHA40 = re.compile(r"^[0-9a-f]{40}$")
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,7 @@ class Allocation:
 
 
 def allocate(dsn: str, device: bytes, token: uuid.UUID) -> Allocation:
-    with psycopg.connect(dsn, autocommit=False) as conn:
+    with psycopg.connect(dsn, autocommit=False, connect_timeout=15) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM voicechat_crypto.allocate_prekey_bundle(%s, %s)",
@@ -57,7 +58,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device-hex", required=True)
     parser.add_argument("--requests", type=int, default=10_000)
-    parser.add_argument("--workers", type=int, default=100)
+    parser.add_argument("--workers", type=int, default=128)
+    parser.add_argument("--allow-smoke", action="store_true")
+    parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--commit", default=os.environ.get("DYCRPT_COMMIT", ""))
     parser.add_argument(
         "--require-one-time-pq",
         action="store_true",
@@ -70,14 +74,17 @@ def main() -> int:
         parser.error("DATABASE_URL must be set")
     if args.requests < 1 or args.workers < 1:
         parser.error("requests/workers must be positive")
+    if not args.allow_smoke and (args.requests < 10_000 or args.workers < 100):
+        parser.error("release stress requires requests>=10000 and workers>=100")
+    if args.commit and not SHA40.fullmatch(args.commit):
+        parser.error("--commit/DYCRPT_COMMIT must be a lowercase 40-character SHA")
     device = bytes.fromhex(args.device_hex)
     if not device:
         parser.error("device id must not be empty")
 
     tokens = [uuid.uuid4() for _ in range(args.requests)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(allocate, dsn, device, token) for token in tokens]
-        allocations = [future.result() for future in futures]
+        allocations = list(pool.map(lambda token: allocate(dsn, device, token), tokens))
 
     ec_ids = [a.ec_opk_id for a in allocations if a.ec_opk_id is not None]
     if len(ec_ids) != len(set(ec_ids)):
@@ -91,18 +98,15 @@ def main() -> int:
         raise AssertionError("inventory exhausted: allocator used last-resort PQ key")
 
     # Replay every request token. Idempotency requires byte-for-byte identical
-    # allocations and must not consume another one-time key.
+    # logical allocations and must not consume another one-time key.
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(allocate, dsn, device, token) for token in tokens]
-        retries = [future.result() for future in futures]
+        retries = list(pool.map(lambda token: allocate(dsn, device, token), tokens))
 
     for token, first, retry in zip(tokens, allocations, retries, strict=True):
         if first != retry:
             raise AssertionError(f"idempotency mismatch for request token {token}")
 
-    # Verify the database itself has no allocation receipt reuse across unique
-    # request tokens for one-time IDs.
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    with psycopg.connect(dsn, connect_timeout=15) as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT ec_opk_id, count(*)
@@ -125,11 +129,39 @@ def main() -> int:
         )
         if cur.fetchone() is not None:
             raise AssertionError("database contains duplicate PQ allocation receipt")
+        cur.execute(
+            """
+            SELECT count(*)
+              FROM voicechat_crypto.allocation_receipts
+             WHERE device_id = %s
+            """,
+            (device,),
+        )
+        receipt_count = int(cur.fetchone()[0])
 
-    print(
-        f"PASS: {len(allocations)} unique allocations, "
-        f"{len(ec_ids)} EC OPKs, {len(pq_ids)} PQ OPKs; retries identical"
-    )
+    if receipt_count != args.requests:
+        raise AssertionError(f"receipt count {receipt_count} != requests {args.requests}")
+
+    evidence = {
+        "schema": "dycrpt-opk-stress-v1",
+        "commit": args.commit or None,
+        "requests": args.requests,
+        "workers": args.workers,
+        "ec_unique": len(ec_ids),
+        "pq_unique": len(pq_ids),
+        "duplicate_ec": 0,
+        "duplicate_pq": 0,
+        "idempotent_retries": args.requests,
+        "receipt_count": receipt_count,
+        "one_time_pq_required": bool(args.require_one_time_pq),
+        "release_scale": args.requests >= 10_000 and args.workers >= 100,
+        "passed": True,
+    }
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    print(json.dumps(evidence, sort_keys=True))
     return 0
 
 
