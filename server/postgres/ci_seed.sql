@@ -1,6 +1,9 @@
 -- Deterministic non-cryptographic fixture data for allocator CI only.
 -- These bytes are deliberately NOT valid production keys. The allocator test
 -- checks database atomicity/idempotency, not cryptographic validation.
+--
+-- Keep >10k one-time entries so the release stress gate can require one-time PQ
+-- allocation for every request without falling back to the last-resort key.
 
 INSERT INTO voicechat_crypto.device_prekeys (
     device_id, identity_key,
@@ -37,7 +40,7 @@ SELECT
     decode('6465766963652d6369', 'hex'),
     i,
     decode(lpad(to_hex(i), 64, '0'), 'hex')
-FROM generate_series(1000, 1999) AS i;
+FROM generate_series(1000, 12999) AS i;
 
 INSERT INTO voicechat_crypto.one_time_pq_prekeys(device_id, prekey_id, public_key, signature)
 SELECT
@@ -45,4 +48,4 @@ SELECT
     i,
     decode(repeat('66', 1184), 'hex') || int8send(i),
     decode(repeat('77', 64), 'hex')
-FROM generate_series(2000, 2999) AS i;
+FROM generate_series(20000, 31999) AS i;
