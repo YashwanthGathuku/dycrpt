@@ -9,11 +9,11 @@ if [[ "$(git branch --show-current)" != "$branch" ]]; then
   exit 2
 fi
 
-# The previous helper could abort at its pager after staging exactly these two files.
-# Preserve that work, but refuse any unrelated tracked edits.
+# Preserve only the exact intended layer-2 work if a previous attempt stopped
+# before commit. Refuse unrelated tracked edits.
 unexpected="$({ git status --porcelain=v1 --untracked-files=no || true; } \
   | awk '{print $2}' \
-  | grep -v -E '^(src/engine/mod.rs|src/storage/encrypted_file.rs)$' || true)"
+  | grep -v -E '^(src/engine/mod.rs|src/storage/encrypted_file.rs|tests/storage_hardening.rs|crypto-parity/src/corpus.rs)$' || true)"
 if [[ -n "$unexpected" ]]; then
   echo "Refusing because unrelated tracked changes exist:" >&2
   git status --short >&2
@@ -38,13 +38,17 @@ GIT_PAGER=cat git diff --cached -- \
   tests/storage_hardening.rs \
   crypto-parity/src/corpus.rs
 
-# Make the evidence commit exact before verification. Do not run the verifier on
-# a dirty tree: its recorded commit must contain the code under test.
-git -c commit.gpgsign=false commit -m "fix: preserve zeroizing ownership through compile checks"
-git push origin HEAD
+# Make evidence commit exact before verification. If the branch already contains
+# all fixes, skip the empty commit and continue directly to verification.
+if git diff --cached --quiet; then
+  echo "Layer-2 source fixes already committed; no new source commit needed."
+else
+  git -c commit.gpgsign=false commit -m "fix: preserve zeroizing ownership through compile checks"
+  git push origin HEAD
+fi
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "Refusing to verify a dirty tracked tree after commit" >&2
+  echo "Refusing to verify a dirty tracked tree after layer-2 preparation" >&2
   git status --short >&2
   exit 2
 fi
