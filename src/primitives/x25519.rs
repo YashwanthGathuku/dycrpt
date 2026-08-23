@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn rfc7748_vector() {
         let alice_secret = X25519Secret::from_bytes(hex!(
-            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177bfa51db92c2a"
+            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
         ));
         let alice_public = alice_secret.public_key();
         assert_eq!(
@@ -96,15 +96,21 @@ mod tests {
         );
 
         let bob_secret = X25519Secret::from_bytes(hex!(
-            "5dab087e624a8a57c16c17251b26645df4c2f87ebc0992ab177bfa51db92c2a"
+            "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"
         ));
-        // Use a separately generated peer below for the round-trip invariant;
-        // exact RFC public/output vectors are covered by the original known
-        // Alice vector above and by x25519-dalek itself.
         let bob_public = bob_secret.public_key();
+        assert_eq!(
+            bob_public.to_bytes(),
+            hex!("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+        );
+
         let shared1 = alice_secret.diffie_hellman_checked(&bob_public).unwrap();
         let shared2 = bob_secret.diffie_hellman_checked(&alice_public).unwrap();
         assert_eq!(shared1, shared2);
+        assert_eq!(
+            shared1,
+            hex!("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+        );
     }
 
     #[test]
