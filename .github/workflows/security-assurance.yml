@@ -1,0 +1,126 @@
+name: security-assurance
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.85.0
+          rustc --version --verbose
+          cargo --version
+
+      - name: Install pinned assurance tooling
+        run: |
+          cargo install cargo-deny --version 0.18.9 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo install cargo-auditable --version 0.7.5 --locked
+
+      - name: Enforce dependency licenses advisories and sources
+        run: cargo deny check
+
+      - name: Independent RustSec lockfile audit
+        run: cargo audit -D warnings
+
+      - name: Build auditable production FFI artifacts
+        run: cargo auditable build --locked --release --features ffi
+
+      - name: Generate reproducible CycloneDX SBOM and dependency evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assurance
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          cargo cyclonedx --locked --format json --spec-version 1.5 --all-features --override-filename dycrpt-sbom
+          SBOM="$(find . -maxdepth 2 -type f -name 'dycrpt-sbom*.cdx.json' -print -quit)"
+          test -n "$SBOM"
+          cp "$SBOM" release-assurance/dycrpt-sbom.cdx.json
+          cp Cargo.lock release-assurance/Cargo.lock
+          cargo tree --locked --workspace --all-features > release-assurance/cargo-tree.txt
+          cargo metadata --locked --format-version 1 > release-assurance/cargo-metadata.json
+          git rev-parse HEAD > release-assurance/commit.txt
+          rustc --version --verbose > release-assurance/rustc.txt
+          cargo --version > release-assurance/cargo.txt
+          find target/release -maxdepth 1 -type f \
+            \( -name 'libvoicechat_crypto.so' -o -name 'libvoicechat_crypto.a' -o -name 'voicechat_crypto.dll' \) \
+            -print0 | sort -z | xargs -0 -r sha256sum > release-assurance/artifact-sha256.txt
+          test -s release-assurance/artifact-sha256.txt
+          sha256sum release-assurance/dycrpt-sbom.cdx.json \
+            release-assurance/Cargo.lock \
+            release-assurance/cargo-tree.txt \
+            release-assurance/cargo-metadata.json \
+            > release-assurance/evidence-sha256.txt
+
+      - name: Upload immutable assurance bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: supply-chain-${{ github.sha }}
+          path: release-assurance/
+          if-no-files-found: error
+          retention-days: 90
+
+  # GitHub artifact attestations for private/internal repositories require
+  # Enterprise Cloud. The job is intentionally explicit instead of silently
+  # downgrading provenance. Enable the repository variable only where supported.
+  attest-release:
+    if: github.event_name == 'push' && vars.ENABLE_GITHUB_ATTESTATIONS == 'true'
+    needs: supply-chain
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust and SBOM tooling
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Rebuild exact production subject and SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          cargo build --locked --release --features ffi
+          cargo cyclonedx --locked --format json --spec-version 1.5 --all-features --override-filename dycrpt-sbom
+          SBOM="$(find . -maxdepth 2 -type f -name 'dycrpt-sbom*.cdx.json' -print -quit)"
+          test -n "$SBOM"
+          cp "$SBOM" dycrpt-sbom.cdx.json
+          test -f target/release/libvoicechat_crypto.so
+
+      - name: Attest SLSA build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: target/release/libvoicechat_crypto.so
+
+      - name: Attest CycloneDX SBOM to the production artifact
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: target/release/libvoicechat_crypto.so
+          sbom-path: dycrpt-sbom.cdx.json
