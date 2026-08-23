@@ -4,31 +4,73 @@ on:
   push:
   pull_request:
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets --all-features -- --skip ten_thousand
+permissions:
+  contents: read
 
-  release:
+jobs:
+  rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --release --all-targets --all-features -- --skip ten_thousand
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify locked Rust workspace
+        run: bash scripts/verify.sh
+
+  opk-allocator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: voicechat_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d voicechat_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/voicechat_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PostgreSQL client and psycopg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          python -m pip install --disable-pip-version-check 'psycopg[binary]>=3.2,<4'
+      - name: Install allocator schema and fixtures
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/postgres/001_opk_allocator.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/postgres/002_rollback_anchor.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/postgres/ci_seed.sql
+      - name: Stress atomic OPK allocation
+        run: |
+          python server/postgres/stress_opk_allocator.py \
+            --device-hex 6465766963652d6369 \
+            --requests 500 \
+            --workers 64 \
+            --require-one-time-pq
 
   fuzz-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --manifest-path fuzz/Cargo.toml
-      - run: cargo run --manifest-path fuzz/Cargo.toml --bin host_runner -- 5000
-      # libfuzzer targets need: cargo build --manifest-path fuzz/Cargo.toml --features libfuzzer
-      # (Linux only; Windows GNU cannot compile libfuzzer-sys)
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --manifest-path fuzz/Cargo.toml
+      - run: cargo run --locked --manifest-path fuzz/Cargo.toml --bin host_runner -- 5000
