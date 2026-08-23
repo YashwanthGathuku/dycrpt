@@ -26,6 +26,44 @@ jobs:
           rustup default 1.85.0
       - name: Verify locked Rust workspace
         run: bash scripts/verify.sh
+      - name: Record successful core verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p core-evidence
+          python3 - <<'PY'
+          import json, os, subprocess
+          commit=subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+          expected=os.environ['GITHUB_SHA']
+          if commit != expected:
+              raise SystemExit(f'checkout SHA mismatch {commit} != {expected}')
+          evidence={
+              'schema':'dycrpt-core-verification-v1',
+              'commit':commit,
+              'rust':'1.85.0',
+              'locked_dependencies':True,
+              'fmt':True,
+              'cargo_check_all_targets_all_features':True,
+              'clippy_deny_warnings':True,
+              'debug_tests_all_targets_all_features':True,
+              'release_tests_all_targets_all_features':True,
+              'pqxdh_10000_randomized':True,
+              'bounded_fuzz_host':True,
+              'passed':True,
+          }
+          with open('core-evidence/summary.json','w',encoding='utf-8') as f:
+              json.dump(evidence,f,sort_keys=True,indent=2); f.write('\n')
+          PY
+          rustc --version --verbose > core-evidence/rustc.txt
+          cargo --version > core-evidence/cargo.txt
+          sha256sum Cargo.lock > core-evidence/cargo-lock-sha256.txt
+      - name: Upload core verification evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: core-verification-${{ github.sha }}
+          path: core-evidence/
+          if-no-files-found: error
+          retention-days: 90
 
   opk-allocator:
     runs-on: ubuntu-24.04
