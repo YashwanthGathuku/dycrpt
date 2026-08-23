@@ -10,7 +10,8 @@ use super::error::PrimitiveError;
 
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
-const TAG_LEN: usize = 16;
+/// AES-GCM authentication tag bytes appended to every sealed payload.
+pub const TAG_LEN: usize = 16;
 
 /// AES-256-GCM key. Zeroized on drop.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -89,6 +90,7 @@ mod tests {
         let ad = b"VoiceChat/DR/v1/Message";
 
         let ct = seal(&key, &nonce, pt, ad).unwrap();
+        assert_eq!(ct.len(), pt.len() + TAG_LEN);
         let recovered = open(&key, &nonce, &ct, ad).unwrap();
         assert_eq!(recovered, pt);
     }
