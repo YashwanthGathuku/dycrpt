@@ -1,6 +1,6 @@
 use voicechat_crypto::{
     CryptoEngineApi, CryptoError, CryptoProfile, DeviceConfig, InitiationPacket, SealedMessage,
-    VoiceChatCryptoEngine, PROTOCOL_VERSION,
+    SessionTag, VoiceChatCryptoEngine, PROTOCOL_VERSION,
 };
 
 fn engine(device: &[u8]) -> VoiceChatCryptoEngine {
@@ -73,6 +73,127 @@ fn protocol_relabel_fails_before_ratchet_and_original_still_decrypts() {
         bob.decrypt(&sid_b, &sealed, b"ad").unwrap(),
         b"version-bound"
     );
+}
+
+#[test]
+fn zero_session_tag_is_rejected_before_handshake_state_changes() {
+    let mut alice = engine(b"alice-zero-tag");
+    let mut bob = engine(b"bob-zero-tag");
+    let bundle = bob.generate_public_prekey_bundle(1).unwrap();
+    let (_, original) = alice
+        .establish_outbound_session(&bundle, b"zero-tag", b"hello", b"ad")
+        .unwrap();
+    let mut malformed = original.clone();
+    malformed.first_message.session_tag = SessionTag([0u8; 16]);
+
+    assert_eq!(
+        bob.process_inbound_session(&malformed, b"zero-tag", b"ad")
+            .unwrap_err(),
+        CryptoError::CryptoFailure
+    );
+    let (_, plaintext) = bob
+        .process_inbound_session(&original, b"zero-tag", b"ad")
+        .unwrap();
+    assert_eq!(plaintext, b"hello");
+}
+
+#[test]
+fn live_session_tag_collision_is_rejected_without_consuming_new_opk() {
+    let (_alice1, mut bob, _sid_a1, _sid_b1, first_init) = pair();
+
+    let mut alice2 = engine(b"alice-second");
+    let bundle2 = bob.generate_public_prekey_bundle(3).unwrap();
+    let (_, original2) = alice2
+        .establish_outbound_session(&bundle2, b"second-conv", b"second", b"ad")
+        .unwrap();
+    assert_ne!(
+        original2.first_message.session_tag,
+        first_init.first_message.session_tag
+    );
+
+    let mut colliding = original2.clone();
+    colliding.first_message.session_tag = first_init.first_message.session_tag;
+    assert_eq!(
+        bob.process_inbound_session(&colliding, b"second-conv", b"ad")
+            .unwrap_err(),
+        CryptoError::CryptoFailure
+    );
+
+    // The collision check is a precondition. It must not consume the OPKs or
+    // otherwise damage the untouched, valid initiation packet.
+    let (_, plaintext) = bob
+        .process_inbound_session(&original2, b"second-conv", b"ad")
+        .unwrap();
+    assert_eq!(plaintext, b"second");
+}
+
+#[test]
+fn oversized_remote_device_is_rejected_before_outbound_session_creation() {
+    let mut alice = engine(b"alice-device-bound");
+    let mut bob = engine(b"bob-device-bound");
+    let bundle = bob.generate_public_prekey_bundle(1).unwrap();
+    let oversized = vec![7u8; 4097];
+    assert_eq!(
+        alice
+            .establish_outbound_session_for_peer(
+                b"peer-1",
+                Some(&oversized),
+                &bundle,
+                b"conv",
+                b"first",
+                b"ad",
+            )
+            .unwrap_err(),
+        CryptoError::LimitExceeded
+    );
+
+    // The same bundle is still usable because the rejected peer metadata did
+    // not create a session or advance local PQXDH/ratchet state.
+    let (_, packet) = alice
+        .establish_outbound_session(&bundle, b"conv", b"first", b"ad")
+        .unwrap();
+    let (_, plaintext) = bob.process_inbound_session(&packet, b"conv", b"ad").unwrap();
+    assert_eq!(plaintext, b"first");
+}
+
+#[test]
+fn oversized_peer_id_is_rejected_before_outbound_session_creation() {
+    let mut alice = engine(b"alice-peer-bound");
+    let mut bob = engine(b"bob-peer-bound");
+    let bundle = bob.generate_public_prekey_bundle(1).unwrap();
+    let oversized_peer = vec![3u8; 4097];
+    assert_eq!(
+        alice
+            .establish_outbound_session_for_peer(
+                &oversized_peer,
+                Some(b"bob-device"),
+                &bundle,
+                b"conv",
+                b"first",
+                b"ad",
+            )
+            .unwrap_err(),
+        CryptoError::InvalidArgument
+    );
+
+    let (_, packet) = alice
+        .establish_outbound_session(&bundle, b"conv", b"first", b"ad")
+        .unwrap();
+    let (_, plaintext) = bob.process_inbound_session(&packet, b"conv", b"ad").unwrap();
+    assert_eq!(plaintext, b"first");
+}
+
+#[test]
+fn sealed_decoder_rejects_zero_network_tag() {
+    let mut alice = engine(b"alice-sealed-zero");
+    let mut bob = engine(b"bob-sealed-zero");
+    let bundle = bob.generate_public_prekey_bundle(1).unwrap();
+    let (sid, _) = alice
+        .establish_outbound_session(&bundle, b"conv", b"first", b"ad")
+        .unwrap();
+    let mut sealed = alice.encrypt(&sid, b"payload", b"ad").unwrap();
+    sealed.session_tag = SessionTag([0u8; 16]);
+    assert!(SealedMessage::decode(&sealed.encode()).is_err());
 }
 
 #[test]
