@@ -22,6 +22,11 @@ pub mod replay;
 pub mod session;
 pub mod storage;
 
+#[path = "storage/encrypted_file.rs"]
+pub mod encrypted_storage;
+#[path = "storage/trusted_anchor.rs"]
+pub mod trusted_anchor;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
@@ -32,6 +37,7 @@ pub use engine::{
     CryptoEngineApi, CryptoError, DeviceConfig, InboundSessionMessage, InitiationPacket,
     SealedMessage, SessionId, SessionTag, VoiceChatCryptoEngine,
 };
+pub use encrypted_storage::EncryptedFileStorage;
 pub use fingerprint::{
     compute_fingerprint, IdentityChangeReason, IdentityMaterial, IdentityState, IdentityTracker,
     SafetyFingerprint, TrustStore, VerificationMethod,
@@ -44,6 +50,7 @@ pub use policy::{
 pub use primitives::kdf::LABELS;
 pub use session::SessionManager;
 pub use storage::{RollbackGuard, StorageEpoch};
+pub use trusted_anchor::{AnchoredMonotonicCounter, RollbackAnchor};
 
 /// Debug representation intentionally summarizes the public bundle instead of
 /// dumping the full ML-KEM public key into logs/test failures.
