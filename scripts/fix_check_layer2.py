@@ -37,33 +37,45 @@ replace_once(
     "StateBlob test ownership",
 )
 
-# These engines use interior synchronization; the bindings themselves are not mutated.
+# Rustc reported these exact five scenarios as having unnecessary mut bindings.
+# Patch function-specific prefixes only; other corpus scenarios genuinely pass engines as &mut.
 corpus = Path("crypto-parity/src/corpus.rs")
 text = corpus.read_text()
-replacements = {
-    'let mut alice = engine_named(b"a")?;': 'let alice = engine_named(b"a")?;',
-    'let mut bob = engine_named(b"b")?;': 'let bob = engine_named(b"b")?;',
-    'let mut a = engine_named(b"a")?;': 'let a = engine_named(b"a")?;',
-    'let mut b = engine_named(b"b")?;': 'let b = engine_named(b"b")?;',
-    'let mut e = engine()?;': 'let e = engine()?;',
-}
-# Only replace occurrences that rustc reported as unnecessary. Counts are deliberately bounded.
-limits = {
-    'let mut alice = engine_named(b"a")?;': 2,
-    'let mut bob = engine_named(b"b")?;': 2,
-    'let mut a = engine_named(b"a")?;': 2,
-    'let mut b = engine_named(b"b")?;': 2,
-    'let mut e = engine()?;': 1,
-}
-for old, new in replacements.items():
-    count = text.count(old)
-    needed = limits[old]
-    if count < needed:
-        # Idempotency: if fewer remain because this script already ran, accept it.
-        print(f"warning cleanup already partly/applied for {old!r}: remaining={count}")
+function_specific = [
+    (
+        'fn wrong_prekey_id() -> Result<(), String> {\n    let mut alice = engine_named(b"a")?;\n    let mut bob = engine_named(b"b")?;',
+        'fn wrong_prekey_id() -> Result<(), String> {\n    let alice = engine_named(b"a")?;\n    let bob = engine_named(b"b")?;',
+        'wrong_prekey_id unused mut',
+    ),
+    (
+        'fn stale_bundle() -> Result<(), String> {\n    let mut alice = engine_named(b"a")?;\n    let mut bob = engine_named(b"b")?;',
+        'fn stale_bundle() -> Result<(), String> {\n    let alice = engine_named(b"a")?;\n    let bob = engine_named(b"b")?;',
+        'stale_bundle unused mut',
+    ),
+    (
+        'fn p0_crash_no_opk_resurrect() -> Result<(), String> {\n    let mut a = engine_named(b"a")?;\n    let mut b = engine_named(b"b")?;',
+        'fn p0_crash_no_opk_resurrect() -> Result<(), String> {\n    let a = engine_named(b"a")?;\n    let b = engine_named(b"b")?;',
+        'p0_crash_no_opk_resurrect unused mut',
+    ),
+    (
+        'fn prekey_replenish() -> Result<(), String> {\n    let mut e = engine()?;',
+        'fn prekey_replenish() -> Result<(), String> {\n    let e = engine()?;',
+        'prekey_replenish unused mut',
+    ),
+    (
+        'fn prekey_exhaust_then_last_resort() -> Result<(), String> {\n    let mut a = engine_named(b"a")?;\n    let mut b = engine_named(b"b")?;',
+        'fn prekey_exhaust_then_last_resort() -> Result<(), String> {\n    let a = engine_named(b"a")?;\n    let b = engine_named(b"b")?;',
+        'prekey_exhaust_then_last_resort unused mut',
+    ),
+]
+for old, new, label in function_specific:
+    if new in text:
+        print(f"already fixed: {label}")
         continue
-    text = text.replace(old, new, needed)
-    print(f"removed {needed} unnecessary mut binding(s): {old}")
+    if old not in text:
+        raise SystemExit(f"expected function-specific pattern missing: {label}")
+    text = text.replace(old, new, 1)
+    print(f"fixed: {label}")
 corpus.write_text(text)
 
 print("Layer-2 compile/clippy fixes applied.")
