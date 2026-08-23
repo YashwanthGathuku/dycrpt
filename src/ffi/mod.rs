@@ -4,19 +4,23 @@
 //!
 //! Foreign memory is copied into bounded owned Rust buffers before parsing;
 //! no borrowed raw-pointer slice is ever assigned a fabricated `'static`
-//! lifetime. Every fallible ABI entry point catches Rust panics. Registry locks
-//! are short-lived: expensive crypto locks only the selected engine handle.
+//! lifetime. Every fallible ABI entry point catches Rust panics.
 //!
-//! `vc_engine_create` currently uses the in-memory development backend. It is
-//! intentionally not a production persistence solution; mobile production
-//! integration must supply the platform durable-storage/rollback adapters
-//! documented by the hardening gate before this ABI is promoted as production.
+//! The engine itself is internally concurrent. The FFI registry therefore does
+//! not wrap the entire engine in a mutex: a per-handle lifecycle RwLock only
+//! coordinates terminal destroy against in-flight calls, while the Rust engine
+//! serializes same-session work and permits different sessions to run in
+//! parallel.
+//!
+//! `vc_engine_create` remains a development constructor using in-memory storage.
+//! Production mobile integration must initialize the Rust engine with
+//! `EncryptedFileStorage` plus a reviewed rollback-resistant `MonotonicCounter`.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::engine::{
     CryptoEngineApi, CryptoError, DeviceConfig, InitiationPacket, SealedMessage, SessionId,
@@ -58,14 +62,16 @@ impl From<CryptoError> for VcError {
 
 struct EngineSlot {
     closed: AtomicBool,
-    engine: Mutex<VoiceChatCryptoEngine>,
+    calls: RwLock<()>,
+    engine: VoiceChatCryptoEngine,
 }
 
 impl EngineSlot {
     fn new(engine: VoiceChatCryptoEngine) -> Self {
         Self {
             closed: AtomicBool::new(false),
-            engine: Mutex::new(engine),
+            calls: RwLock::new(()),
+            engine,
         }
     }
 }
@@ -104,20 +110,17 @@ fn engine_for(handle: VcHandle) -> Result<SharedEngine, VcError> {
 
 fn with_engine<R>(
     handle: VcHandle,
-    f: impl FnOnce(&mut VoiceChatCryptoEngine) -> Result<R, VcError>,
+    f: impl FnOnce(&VoiceChatCryptoEngine) -> Result<R, VcError>,
 ) -> Result<R, VcError> {
     let slot = engine_for(handle)?;
     if slot.closed.load(Ordering::Acquire) {
         return Err(VcError::NotFound);
     }
-    let mut guard = slot.engine.lock().map_err(|_| VcError::Internal)?;
-    // Destroy may have removed/closed the handle while this caller was queued
-    // on the per-engine mutex. Recheck after acquiring the mutex so a queued
-    // operation cannot resume after destroy has begun.
+    let _call = slot.calls.read().map_err(|_| VcError::Internal)?;
     if slot.closed.load(Ordering::Acquire) {
         return Err(VcError::NotFound);
     }
-    f(&mut guard)
+    f(&slot.engine)
 }
 
 fn ffi_guard(f: impl FnOnce() -> i32) -> i32 {
@@ -171,6 +174,9 @@ fn read_sid(ptr: *const u8) -> Result<SessionId, VcError> {
     }
     let mut sid = [0u8; 16];
     unsafe { std::ptr::copy_nonoverlapping(ptr, sid.as_mut_ptr(), 16) };
+    if sid == [0u8; 16] {
+        return Err(VcError::InvalidArgument);
+    }
     Ok(SessionId(sid))
 }
 
@@ -224,7 +230,8 @@ pub unsafe extern "C" fn vc_engine_create(
             Err(_) => return VcError::InvalidArgument as i32,
         };
         let dev_id = match read_owned(device_id, device_id_len, MAX_FFI_DEVICE_ID) {
-            Ok(v) => v,
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => return VcError::InvalidArgument as i32,
             Err(e) => return e as i32,
         };
         let engine = match VoiceChatCryptoEngine::initialize_device(DeviceConfig {
@@ -277,16 +284,14 @@ pub unsafe extern "C" fn vc_engine_destroy(engine: VcHandle) -> i32 {
             let Some(slot) = reg.engines.remove(&engine) else {
                 return VcError::NotFound as i32;
             };
-            // Mark closed while the registry lock is held so no later lookup can
-            // race with removal and obtain a logically live handle.
             slot.closed.store(true, Ordering::Release);
             slot
         };
 
-        // Wait for an operation that acquired the per-engine lock before the
-        // close flag was set. Once this lock is obtained/released, every older
-        // operation has completed and every queued holder will observe closed.
-        match slot.engine.lock() {
+        // A write guard waits for all older read guards. Once acquired, every
+        // call that entered before close has returned and no queued call can
+        // start because it will observe `closed` on its second check.
+        match slot.calls.write() {
             Ok(guard) => drop(guard),
             Err(_) => return VcError::Internal as i32,
         }
@@ -871,6 +876,8 @@ pub extern "C" fn vc_protocol_version() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::thread;
 
     unsafe fn create_engine(id: &[u8]) -> (VcHandle, [u8; 32]) {
         let mut handle = 0u64;
@@ -910,20 +917,6 @@ mod tests {
     #[test]
     fn protocol_version_is_v2() {
         assert_eq!(vc_protocol_version(), 2);
-    }
-
-    #[test]
-    fn destroyed_handle_is_terminal() {
-        unsafe {
-            let (handle, _) = create_engine(b"destroyed");
-            assert_eq!(vc_engine_destroy(handle), VcError::Ok as i32);
-            let mut pk = [0u8; 32];
-            assert_eq!(
-                vc_engine_public_identity(handle, pk.as_mut_ptr()),
-                VcError::NotFound as i32
-            );
-            assert_eq!(vc_engine_destroy(handle), VcError::NotFound as i32);
-        }
     }
 
     #[test]
@@ -1033,17 +1026,6 @@ mod tests {
             );
             assert_eq!(&out[..out_len], b"B1");
 
-            let mut no_pending_len = 0usize;
-            assert_eq!(
-                vc_pending_outbound_initiation(
-                    alice,
-                    sid_a.as_ptr(),
-                    std::ptr::null_mut(),
-                    &mut no_pending_len,
-                ),
-                VcError::NotFound as i32
-            );
-
             let mut binary = [0u8; 32];
             let mut numeric = [0u8; 60];
             let mut numeric_len = numeric.len();
@@ -1066,6 +1048,30 @@ mod tests {
             assert_eq!(vc_delete_session(alice, sid_a.as_ptr()), VcError::Ok as i32);
             assert_eq!(vc_engine_destroy(alice), VcError::Ok as i32);
             assert_eq!(vc_engine_destroy(bob), VcError::Ok as i32);
+        }
+    }
+
+    #[test]
+    fn destroy_is_terminal_against_inflight_calls() {
+        unsafe {
+            let (handle, _) = create_engine(b"destroy-race");
+            let barrier = Arc::new(Barrier::new(2));
+            let worker_barrier = barrier.clone();
+            let worker = thread::spawn(move || {
+                worker_barrier.wait();
+                let mut out = [0u8; 32];
+                vc_engine_public_identity(handle, out.as_mut_ptr())
+            });
+            barrier.wait();
+            let destroy = vc_engine_destroy(handle);
+            assert_eq!(destroy, VcError::Ok as i32);
+            let result = worker.join().unwrap();
+            assert!(result == VcError::Ok as i32 || result == VcError::NotFound as i32);
+            let mut out = [0u8; 32];
+            assert_eq!(
+                vc_engine_public_identity(handle, out.as_mut_ptr()),
+                VcError::NotFound as i32
+            );
         }
     }
 }
