@@ -8,7 +8,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-voicechat_crypto = { path = "..", features = ["std", "hybrid"] }
+voicechat_crypto = { path = "..", features = ["std", "hybrid", "header-encrypt", "sesame"] }
 libfuzzer-sys = { version = "0.4", optional = true }
 
 [features]
@@ -36,5 +36,23 @@ required-features = ["libfuzzer"]
 [[bin]]
 name = "triple_header_decode"
 path = "fuzz_targets/triple_header_decode.rs"
+doc = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "engine_wire"
+path = "fuzz_targets/engine_wire.rs"
+doc = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "prekey_bundle"
+path = "fuzz_targets/prekey_bundle.rs"
+doc = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "state_decoders"
+path = "fuzz_targets/state_decoders.rs"
 doc = false
 required-features = ["libfuzzer"]
