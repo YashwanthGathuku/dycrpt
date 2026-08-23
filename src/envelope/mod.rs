@@ -6,28 +6,22 @@
 //!
 //! Design rules:
 //! - Strict canonical serialization (deterministic field order, no duplicates).
-//! - Sensitive routing/application metadata is placed in AEAD associated data
-//!   (or encrypted when transport requires confidentiality of that metadata).
+//! - Sensitive routing/application metadata is placed in AEAD associated data.
+//! - The payload body is AEAD plaintext, while its exact length is authenticated.
 //! - Parser is fail-closed: unknown critical fields, overflows, oversized
 //!   payloads, invalid UTF-8, malformed lengths, unsupported versions → error.
-//! - Continuous fuzzing of the parser is required.
 
 use crate::primitives::error::PrimitiveError;
 
-/// Current envelope format version.
 pub const ENVELOPE_VERSION: u8 = 1;
-
-/// Maximum payload size (bytes) accepted by the parser.
-pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024; // 1 MiB
-
-/// Maximum length for identifier strings / byte arrays.
+pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 pub const MAX_ID_LEN: usize = 128;
+const ENVELOPE_AD_DOMAIN: &[u8] = b"VCENV-AD-v1";
 
-/// Cryptographic suite identifier (authenticated).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CryptoSuite {
-    /// X25519 + ML-KEM-768 + Triple Ratchet + AES-256-GCM
+    /// X25519 + ML-KEM-768 + Triple Ratchet + AES-256-GCM.
     PqxdhTripleAes256Gcm = 1,
 }
 
@@ -35,7 +29,7 @@ impl CryptoSuite {
     pub fn from_u8(v: u8) -> Result<Self, PrimitiveError> {
         match v {
             1 => Ok(Self::PqxdhTripleAes256Gcm),
-            _ => Err(PrimitiveError::InvalidLength), // treat as unsupported
+            _ => Err(PrimitiveError::InvalidLength),
         }
     }
 
@@ -44,7 +38,6 @@ impl CryptoSuite {
     }
 }
 
-/// Application payload type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PayloadType {
@@ -70,17 +63,13 @@ impl PayloadType {
     }
 }
 
-/// Synthetic-voice specific metadata (bound when payload_type == SyntheticVoice).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyntheticVoiceMeta {
-    pub codec: String, // e.g. "opus"
+    pub codec: String,
     pub duration_ms: u32,
-    pub payload_length: u32, // claimed length; must match actual payload
+    pub payload_length: u32,
 }
 
-/// The application envelope. All security-sensitive fields are part of the
-/// authenticated associated data (or encrypted) and therefore cannot be
-/// altered without detection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Envelope {
     pub protocol_version: u8,
@@ -91,104 +80,31 @@ pub struct Envelope {
     pub recipient_user_id: Vec<u8>,
     pub recipient_device_id: Vec<u8>,
     pub message_id: Vec<u8>,
-    pub message_type: u8,       // application-defined subtype
-    pub sequence: u64,          // monotonic per conversation/device
-    pub created_timestamp: u64, // Unix ms or application clock
+    pub message_type: u8,
+    pub sequence: u64,
+    pub created_timestamp: u64,
     pub payload_type: PayloadType,
     pub synthetic_voice: Option<SyntheticVoiceMeta>,
     pub payload: Vec<u8>,
 }
 
 impl Envelope {
-    /// Canonical serialization used both for AEAD associated data and for
-    /// the cleartext envelope when metadata is not encrypted.
-    ///
-    /// Format (all multi-byte integers little-endian):
-    /// ```
-    /// version:        u8
-    /// suite:          u8
-    /// conv_id_len:    u16
-    /// conv_id:        [u8; conv_id_len]
-    /// sender_uid_len: u16
-    /// sender_uid:     [u8; ...]
-    /// sender_did_len: u16
-    /// sender_did:     [u8; ...]
-    /// recip_uid_len:  u16
-    /// recip_uid:      [u8; ...]
-    /// recip_did_len:  u16
-    /// recip_did:      [u8; ...]
-    /// msg_id_len:     u16
-    /// msg_id:         [u8; ...]
-    /// message_type:   u8
-    /// sequence:       u64
-    /// timestamp:      u64
-    /// payload_type:   u8
-    /// [if SyntheticVoice]
-    ///   codec_len:    u16
-    ///   codec:        [u8; ...]   (UTF-8)
-    ///   duration_ms:  u32
-    ///   payload_len:  u32
-    /// payload_len:    u32
-    /// payload:        [u8; payload_len]
-    /// ```
-    ///
-    /// Field order is fixed. Duplicate fields are impossible by construction.
-    /// Unknown critical fields cannot appear because the format is closed.
+    /// Canonical full-envelope serialization.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, PrimitiveError> {
         self.validate_limits()?;
-
+        self.validate_payload_metadata()?;
         let mut out = Vec::with_capacity(256 + self.payload.len());
-        out.push(self.protocol_version);
-        out.push(self.crypto_suite.as_u8());
-
-        write_bytes_u16(&mut out, &self.conversation_id)?;
-        write_bytes_u16(&mut out, &self.sender_user_id)?;
-        write_bytes_u16(&mut out, &self.sender_device_id)?;
-        write_bytes_u16(&mut out, &self.recipient_user_id)?;
-        write_bytes_u16(&mut out, &self.recipient_device_id)?;
-        write_bytes_u16(&mut out, &self.message_id)?;
-
-        out.push(self.message_type);
-        out.extend_from_slice(&self.sequence.to_le_bytes());
-        out.extend_from_slice(&self.created_timestamp.to_le_bytes());
-        out.push(self.payload_type.as_u8());
-
-        if self.payload_type == PayloadType::SyntheticVoice {
-            let meta = self
-                .synthetic_voice
-                .as_ref()
-                .ok_or(PrimitiveError::InvalidLength)?;
-            if meta.codec.len() > MAX_ID_LEN || !meta.codec.is_ascii() {
-                // require simple ASCII codec names for now
-                return Err(PrimitiveError::InvalidLength);
-            }
-            write_bytes_u16(&mut out, meta.codec.as_bytes())?;
-            out.extend_from_slice(&meta.duration_ms.to_le_bytes());
-            out.extend_from_slice(&meta.payload_length.to_le_bytes());
-            if meta.payload_length as usize != self.payload.len() {
-                return Err(PrimitiveError::InvalidLength);
-            }
-        } else if self.synthetic_voice.is_some() {
-            // synthetic_voice metadata present for non-voice payload → reject
-            return Err(PrimitiveError::InvalidLength);
-        }
-
-        if self.payload.len() > MAX_PAYLOAD_LEN {
-            return Err(PrimitiveError::InvalidLength);
-        }
-        let plen = self.payload.len() as u32;
-        out.extend_from_slice(&plen.to_le_bytes());
+        self.write_authenticated_metadata(&mut out)?;
         out.extend_from_slice(&self.payload);
-
         Ok(out)
     }
 
-    /// Parse a canonical envelope. Fail-closed on every malformed input.
+    /// Parse a canonical envelope. Fail-closed on malformed/trailing input.
     pub fn parse(data: &[u8]) -> Result<Self, PrimitiveError> {
         let mut i = 0;
         let version = read_u8(data, &mut i)?;
         if version != ENVELOPE_VERSION {
-            return Err(PrimitiveError::InvalidLength); // unsupported version
+            return Err(PrimitiveError::InvalidLength);
         }
         let suite = CryptoSuite::from_u8(read_u8(data, &mut i)?)?;
 
@@ -227,17 +143,13 @@ impl Envelope {
         if payload_len > MAX_PAYLOAD_LEN {
             return Err(PrimitiveError::InvalidLength);
         }
-        if i + payload_len != data.len() {
-            // trailing data or truncated → reject
+        let end = i
+            .checked_add(payload_len)
+            .ok_or(PrimitiveError::LimitExceeded)?;
+        if end != data.len() {
             return Err(PrimitiveError::InvalidLength);
         }
-        let payload = data[i..i + payload_len].to_vec();
-
-        if let Some(ref meta) = synthetic_voice {
-            if meta.payload_length as usize != payload.len() {
-                return Err(PrimitiveError::InvalidLength);
-            }
-        }
+        let payload = data[i..end].to_vec();
 
         let env = Self {
             protocol_version: version,
@@ -256,20 +168,64 @@ impl Envelope {
             payload,
         };
         env.validate_limits()?;
+        env.validate_payload_metadata()?;
         Ok(env)
     }
 
-    /// Produce the associated-data bytes that must be supplied to the AEAD.
-    /// This binds every security-sensitive field.
+    /// Canonical AEAD associated data.
+    ///
+    /// This binds every routing field, payload type, voice metadata, and the
+    /// exact payload length while deliberately omitting the payload body because
+    /// that body is the AEAD plaintext. Unlike the old clone-and-clear shortcut,
+    /// SyntheticVoice metadata remains self-consistent and authenticated.
     pub fn associated_data(&self) -> Result<Vec<u8>, PrimitiveError> {
-        // For the current design the entire canonical encoding (excluding
-        // the raw payload if it is large) can be used, or a compact AD
-        // that omits the payload body. We bind the header fields strictly.
-        // Policy: bind everything except the payload body itself (the
-        // payload is the AEAD plaintext).
-        let mut ad_env = self.clone();
-        ad_env.payload = Vec::new(); // payload is plaintext, not AD
-        ad_env.canonical_bytes()
+        self.validate_limits()?;
+        self.validate_payload_metadata()?;
+        let mut out = Vec::with_capacity(ENVELOPE_AD_DOMAIN.len() + 256);
+        out.extend_from_slice(ENVELOPE_AD_DOMAIN);
+        self.write_authenticated_metadata(&mut out)?;
+        Ok(out)
+    }
+
+    fn write_authenticated_metadata(&self, out: &mut Vec<u8>) -> Result<(), PrimitiveError> {
+        out.push(self.protocol_version);
+        out.push(self.crypto_suite.as_u8());
+        write_bytes_u16(out, &self.conversation_id)?;
+        write_bytes_u16(out, &self.sender_user_id)?;
+        write_bytes_u16(out, &self.sender_device_id)?;
+        write_bytes_u16(out, &self.recipient_user_id)?;
+        write_bytes_u16(out, &self.recipient_device_id)?;
+        write_bytes_u16(out, &self.message_id)?;
+        out.push(self.message_type);
+        out.extend_from_slice(&self.sequence.to_le_bytes());
+        out.extend_from_slice(&self.created_timestamp.to_le_bytes());
+        out.push(self.payload_type.as_u8());
+
+        if let Some(meta) = &self.synthetic_voice {
+            write_bytes_u16(out, meta.codec.as_bytes())?;
+            out.extend_from_slice(&meta.duration_ms.to_le_bytes());
+            out.extend_from_slice(&meta.payload_length.to_le_bytes());
+        }
+
+        out.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        Ok(())
+    }
+
+    fn validate_payload_metadata(&self) -> Result<(), PrimitiveError> {
+        match (self.payload_type, &self.synthetic_voice) {
+            (PayloadType::SyntheticVoice, Some(meta)) => {
+                if meta.codec.is_empty() || meta.codec.len() > MAX_ID_LEN || !meta.codec.is_ascii() {
+                    return Err(PrimitiveError::InvalidLength);
+                }
+                if meta.payload_length as usize != self.payload.len() {
+                    return Err(PrimitiveError::InvalidLength);
+                }
+            }
+            (PayloadType::SyntheticVoice, None) => return Err(PrimitiveError::InvalidLength),
+            (_, Some(_)) => return Err(PrimitiveError::InvalidLength),
+            (_, None) => {}
+        }
+        Ok(())
     }
 
     fn validate_limits(&self) -> Result<(), PrimitiveError> {
@@ -288,16 +244,12 @@ impl Envelope {
                 return Err(PrimitiveError::InvalidLength);
             }
         }
-        if self.payload.len() > MAX_PAYLOAD_LEN {
+        if self.payload.len() > MAX_PAYLOAD_LEN || self.payload.len() > u32::MAX as usize {
             return Err(PrimitiveError::InvalidLength);
         }
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Canonical helpers (strict, no overflow, no duplicate fields possible)
-// ---------------------------------------------------------------------------
 
 fn write_bytes_u16(out: &mut Vec<u8>, data: &[u8]) -> Result<(), PrimitiveError> {
     if data.len() > u16::MAX as usize || data.len() > MAX_ID_LEN {
@@ -318,45 +270,48 @@ fn read_u8(data: &[u8], i: &mut usize) -> Result<u8, PrimitiveError> {
 }
 
 fn read_u16(data: &[u8], i: &mut usize) -> Result<u16, PrimitiveError> {
-    if *i + 2 > data.len() {
+    let end = i.checked_add(2).ok_or(PrimitiveError::LimitExceeded)?;
+    if end > data.len() {
         return Err(PrimitiveError::InvalidLength);
     }
-    let v = u16::from_le_bytes(data[*i..*i + 2].try_into().unwrap());
-    *i += 2;
+    let v = u16::from_le_bytes(data[*i..end].try_into().unwrap());
+    *i = end;
     Ok(v)
 }
 
 fn read_u32(data: &[u8], i: &mut usize) -> Result<u32, PrimitiveError> {
-    if *i + 4 > data.len() {
+    let end = i.checked_add(4).ok_or(PrimitiveError::LimitExceeded)?;
+    if end > data.len() {
         return Err(PrimitiveError::InvalidLength);
     }
-    let v = u32::from_le_bytes(data[*i..*i + 4].try_into().unwrap());
-    *i += 4;
+    let v = u32::from_le_bytes(data[*i..end].try_into().unwrap());
+    *i = end;
     Ok(v)
 }
 
 fn read_u64(data: &[u8], i: &mut usize) -> Result<u64, PrimitiveError> {
-    if *i + 8 > data.len() {
+    let end = i.checked_add(8).ok_or(PrimitiveError::LimitExceeded)?;
+    if end > data.len() {
         return Err(PrimitiveError::InvalidLength);
     }
-    let v = u64::from_le_bytes(data[*i..*i + 8].try_into().unwrap());
-    *i += 8;
+    let v = u64::from_le_bytes(data[*i..end].try_into().unwrap());
+    *i = end;
     Ok(v)
 }
 
 fn read_bytes_u16(data: &[u8], i: &mut usize) -> Result<Vec<u8>, PrimitiveError> {
     let len = read_u16(data, i)? as usize;
-    if len > MAX_ID_LEN || *i + len > data.len() {
+    if len > MAX_ID_LEN {
         return Err(PrimitiveError::InvalidLength);
     }
-    let v = data[*i..*i + len].to_vec();
-    *i += len;
+    let end = i.checked_add(len).ok_or(PrimitiveError::LimitExceeded)?;
+    if end > data.len() {
+        return Err(PrimitiveError::InvalidLength);
+    }
+    let v = data[*i..end].to_vec();
+    *i = end;
     Ok(v)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -381,6 +336,29 @@ mod tests {
         }
     }
 
+    fn voice_envelope() -> Envelope {
+        Envelope {
+            protocol_version: ENVELOPE_VERSION,
+            crypto_suite: CryptoSuite::PqxdhTripleAes256Gcm,
+            conversation_id: b"c".to_vec(),
+            sender_user_id: b"a".to_vec(),
+            sender_device_id: b"d1".to_vec(),
+            recipient_user_id: b"b".to_vec(),
+            recipient_device_id: b"d2".to_vec(),
+            message_id: b"m".to_vec(),
+            message_type: 0,
+            sequence: 1,
+            created_timestamp: 100,
+            payload_type: PayloadType::SyntheticVoice,
+            synthetic_voice: Some(SyntheticVoiceMeta {
+                codec: "opus".into(),
+                duration_ms: 1500,
+                payload_length: 5,
+            }),
+            payload: b"audio".to_vec(),
+        }
+    }
+
     #[test]
     fn roundtrip_canonical() {
         let env = sample_envelope();
@@ -395,12 +373,9 @@ mod tests {
         env_a.conversation_id = b"conversation-A".to_vec();
         let mut env_b = env_a.clone();
         env_b.conversation_id = b"conversation-B".to_vec();
-
-        let ad_a = env_a.associated_data().unwrap();
-        let ad_b = env_b.associated_data().unwrap();
         assert_ne!(
-            ad_a, ad_b,
-            "different conversations must produce different AD"
+            env_a.associated_data().unwrap(),
+            env_b.associated_data().unwrap()
         );
     }
 
@@ -410,16 +385,13 @@ mod tests {
         let ad1 = env.associated_data().unwrap();
         env.recipient_device_id = b"device-OTHER".to_vec();
         let ad2 = env.associated_data().unwrap();
-        assert_ne!(
-            ad1, ad2,
-            "different recipient devices must produce different AD"
-        );
+        assert_ne!(ad1, ad2);
     }
 
     #[test]
     fn unsupported_version_rejected() {
         let mut bytes = sample_envelope().canonical_bytes().unwrap();
-        bytes[0] = 99; // unknown version
+        bytes[0] = 99;
         assert!(Envelope::parse(&bytes).is_err());
     }
 
@@ -445,61 +417,40 @@ mod tests {
 
     #[test]
     fn synthetic_voice_roundtrip() {
-        let env = Envelope {
-            protocol_version: ENVELOPE_VERSION,
-            crypto_suite: CryptoSuite::PqxdhTripleAes256Gcm,
-            conversation_id: b"c".to_vec(),
-            sender_user_id: b"a".to_vec(),
-            sender_device_id: b"d1".to_vec(),
-            recipient_user_id: b"b".to_vec(),
-            recipient_device_id: b"d2".to_vec(),
-            message_id: b"m".to_vec(),
-            message_type: 0,
-            sequence: 1,
-            created_timestamp: 100,
-            payload_type: PayloadType::SyntheticVoice,
-            synthetic_voice: Some(SyntheticVoiceMeta {
-                codec: "opus".into(),
-                duration_ms: 1500,
-                payload_length: 5,
-            }),
-            payload: b"audio".to_vec(),
-        };
+        let env = voice_envelope();
         let bytes = env.canonical_bytes().unwrap();
         let parsed = Envelope::parse(&bytes).unwrap();
         assert_eq!(env, parsed);
     }
 
     #[test]
-    fn synthetic_voice_length_mismatch_rejected() {
-        let env = Envelope {
-            protocol_version: ENVELOPE_VERSION,
-            crypto_suite: CryptoSuite::PqxdhTripleAes256Gcm,
-            conversation_id: b"c".to_vec(),
-            sender_user_id: b"a".to_vec(),
-            sender_device_id: b"d1".to_vec(),
-            recipient_user_id: b"b".to_vec(),
-            recipient_device_id: b"d2".to_vec(),
-            message_id: b"m".to_vec(),
-            message_type: 0,
-            sequence: 1,
-            created_timestamp: 100,
-            payload_type: PayloadType::SyntheticVoice,
-            synthetic_voice: Some(SyntheticVoiceMeta {
-                codec: "opus".into(),
-                duration_ms: 1500,
-                payload_length: 99, // wrong
-            }),
-            payload: b"audio".to_vec(),
-        };
+    fn synthetic_voice_associated_data_is_valid_and_binds_metadata() {
+        let env = voice_envelope();
+        let ad = env.associated_data().unwrap();
+        assert!(!ad.is_empty());
+
+        let mut changed_duration = env.clone();
+        changed_duration.synthetic_voice.as_mut().unwrap().duration_ms += 1;
+        assert_ne!(ad, changed_duration.associated_data().unwrap());
+
+        // Payload contents are plaintext, not AD. Same-length payload content
+        // therefore does not alter metadata AD; AEAD authenticates the body.
+        let mut changed_body = env.clone();
+        changed_body.payload = b"other".to_vec();
+        assert_eq!(ad, changed_body.associated_data().unwrap());
+    }
+
+    #[test]
+    fn synthetic_voice_length_mismatch_rejected_for_body_and_ad() {
+        let mut env = voice_envelope();
+        env.synthetic_voice.as_mut().unwrap().payload_length = 99;
         assert!(env.canonical_bytes().is_err());
+        assert!(env.associated_data().is_err());
     }
 
     #[test]
     fn associated_data_stable_for_same_envelope() {
         let env = sample_envelope();
-        let ad1 = env.associated_data().unwrap();
-        let ad2 = env.associated_data().unwrap();
-        assert_eq!(ad1, ad2);
+        assert_eq!(env.associated_data().unwrap(), env.associated_data().unwrap());
     }
 }
