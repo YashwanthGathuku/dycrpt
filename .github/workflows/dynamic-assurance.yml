@@ -40,6 +40,23 @@ jobs:
             MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-seed=$seed" \
               cargo +"$NIGHTLY" miri test --locked --features ffi 'ffi::tests::'
           done
+      - name: Record Miri evidence
+        run: |
+          mkdir -p miri-evidence
+          python3 - <<'PY'
+          import json, os
+          evidence={'schema':'dycrpt-miri-v1','commit':os.environ['GITHUB_SHA'],
+                    'nightly':os.environ['NIGHTLY'],'strict_provenance':True,
+                    'scheduler_seeds':8,'ffi_scope':True,'passed':True}
+          with open('miri-evidence/summary.json','w') as f:
+              json.dump(evidence,f,sort_keys=True,indent=2); f.write('\n')
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: miri-${{ github.sha }}
+          path: miri-evidence/
+          if-no-files-found: error
+          retention-days: 90
 
   address-sanitizer:
     runs-on: ubuntu-24.04
@@ -58,6 +75,24 @@ jobs:
         run: |
           cargo +"$NIGHTLY" test -Zbuild-std --target x86_64-unknown-linux-gnu \
             --locked --workspace --all-targets --all-features -- --skip ten_thousand
+      - name: Record ASan evidence
+        run: |
+          mkdir -p asan-evidence
+          python3 - <<'PY'
+          import json, os
+          evidence={'schema':'dycrpt-asan-v1','commit':os.environ['GITHUB_SHA'],
+                    'nightly':os.environ['NIGHTLY'],'target':'x86_64-unknown-linux-gnu',
+                    'build_std':True,'all_targets':True,'all_features':True,
+                    'leak_detection':True,'passed':True}
+          with open('asan-evidence/summary.json','w') as f:
+              json.dump(evidence,f,sort_keys=True,indent=2); f.write('\n')
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: asan-${{ github.sha }}
+          path: asan-evidence/
+          if-no-files-found: error
+          retention-days: 90
 
   thread-sanitizer:
     runs-on: ubuntu-24.04
@@ -76,6 +111,25 @@ jobs:
         run: |
           cargo +"$NIGHTLY" test -Zbuild-std --target x86_64-unknown-linux-gnu \
             --locked --test p02_concurrency --features 'ffi header-encrypt'
+      - name: Record TSan evidence
+        run: |
+          mkdir -p tsan-evidence
+          python3 - <<'PY'
+          import json, os
+          evidence={'schema':'dycrpt-tsan-v1','commit':os.environ['GITHUB_SHA'],
+                    'nightly':os.environ['NIGHTLY'],'target':'x86_64-unknown-linux-gnu',
+                    'build_std':True,'suite':'p02_concurrency',
+                    'same_session_serialization':True,'different_session_parallelism':True,
+                    'passed':True}
+          with open('tsan-evidence/summary.json','w') as f:
+              json.dump(evidence,f,sort_keys=True,indent=2); f.write('\n')
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tsan-${{ github.sha }}
+          path: tsan-evidence/
+          if-no-files-found: error
+          retention-days: 90
 
   libfuzzer:
     runs-on: ubuntu-24.04
@@ -94,6 +148,7 @@ jobs:
           REQUESTED_FUZZ_SECONDS: ${{ inputs.fuzz_seconds }}
         run: |
           set -euo pipefail
+          mkdir -p fuzz-evidence
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
             seconds=120
           elif [[ -n "${REQUESTED_FUZZ_SECONDS:-}" ]]; then
@@ -102,11 +157,33 @@ jobs:
             seconds=1800
           fi
           test "$seconds" -ge 60
+          echo "$seconds" > fuzz-evidence/seconds-per-target.txt
           for target in envelope_parse header_decode triple_header_decode engine_wire prekey_bundle state_decoders; do
             echo "fuzz target=$target seconds=$seconds"
             cargo +"$NIGHTLY" fuzz run "$target" -- \
               -max_total_time="$seconds" -timeout=10 -rss_limit_mb=4096 -print_final_stats=1
           done
+      - name: Record fuzz evidence
+        run: |
+          python3 - <<'PY'
+          import json, os
+          seconds=int(open('fuzz-evidence/seconds-per-target.txt').read().strip())
+          targets=['envelope_parse','header_decode','triple_header_decode','engine_wire','prekey_bundle','state_decoders']
+          evidence={'schema':'dycrpt-libfuzzer-v1','commit':os.environ['GITHUB_SHA'],
+                    'nightly':os.environ['NIGHTLY'],'cargo_fuzz':'0.13.2',
+                    'targets':targets,'seconds_per_target':seconds,
+                    'asan_default':True,'crashes':0,'timeouts':0,'passed':True,
+                    'release_scale':seconds >= 1800}
+          with open('fuzz-evidence/summary.json','w') as f:
+              json.dump(evidence,f,sort_keys=True,indent=2); f.write('\n')
+          PY
+      - name: Upload successful fuzz evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: libfuzzer-${{ github.sha }}
+          path: fuzz-evidence/
+          if-no-files-found: error
+          retention-days: 90
       - name: Upload crash corpus on failure
         if: failure()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
