@@ -345,6 +345,9 @@ pub unsafe extern "C" fn vc_generate_bundle(
     })
 }
 
+// This helper mirrors a C ABI pointer/length surface; keeping the pairs explicit
+// makes validation auditable and avoids a second representation at the FFI boundary.
+#[allow(clippy::too_many_arguments)]
 fn establish_outbound_inner(
     engine: VcHandle,
     peer: Option<(Vec<u8>, Option<Vec<u8>>)>,
@@ -507,6 +510,9 @@ pub unsafe extern "C" fn vc_establish_outbound_for_peer(
     })
 }
 
+// This helper mirrors a C ABI pointer/length surface; keeping the pairs explicit
+// makes validation auditable and avoids a second representation at the FFI boundary.
+#[allow(clippy::too_many_arguments)]
 fn process_inbound_inner(
     engine: VcHandle,
     peer: Option<(Vec<u8>, Option<Vec<u8>>)>,

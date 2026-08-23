@@ -26,6 +26,8 @@ use crate::storage::{StateBlob, StorageEpoch, TransactionId, TransactionalStorag
 
 const STORAGE_EPOCH_KEY: &[u8] = b"storage-epoch-v1";
 
+pub type CoordinatedBackendPair = (Box<dyn TransactionalStorage>, Box<dyn MonotonicCounter>);
+
 struct Coordination {
     anchor: Arc<dyn RollbackAnchor>,
     pending_epoch: Mutex<Option<u64>>,
@@ -260,7 +262,7 @@ impl<S: TransactionalStorage> TransactionalStorage for AnchoredStorage<S> {
 pub fn coordinated_backends_for_initialize<S>(
     storage: S,
     anchor: Arc<dyn RollbackAnchor>,
-) -> Result<(Box<dyn TransactionalStorage>, Box<dyn MonotonicCounter>), PrimitiveError>
+) -> Result<CoordinatedBackendPair, PrimitiveError>
 where
     S: TransactionalStorage + 'static,
 {
@@ -280,7 +282,7 @@ where
 pub fn coordinated_backends_for_restore<S>(
     storage: S,
     anchor: Arc<dyn RollbackAnchor>,
-) -> Result<(Box<dyn TransactionalStorage>, Box<dyn MonotonicCounter>), PrimitiveError>
+) -> Result<CoordinatedBackendPair, PrimitiveError>
 where
     S: TransactionalStorage + 'static,
 {
@@ -327,7 +329,7 @@ where
 fn build_pair<S>(
     storage: S,
     anchor: Arc<dyn RollbackAnchor>,
-) -> Result<(Box<dyn TransactionalStorage>, Box<dyn MonotonicCounter>), PrimitiveError>
+) -> Result<CoordinatedBackendPair, PrimitiveError>
 where
     S: TransactionalStorage + 'static,
 {

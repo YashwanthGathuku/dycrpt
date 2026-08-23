@@ -94,17 +94,17 @@ fn canonical_order<'a>(
 ) -> (&'a IdentityMaterial, &'a IdentityMaterial) {
     let a_bytes = a.identity_key.to_bytes();
     let b_bytes = b.identity_key.to_bytes();
-    if a_bytes < b_bytes {
-        (a, b)
-    } else if b_bytes < a_bytes {
-        (b, a)
-    } else {
-        let a_dev = a.device_id.as_deref().unwrap_or(&[]);
-        let b_dev = b.device_id.as_deref().unwrap_or(&[]);
-        if a_dev <= b_dev {
-            (a, b)
-        } else {
-            (b, a)
+    match a_bytes.cmp(&b_bytes) {
+        std::cmp::Ordering::Less => (a, b),
+        std::cmp::Ordering::Greater => (b, a),
+        std::cmp::Ordering::Equal => {
+            let a_dev = a.device_id.as_deref().unwrap_or(&[]);
+            let b_dev = b.device_id.as_deref().unwrap_or(&[]);
+            if a_dev <= b_dev {
+                (a, b)
+            } else {
+                (b, a)
+            }
         }
     }
 }

@@ -31,6 +31,18 @@ const MAX_RECORDS: usize = 200_000;
 const MAX_KEY_LEN: usize = 64 * 1024;
 const MAX_VALUE_LEN: usize = 80 * 1024 * 1024;
 
+type SnapshotMap = HashMap<Vec<u8>, Vec<u8>>;
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct StagedValue(Option<Vec<u8>>);
 
@@ -70,10 +82,7 @@ impl EncryptedFileStorage {
         &self.path
     }
 
-    fn read_snapshot(
-        path: &Path,
-        key: &AeadKey,
-    ) -> Result<(HashMap<Vec<u8>, Vec<u8>>, u64), PrimitiveError> {
+    fn read_snapshot(path: &Path, key: &AeadKey) -> Result<(SnapshotMap, u64), PrimitiveError> {
         let metadata = fs::metadata(path).map_err(|_| PrimitiveError::Internal)?;
         let file_len =
             usize::try_from(metadata.len()).map_err(|_| PrimitiveError::LimitExceeded)?;
@@ -97,7 +106,7 @@ impl EncryptedFileStorage {
         parsed
     }
 
-    fn decode_map(data: &[u8]) -> Result<(HashMap<Vec<u8>, Vec<u8>>, u64), PrimitiveError> {
+    fn decode_map(data: &[u8]) -> Result<(SnapshotMap, u64), PrimitiveError> {
         if data.len() < 8 + 8 + 4 || &data[..8] != MAP_MAGIC {
             return Err(PrimitiveError::InvalidLength);
         }
@@ -212,7 +221,7 @@ impl EncryptedFileStorage {
 
         let mut suffix = [0u8; 16];
         fill_random(&mut suffix)?;
-        let suffix_hex: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+        let suffix_hex = encode_lower_hex(&suffix);
         suffix.zeroize();
         let file_name = self
             .path
@@ -418,7 +427,7 @@ mod tests {
     fn temp_path(label: &str) -> PathBuf {
         let mut random = [0u8; 8];
         fill_random(&mut random).unwrap();
-        let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let suffix = encode_lower_hex(&random);
         std::env::temp_dir().join(format!("voicechat-{label}-{suffix}.store"))
     }
 
