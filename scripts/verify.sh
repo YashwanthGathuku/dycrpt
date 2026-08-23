@@ -29,8 +29,7 @@ printf '\n== release tests ==\n'
 cargo test --locked --release --workspace --all-targets --all-features -- --skip ten_thousand
 
 printf '\n== long PQXDH randomized test ==\n'
-cargo test --locked --release ten_thousand_randomized_handshakes -- --ignored 2>/dev/null || \
-  cargo test --locked --release ten_thousand_randomized_handshakes
+cargo test --locked --release ten_thousand_randomized_handshakes
 
 if [[ -f fuzz/Cargo.toml ]]; then
   printf '\n== fuzz host build ==\n'
