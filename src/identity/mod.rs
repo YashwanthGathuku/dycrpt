@@ -15,7 +15,8 @@ pub use crate::prekeys::IdentityKeyPair;
 use std::collections::HashMap;
 
 use crate::fingerprint::{
-    IdentityChangeReason, IdentityMaterial, IdentityState, VerificationMethod,
+    validate_identity_material, IdentityChangeReason, IdentityMaterial, IdentityState,
+    VerificationMethod,
 };
 use crate::primitives::error::PrimitiveError;
 use crate::primitives::x25519::X25519Public;
@@ -24,6 +25,7 @@ const PEER_STORE_MAGIC: &[u8; 8] = b"VCPEER01";
 const MAX_PEER_ID_LEN: usize = 4096;
 const MAX_DEVICE_ID_LEN: usize = 4096;
 const MAX_PEER_RECORDS: usize = 100_000;
+const MAX_PEER_STORE_LEN: usize = 64 * 1024 * 1024;
 
 /// Persisted trust state for one stable application peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +89,7 @@ impl PeerIdentityStore {
         identity: IdentityMaterial,
     ) -> Result<(), PrimitiveError> {
         validate_peer_id(peer_id)?;
+        validate_peer_identity(&identity)?;
         if let Some(existing) = self.by_peer.get(peer_id) {
             if existing.identity != identity {
                 return Err(PrimitiveError::Internal);
@@ -117,6 +120,7 @@ impl PeerIdentityStore {
         method: VerificationMethod,
     ) -> Result<(), PrimitiveError> {
         validate_peer_id(peer_id)?;
+        validate_peer_identity(&identity)?;
         if self.by_peer.len() >= MAX_PEER_RECORDS && !self.by_peer.contains_key(peer_id) {
             return Err(PrimitiveError::LimitExceeded);
         }
@@ -136,6 +140,8 @@ impl PeerIdentityStore {
         let mut out = PEER_STORE_MAGIC.to_vec();
         out.extend_from_slice(&(self.by_peer.len() as u32).to_le_bytes());
         for (peer_id, rec) in &self.by_peer {
+            debug_assert!(validate_peer_id(peer_id).is_ok());
+            debug_assert!(validate_peer_identity(&rec.identity).is_ok());
             put_vec(&mut out, peer_id);
             out.extend_from_slice(&rec.identity.identity_key.to_bytes());
             put_vec(
@@ -146,11 +152,12 @@ impl PeerIdentityStore {
             out.extend_from_slice(&rec.acknowledged_unix.to_le_bytes());
             out.push(rec.method as u8);
         }
+        debug_assert!(out.len() <= MAX_PEER_STORE_LEN);
         out
     }
 
     pub fn deserialize(data: &[u8]) -> Result<Self, PrimitiveError> {
-        if data.len() < 12 || &data[..8] != PEER_STORE_MAGIC {
+        if data.len() < 12 || data.len() > MAX_PEER_STORE_LEN || &data[..8] != PEER_STORE_MAGIC {
             return Err(PrimitiveError::InvalidLength);
         }
         let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
@@ -162,45 +169,40 @@ impl PeerIdentityStore {
         for _ in 0..count {
             let peer_id = take_vec(data, &mut i, MAX_PEER_ID_LEN)?;
             validate_peer_id(&peer_id)?;
-            if i + 32 > data.len() {
-                return Err(PrimitiveError::InvalidLength);
-            }
             let mut key = [0u8; 32];
-            key.copy_from_slice(&data[i..i + 32]);
-            i += 32;
+            key.copy_from_slice(take(data, &mut i, 32)?);
             let device = take_vec(data, &mut i, MAX_DEVICE_ID_LEN)?;
-            if i + 1 + 8 + 1 > data.len() {
-                return Err(PrimitiveError::InvalidLength);
-            }
-            let acknowledged = match data[i] {
+            let acknowledged = match take(data, &mut i, 1)?[0] {
                 0 => false,
                 1 => true,
                 _ => return Err(PrimitiveError::InvalidLength),
             };
-            i += 1;
-            let acknowledged_unix = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-            i += 8;
-            let method = match data[i] {
+            let acknowledged_unix =
+                u64::from_le_bytes(take(data, &mut i, 8)?.try_into().unwrap());
+            let method = match take(data, &mut i, 1)?[0] {
                 0 => VerificationMethod::None,
                 1 => VerificationMethod::SafetyNumber,
                 _ => return Err(PrimitiveError::InvalidLength),
             };
-            i += 1;
-            if by_peer.contains_key(&peer_id) {
+            let identity = IdentityMaterial {
+                identity_key: X25519Public::from_bytes(key)?,
+                device_id: if device.is_empty() { None } else { Some(device) },
+            };
+            validate_peer_identity(&identity)?;
+            if by_peer
+                .insert(
+                    peer_id,
+                    PeerTrustRecord {
+                        identity,
+                        acknowledged,
+                        acknowledged_unix,
+                        method,
+                    },
+                )
+                .is_some()
+            {
                 return Err(PrimitiveError::InvalidLength);
             }
-            by_peer.insert(
-                peer_id,
-                PeerTrustRecord {
-                    identity: IdentityMaterial {
-                        identity_key: X25519Public::from_bytes(key)?,
-                        device_id: if device.is_empty() { None } else { Some(device) },
-                    },
-                    acknowledged,
-                    acknowledged_unix,
-                    method,
-                },
-            );
         }
         if i != data.len() {
             return Err(PrimitiveError::InvalidLength);
@@ -216,23 +218,39 @@ fn validate_peer_id(peer_id: &[u8]) -> Result<(), PrimitiveError> {
     Ok(())
 }
 
+fn validate_peer_identity(identity: &IdentityMaterial) -> Result<(), PrimitiveError> {
+    validate_identity_material(identity)?;
+    if identity
+        .device_id
+        .as_deref()
+        .is_some_and(|device| device.len() > MAX_DEVICE_ID_LEN)
+    {
+        return Err(PrimitiveError::LimitExceeded);
+    }
+    Ok(())
+}
+
 fn put_vec(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
 }
 
-fn take_vec(data: &[u8], i: &mut usize, max: usize) -> Result<Vec<u8>, PrimitiveError> {
-    if *i + 4 > data.len() {
+fn take<'a>(data: &'a [u8], i: &mut usize, len: usize) -> Result<&'a [u8], PrimitiveError> {
+    let end = i.checked_add(len).ok_or(PrimitiveError::LimitExceeded)?;
+    if end > data.len() {
         return Err(PrimitiveError::InvalidLength);
     }
-    let len = u32::from_le_bytes(data[*i..*i + 4].try_into().unwrap()) as usize;
-    *i += 4;
-    if len > max || *i + len > data.len() {
-        return Err(PrimitiveError::InvalidLength);
-    }
-    let out = data[*i..*i + len].to_vec();
-    *i += len;
+    let out = &data[*i..end];
+    *i = end;
     Ok(out)
+}
+
+fn take_vec(data: &[u8], i: &mut usize, max: usize) -> Result<Vec<u8>, PrimitiveError> {
+    let len = u32::from_le_bytes(take(data, i, 4)?.try_into().unwrap()) as usize;
+    if len > max {
+        return Err(PrimitiveError::LimitExceeded);
+    }
+    Ok(take(data, i, len)?.to_vec())
 }
 
 #[cfg(test)]
@@ -276,6 +294,15 @@ mod tests {
         let mut store = PeerIdentityStore::new();
         store.record_seen(peer, a).unwrap();
         assert!(store.record_seen(peer, b).is_err());
+    }
+
+    #[test]
+    fn oversized_identity_device_is_rejected_before_mutation() {
+        let peer = b"peer";
+        let oversized = identity(3, &vec![7u8; MAX_DEVICE_ID_LEN + 1]);
+        let mut store = PeerIdentityStore::new();
+        assert!(store.record_seen(peer, oversized).is_err());
+        assert!(store.get(peer).is_none());
     }
 
     #[test]
