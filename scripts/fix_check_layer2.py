@@ -30,12 +30,25 @@ replace_once(
 )
 
 # Test helper: transfer the StateBlob Vec without cloning, leaving an empty Vec for Drop.
-replace_once(
-    Path("tests/storage_hardening.rs"),
-    """        TransactionalStorage::get(&*storage, key)\n            .unwrap()\n            .unwrap()\n            .0\n""",
-    """        let mut blob = TransactionalStorage::get(&*storage, key)\n            .unwrap()\n            .unwrap();\n        std::mem::take(&mut blob.0)\n""",
-    "StateBlob test ownership",
-)
+# rustfmt may compact the get/unwrap chain onto one line, so detect the semantic fix
+# directly instead of requiring one exact formatted representation.
+storage_test = Path("tests/storage_hardening.rs")
+storage_text = storage_test.read_text()
+if "std::mem::take(&mut blob.0)" in storage_text:
+    print("already fixed: StateBlob test ownership")
+else:
+    old = """        TransactionalStorage::get(&*storage, key)\n            .unwrap()\n            .unwrap()\n            .0\n"""
+    if old not in storage_text:
+        raise SystemExit(
+            "StateBlob get_raw shape is neither known-old nor already-fixed; refusing to guess"
+        )
+    storage_text = storage_text.replace(
+        old,
+        """        let mut blob = TransactionalStorage::get(&*storage, key)\n            .unwrap()\n            .unwrap();\n        std::mem::take(&mut blob.0)\n""",
+        1,
+    )
+    storage_test.write_text(storage_text)
+    print("fixed: StateBlob test ownership")
 
 # Rustc reported these exact five scenarios as having unnecessary mut bindings.
 # Patch function-specific prefixes only; other corpus scenarios genuinely pass engines as &mut.
