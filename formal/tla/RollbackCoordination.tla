@@ -55,9 +55,21 @@ RecoverOneAhead ==
     /\ phase' = "Idle"
     /\ UNCHANGED <<local, pending>>
 
+\* Bounded-model terminal: Idle and fully reconciled at MaxEpoch. This is not a
+\* protocol deadlock; Prepare is disabled because the epoch bound has been reached.
+Terminal ==
+    /\ phase = "Idle"
+    /\ pending = 0
+    /\ local = anchor
+    /\ local = MaxEpoch
+
+TerminalStutter ==
+    /\ Terminal
+    /\ UNCHANGED vars
+
 Next ==
     Prepare \/ CommitLocal \/ FinalizeAnchor \/ CrashBeforeLocal \/
-    CrashAfterLocal \/ RecoverOneAhead
+    CrashAfterLocal \/ RecoverOneAhead \/ TerminalStutter
 
 Spec == Init /\ [][Next]_vars
 

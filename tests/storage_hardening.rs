@@ -22,6 +22,13 @@ impl SharedStorage {
         TransactionalStorage::commit(&mut *storage, tx).unwrap();
     }
 
+    fn delete_committed_raw(&self, key: &[u8]) {
+        let mut storage = self.inner.lock().unwrap();
+        let tx = TransactionalStorage::begin(&mut *storage).unwrap();
+        TransactionalStorage::delete(&mut *storage, tx, key).unwrap();
+        TransactionalStorage::commit(&mut *storage, tx).unwrap();
+    }
+
     fn get_raw(&self, key: &[u8]) -> Vec<u8> {
         let storage = self.inner.lock().unwrap();
         let mut blob = TransactionalStorage::get(&*storage, key).unwrap().unwrap();
@@ -206,4 +213,159 @@ fn duplicate_persisted_session_tags_are_rejected_on_reload() {
     );
     assert!(alice.has_session(&sid1));
     assert!(alice.has_session(&sid2));
+    assert_eq!(
+        alice.generate_public_prekey_bundle(1).unwrap_err(),
+        CryptoError::Storage
+    );
+}
+
+fn poison_reload_preserves_live_sessions(key: &[u8], corrupt: &[u8], device: &[u8]) {
+    let storage = SharedStorage::default();
+    let counter = SharedCounter::default();
+    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+        config(device),
+        Box::new(storage.clone()),
+        Box::new(counter),
+    )
+    .unwrap();
+    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"reload-bob")).unwrap();
+    let bundle = bob.generate_public_prekey_bundle(1).unwrap();
+    let (sid, _) = alice
+        .establish_outbound_session(&bundle, b"reload", b"first", b"ad")
+        .unwrap();
+    let identity_before = alice.local_identity_public();
+    assert!(alice.has_session(&sid));
+
+    storage.put_committed_raw(key, corrupt);
+    assert_eq!(
+        alice.simulate_crash_reload().unwrap_err(),
+        CryptoError::Storage
+    );
+    assert_eq!(alice.local_identity_public(), identity_before);
+    assert!(alice.has_session(&sid));
+    assert_eq!(
+        alice.generate_public_prekey_bundle(1).unwrap_err(),
+        CryptoError::Storage
+    );
+}
+
+#[test]
+fn corrupt_prekeys_reload_leaves_live_sessions_unchanged() {
+    poison_reload_preserves_live_sessions(b"prekeys", b"corrupt-prekeys-state", b"prekey-alice");
+}
+
+#[test]
+fn corrupt_replay_reload_leaves_live_sessions_unchanged() {
+    poison_reload_preserves_live_sessions(b"replay", b"corrupt-replay-state", b"replay-alice");
+}
+
+#[test]
+fn malformed_persisted_session_does_not_remove_valid_sessions() {
+    let storage = SharedStorage::default();
+    let counter = SharedCounter::default();
+    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+        config(b"sess-alice"),
+        Box::new(storage.clone()),
+        Box::new(counter),
+    )
+    .unwrap();
+    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"sess-bob")).unwrap();
+
+    let bundle1 = bob.generate_public_prekey_bundle(3).unwrap();
+    let (sid1, init1) = alice
+        .establish_outbound_session(&bundle1, b"s1", b"one", b"ad")
+        .unwrap();
+    let (bob_sid1, _) = bob.process_inbound_session(&init1, b"s1", b"ad").unwrap();
+    alice
+        .decrypt(
+            &sid1,
+            &bob.encrypt(&bob_sid1, b"ack-1", b"ad").unwrap(),
+            b"ad",
+        )
+        .unwrap();
+
+    let bundle2 = bob.generate_public_prekey_bundle(3).unwrap();
+    let (sid2, init2) = alice
+        .establish_outbound_session(&bundle2, b"s2", b"two", b"ad")
+        .unwrap();
+    let (bob_sid2, _) = bob.process_inbound_session(&init2, b"s2", b"ad").unwrap();
+    alice
+        .decrypt(
+            &sid2,
+            &bob.encrypt(&bob_sid2, b"ack-2", b"ad").unwrap(),
+            b"ad",
+        )
+        .unwrap();
+
+    let mut blob = storage.get_raw(&sid2.0);
+    assert_eq!(&blob[..8], b"VCSESS02");
+    let last = blob.len() - 1;
+    blob[last] ^= 0xff;
+    storage.put_committed_raw(&sid2.0, &blob);
+
+    assert_eq!(
+        alice.simulate_crash_reload().unwrap_err(),
+        CryptoError::Storage
+    );
+    assert!(alice.has_session(&sid1));
+    assert!(alice.has_session(&sid2));
+    assert_eq!(
+        alice.generate_public_prekey_bundle(1).unwrap_err(),
+        CryptoError::Storage
+    );
+}
+
+#[test]
+fn corrupt_session_magic_fails_without_dropping_live_sessions() {
+    let storage = SharedStorage::default();
+    let counter = SharedCounter::default();
+    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+        config(b"magic-alice"),
+        Box::new(storage.clone()),
+        Box::new(counter),
+    )
+    .unwrap();
+    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"magic-bob")).unwrap();
+    let bundle = bob.generate_public_prekey_bundle(1).unwrap();
+    let (sid, _) = alice
+        .establish_outbound_session(&bundle, b"magic", b"first", b"ad")
+        .unwrap();
+    assert!(alice.has_session(&sid));
+
+    let mut blob = storage.get_raw(&sid.0);
+    blob[..8].copy_from_slice(b"XXXXXXXX");
+    storage.put_committed_raw(&sid.0, &blob);
+
+    assert_eq!(
+        alice.simulate_crash_reload().unwrap_err(),
+        CryptoError::Storage
+    );
+    assert!(alice.has_session(&sid));
+}
+
+#[test]
+fn successful_reload_replaces_live_sessions_from_storage() {
+    let storage = SharedStorage::default();
+    let counter = SharedCounter::default();
+    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+        config(b"ok-alice"),
+        Box::new(storage.clone()),
+        Box::new(counter),
+    )
+    .unwrap();
+    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"ok-bob")).unwrap();
+    let bundle = bob.generate_public_prekey_bundle(1).unwrap();
+    let (sid, init) = alice
+        .establish_outbound_session(&bundle, b"ok", b"first", b"ad")
+        .unwrap();
+    let (bob_sid, _) = bob.process_inbound_session(&init, b"ok", b"ad").unwrap();
+    alice
+        .decrypt(&sid, &bob.encrypt(&bob_sid, b"ack", b"ad").unwrap(), b"ad")
+        .unwrap();
+    assert!(alice.has_session(&sid));
+
+    storage.delete_committed_raw(&sid.0);
+    alice.simulate_crash_reload().unwrap();
+    assert!(!alice.has_session(&sid));
+    alice.generate_public_prekey_bundle(1).unwrap();
 }

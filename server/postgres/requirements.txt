@@ -1,0 +1,3 @@
+# Client used by server/postgres/stress_opk_allocator.py.
+# Pin is inside the previously required v3.2–3.3 range (psycopg v3 binary, not v2).
+psycopg[binary]==3.3.4

@@ -50,11 +50,17 @@ try:
 except Exception:
     data = {}
 failures = data.get('failures') or []
+skipped = data.get('skipped') or []
 if failures:
     for failure in failures:
         print(f"- `{failure}`")
 else:
     print("- Failure occurred before a structured stage summary was produced.")
+if skipped:
+    print()
+    print("### Skipped stages (prerequisites missing; not PASS)")
+    for item in skipped:
+        print(f"- `{item}`")
 PY
       echo
     fi

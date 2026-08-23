@@ -788,6 +788,28 @@ fn decode_session(data: &[u8]) -> Result<(SessionId, LiveSession), CryptoError> 
     ))
 }
 
+fn is_reserved_storage_key(key: &[u8]) -> bool {
+    key == VoiceChatCryptoEngine::KEY_IDENTITY
+        || key == VoiceChatCryptoEngine::KEY_PREKEYS
+        || key == VoiceChatCryptoEngine::KEY_REPLAY
+        || key == VoiceChatCryptoEngine::KEY_TRUST
+        || key == VoiceChatCryptoEngine::KEY_PEER_IDENTITIES
+        || key == VoiceChatCryptoEngine::KEY_DEVICE_CONFIG
+        || key == VoiceChatCryptoEngine::KEY_STORAGE_EPOCH
+}
+
+fn validate_unique_session_tags(
+    sessions: &HashMap<SessionId, LiveSession>,
+) -> Result<(), CryptoError> {
+    let mut tags = HashSet::new();
+    for session in sessions.values() {
+        if session.session_tag.is_zero() || !tags.insert(session.session_tag) {
+            return Err(CryptoError::Storage);
+        }
+    }
+    Ok(())
+}
+
 fn load_sessions(
     storage: &dyn TransactionalStorage,
     profile: CryptoProfile,
@@ -798,14 +820,17 @@ fn load_sessions(
         let Some(blob) = storage.get(&key).map_err(|_| CryptoError::Storage)? else {
             continue;
         };
-        if blob.0.len() >= 8 && &blob.0[..8] == b"VCSESS01" {
+        let session_magic =
+            blob.0.len() >= 8 && (&blob.0[..8] == b"VCSESS01" || &blob.0[..8] == b"VCSESS02");
+        let session_key = key.len() == 16 && !is_reserved_storage_key(&key);
+        if !session_magic && !session_key {
             continue;
         }
-        if blob.0.len() < 8 || &blob.0[..8] != b"VCSESS02" {
-            continue;
+        if blob.0.len() >= 8 && &blob.0[..8] == b"VCSESS01" {
+            return Err(CryptoError::Storage);
         }
         if sessions.len() >= MAX_SESSIONS {
-            return Err(CryptoError::LimitExceeded);
+            return Err(CryptoError::Storage);
         }
         let (sid, sess) = decode_session(&blob.0)?;
         if sess.profile != profile || key.as_slice() != sid.0.as_slice() {
@@ -815,10 +840,12 @@ fn load_sessions(
             return Err(CryptoError::Storage);
         }
     }
+    validate_unique_session_tags(&sessions)?;
     Ok(sessions)
 }
 
-struct LoadedState {
+/// Fully decoded persisted engine state. Nothing in this type is live.
+struct ReloadSnapshot {
     identity: IdentityKeyPair,
     prekeys: PrekeyStore,
     sessions: HashMap<SessionId, LiveSession>,
@@ -827,10 +854,10 @@ struct LoadedState {
     peer_identities: PeerIdentityStore,
 }
 
-fn load_state(
+fn stage_reload_snapshot(
     storage: &dyn TransactionalStorage,
     profile: CryptoProfile,
-) -> Result<LoadedState, CryptoError> {
+) -> Result<ReloadSnapshot, CryptoError> {
     let identity_blob = storage
         .get(VoiceChatCryptoEngine::KEY_IDENTITY)
         .map_err(|_| CryptoError::Storage)?
@@ -839,41 +866,53 @@ fn load_state(
         .get(VoiceChatCryptoEngine::KEY_PREKEYS)
         .map_err(|_| CryptoError::Storage)?
         .ok_or(CryptoError::Storage)?;
-    let identity = IdentityKeyPair::deserialize(&identity_blob.0).map_err(CryptoError::from)?;
-    let prekeys = PrekeyStore::deserialize(&prekeys_blob.0).map_err(CryptoError::from)?;
+    let identity =
+        IdentityKeyPair::deserialize(&identity_blob.0).map_err(|_| CryptoError::Storage)?;
+    let prekeys = PrekeyStore::deserialize(&prekeys_blob.0).map_err(|_| CryptoError::Storage)?;
+    prekeys
+        .public_bundle(&identity)
+        .and_then(|bundle| bundle.validate())
+        .map_err(|_| CryptoError::Storage)?;
     let replay = match storage
         .get(VoiceChatCryptoEngine::KEY_REPLAY)
         .map_err(|_| CryptoError::Storage)?
     {
-        Some(blob) => ReplayCache::deserialize(&blob.0).map_err(CryptoError::from)?,
+        Some(blob) => ReplayCache::deserialize(&blob.0).map_err(|_| CryptoError::Storage)?,
         None => ReplayCache::new(DEFAULT_REPLAY_CACHE_SIZE),
     };
     let trust = match storage
         .get(VoiceChatCryptoEngine::KEY_TRUST)
         .map_err(|_| CryptoError::Storage)?
     {
-        Some(blob) => TrustStore::deserialize(&blob.0).map_err(CryptoError::from)?,
+        Some(blob) => TrustStore::deserialize(&blob.0).map_err(|_| CryptoError::Storage)?,
         None => TrustStore::new(),
     };
     let peer_identities = match storage
         .get(VoiceChatCryptoEngine::KEY_PEER_IDENTITIES)
         .map_err(|_| CryptoError::Storage)?
     {
-        Some(blob) => PeerIdentityStore::deserialize(&blob.0).map_err(CryptoError::from)?,
+        Some(blob) => PeerIdentityStore::deserialize(&blob.0).map_err(|_| CryptoError::Storage)?,
         None => PeerIdentityStore::new(),
     };
     let mut sessions = load_sessions(storage, profile)?;
     let local_identity = identity.public().to_bytes();
     for session in sessions.values_mut() {
+        if session.profile != profile {
+            return Err(CryptoError::Storage);
+        }
         if let Some(packet) = &session.pending_initiation {
             let parsed = InitiationPacket::decode(packet).map_err(|_| CryptoError::Storage)?;
-            if parsed.sender_identity_public != local_identity {
+            if parsed.sender_identity_public != local_identity
+                || parsed.profile != profile
+                || parsed.first_message.session_tag != session.session_tag
+            {
                 return Err(CryptoError::Storage);
             }
         }
         session.identity_tracker = trust.tracker_for(&session.remote_identity);
     }
-    Ok(LoadedState {
+    validate_unique_session_tags(&sessions)?;
+    Ok(ReloadSnapshot {
         identity,
         prekeys,
         sessions,
@@ -1005,25 +1044,25 @@ impl VoiceChatCryptoEngine {
             return Err(CryptoError::Storage);
         }
         ensure_config_matches(storage.as_ref(), &config)?;
-        let loaded = load_state(storage.as_ref(), config.profile)?;
+        let snapshot = stage_reload_snapshot(storage.as_ref(), config.profile)?;
         let mut rollback_guard = RollbackGuard::default();
         rollback_guard
             .observe(StorageEpoch(persisted_epoch))
             .map_err(|_| CryptoError::Storage)?;
-        let sessions = loaded
+        let sessions = snapshot
             .sessions
             .into_iter()
             .map(|(id, session)| (id, Arc::new(SessionEntry::new(session))))
             .collect();
         Ok(Self {
-            identity: loaded.identity,
+            identity: snapshot.identity,
             device_id: config.device_id,
             profile: config.profile,
-            prekeys: Mutex::new(loaded.prekeys),
+            prekeys: Mutex::new(snapshot.prekeys),
             sessions: RwLock::new(sessions),
-            replay: Mutex::new(ReplayState::new(loaded.replay)),
-            trust: Mutex::new(loaded.trust),
-            peer_identities: Mutex::new(loaded.peer_identities),
+            replay: Mutex::new(ReplayState::new(snapshot.replay)),
+            trust: Mutex::new(snapshot.trust),
+            peer_identities: Mutex::new(snapshot.peer_identities),
             persistence: Mutex::new(PersistenceState {
                 storage,
                 monotonic,
@@ -1755,29 +1794,51 @@ impl VoiceChatCryptoEngine {
             profile: self.profile,
         };
 
-        let loaded = {
-            let mut p = self.mutex(&self.persistence)?;
-            self.verify_storage_epoch_locked(&mut p)?;
-            if ensure_config_matches(p.storage.as_ref(), &expected).is_err() {
-                return self.poison();
-            }
-            match load_state(p.storage.as_ref(), self.profile) {
-                Ok(state) => state,
-                Err(_) => return self.poison(),
-            }
+        let snapshot = match self.stage_persisted_snapshot(&expected) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return self.poison(),
         };
+        self.commit_reload_snapshot(snapshot)
+    }
 
-        *self.mutex(&self.prekeys)? = loaded.prekeys;
-        *self.mutex(&self.replay)? = ReplayState::new(loaded.replay);
-        *self.mutex(&self.trust)? = loaded.trust;
-        *self.mutex(&self.peer_identities)? = loaded.peer_identities;
-        let sessions = loaded
-            .sessions
+    fn stage_persisted_snapshot(
+        &self,
+        expected: &DeviceConfig,
+    ) -> Result<ReloadSnapshot, CryptoError> {
+        let mut p = self.mutex(&self.persistence)?;
+        self.verify_storage_epoch_locked(&mut p)?;
+        ensure_config_matches(p.storage.as_ref(), expected)?;
+        let snapshot = stage_reload_snapshot(p.storage.as_ref(), expected.profile)?;
+        if snapshot.identity.serialize() != self.identity.serialize() {
+            return Err(CryptoError::Storage);
+        }
+        validate_unique_session_tags(&snapshot.sessions)?;
+        Ok(snapshot)
+    }
+
+    fn commit_reload_snapshot(&self, snapshot: ReloadSnapshot) -> Result<(), CryptoError> {
+        // Take every live-state lock before assigning any of them.
+        let mut prekeys = self.mutex(&self.prekeys)?;
+        let mut replay = self.mutex(&self.replay)?;
+        let mut trust = self.mutex(&self.trust)?;
+        let mut peers = self.mutex(&self.peer_identities)?;
+        let mut sessions = self.write_lock(&self.sessions)?;
+        let ReloadSnapshot {
+            identity: _,
+            prekeys: next_prekeys,
+            sessions: next_sessions,
+            replay: next_replay,
+            trust: next_trust,
+            peer_identities: next_peers,
+        } = snapshot;
+        *prekeys = next_prekeys;
+        *replay = ReplayState::new(next_replay);
+        *trust = next_trust;
+        *peers = next_peers;
+        *sessions = next_sessions
             .into_iter()
             .map(|(id, session)| (id, Arc::new(SessionEntry::new(session))))
             .collect();
-        *self.write_lock(&self.sessions)? = sessions;
-        self.restore_identity_trackers()?;
         Ok(())
     }
 }
@@ -2171,9 +2232,6 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
     }
 
     fn has_session(&self, session_id: &SessionId) -> bool {
-        if self.storage_poisoned.load(Ordering::Acquire) {
-            return false;
-        }
         self.sessions
             .read()
             .map(|sessions| sessions.contains_key(session_id))
