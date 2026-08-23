@@ -249,8 +249,8 @@ impl EncryptedFileStorage {
     }
 
     fn apply_staged(&mut self, mut staged: HashMap<Vec<u8>, StagedValue>) {
-        for (key, staged_value) in staged.drain() {
-            match staged_value.0 {
+        for (key, mut staged_value) in staged.drain() {
+            match staged_value.0.take() {
                 Some(value) => {
                     if let Some(mut old) = self.committed.insert(key, value) {
                         old.zeroize();

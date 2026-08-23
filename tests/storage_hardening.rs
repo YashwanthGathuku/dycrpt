@@ -24,10 +24,8 @@ impl SharedStorage {
 
     fn get_raw(&self, key: &[u8]) -> Vec<u8> {
         let storage = self.inner.lock().unwrap();
-        TransactionalStorage::get(&*storage, key)
-            .unwrap()
-            .unwrap()
-            .0
+        let mut blob = TransactionalStorage::get(&*storage, key).unwrap().unwrap();
+        std::mem::take(&mut blob.0)
     }
 }
 

@@ -1598,7 +1598,7 @@ impl VoiceChatCryptoEngine {
                 pq_public: &pq_public,
                 pq_prekey_id: message.pq_prekey_id,
             };
-            let shared = bob_process(
+            let mut shared = bob_process(
                 &bob_mat,
                 &alice_ik,
                 &alice_ek,
@@ -1608,7 +1608,8 @@ impl VoiceChatCryptoEngine {
             .map_err(CryptoError::from)?;
             let bob_dh = X25519Secret::from_bytes(signed.secret.to_bytes());
             let ratchet = init_bob_ratchet(self.profile, &shared.sk, bob_dh)?;
-            (ratchet, shared.ad, last_resort)
+            let handshake_ad = std::mem::take(&mut shared.ad);
+            (ratchet, handshake_ad, last_resort)
         };
 
         let sid = self.next_session_id()?;
