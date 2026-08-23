@@ -1,0 +1,88 @@
+name: constant-time
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    name: timing-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+      - name: Build timing probe
+        run: cargo build --locked --release --bin ct_timing
+      - name: Run repeated pinned-core Welch t-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p timing-evidence/raw
+          for run in 1 2 3 4 5; do
+            echo "timing run $run on $(uname -m)"
+            taskset -c 0 target/release/ct_timing \
+              --samples 500000 --warmup 50000 --max-t 10 \
+              | tee "timing-evidence/raw/run-${run}.json"
+          done
+      - name: Aggregate exact-commit timing evidence
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, math, os, platform
+          rows=[]
+          for path in sorted(glob.glob('timing-evidence/raw/run-*.json')):
+              with open(path, encoding='utf-8') as f:
+                  row=json.load(f)
+              if not row.get('passed'):
+                  raise SystemExit(f'failed timing run: {path}')
+              rows.append(row)
+          if len(rows) != 5:
+              raise SystemExit('expected exactly five timing runs')
+          machine=platform.machine().lower()
+          expected=os.environ['EXPECTED_ARCH']
+          aliases={'x86_64':{'x86_64','amd64'}, 'aarch64':{'aarch64','arm64'}}
+          if machine not in aliases[expected]:
+              raise SystemExit(f'wrong runner architecture: {machine} != {expected}')
+          summary={
+              'schema':'dycrpt-constant-time-evidence-v1',
+              'commit':os.environ['COMMIT_SHA'],
+              'arch':expected,
+              'machine':machine,
+              'runs':len(rows),
+              'samples_per_run':rows[0]['samples'],
+              'threshold':rows[0]['max_abs_t'],
+              'max_observed_abs_t':max(abs(float(r['welch_t'])) for r in rows),
+              'passed':all(bool(r['passed']) for r in rows),
+              'raw':rows,
+          }
+          with open('timing-evidence/summary.json','w',encoding='utf-8') as f:
+              json.dump(summary,f,sort_keys=True,indent=2)
+              f.write('\n')
+          PY
+      - name: Upload timing evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: constant-time-${{ matrix.arch }}-${{ github.sha }}
+          path: timing-evidence/
+          if-no-files-found: error
+          retention-days: 90
