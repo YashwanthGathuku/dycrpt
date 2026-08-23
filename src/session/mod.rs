@@ -1,14 +1,9 @@
-//! VoiceChat session manager — Sesame-style multi-device design.
+//! Sesame-style multi-device session manager.
 //!
-//! Derived from the public-domain Sesame specification concepts only.
-//! No implementation code was copied.
-//!
-//! Data model supports:
-//!   User A ─ Device A1, A2, A3
-//!   User B ─ Device B1, B2
-//!
-//! MVP may use a single active device per user; the structures do not
-//! preclude multi-device. Transport-agnostic (no Firebase or network I/O).
+//! This module remains a transport/session experiment; production application
+//! code should use `engine::VoiceChatCryptoEngine`. It is nevertheless hardened
+//! so direct library use cannot silently replace a device identity, allocate
+//! unbounded identifiers, or permanently leak initiating-session quota.
 
 pub mod mailbox;
 #[cfg(any(test, feature = "sesame"))]
@@ -16,75 +11,47 @@ pub mod sesame;
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::fingerprint::{IdentityMaterial, IdentityState, IdentityTracker};
+use crate::fingerprint::{
+    validate_identity_material, IdentityMaterial, IdentityState, IdentityTracker,
+};
 use crate::primitives::error::PrimitiveError;
 use crate::ratchet::DoubleRatchetState;
 
-// ---------------------------------------------------------------------------
-// Hard limits (anti-DoS)
-// ---------------------------------------------------------------------------
-
-/// Maximum devices remembered per remote user.
 pub const MAX_DEVICES_PER_USER: usize = 10;
-
-/// Maximum sessions retained per device (active + inactive).
 pub const MAX_SESSIONS_PER_DEVICE: usize = 8;
-
-/// Maximum remote users tracked by this device.
 pub const MAX_USERS: usize = 10_000;
-
-/// Maximum resend attempts for a single message before giving up.
 pub const MAX_RESEND_ATTEMPTS: u32 = 5;
-
-/// Sesame §3.1 — stale records older than this (seconds) may be deleted
-/// after the next mailbox fetch. Application clock, not wall NTP.
 pub const MAX_LATENCY_SECS: u64 = 86_400;
-
-/// Maximum concurrent initiating (unconfirmed) sessions overall.
 pub const MAX_INITIATING_SESSIONS: usize = 64;
-
-// ---------------------------------------------------------------------------
-// Identifiers (opaque, application-supplied)
-// ---------------------------------------------------------------------------
+pub const MAX_USER_ID_LEN: usize = 4096;
+pub const MAX_DEVICE_ID_LEN: usize = 4096;
 
 pub type UserId = Vec<u8>;
 pub type DeviceId = Vec<u8>;
 pub type SessionId = [u8; 16];
 
-// ---------------------------------------------------------------------------
-// Session record
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionStatus {
-    /// Created locally; waiting for first successful decrypt on the other side
-    /// or first inbound message that confirms it.
     Initiating,
-    /// Fully established; usable for send/receive.
     Active,
-    /// Previously active; retained for delayed / out-of-order messages.
     Inactive,
-    /// Permanently unusable (crypto failure, identity change, explicit delete).
     Failed,
 }
 
-/// One Double Ratchet (or future Triple Ratchet) session with a remote device.
 pub struct SessionRecord {
     pub id: SessionId,
     pub status: SessionStatus,
     pub ratchet: DoubleRatchetState,
-    /// When this session was created or last activated (application clock).
     pub timestamp: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Device and user records (Sesame-inspired)
-// ---------------------------------------------------------------------------
-
 pub struct DeviceRecord {
     pub device_id: DeviceId,
-    /// Cryptographic identity of this remote device (if known).
+    /// First-seen/current cryptographic identity for this application device.
     pub identity: Option<IdentityMaterial>,
+    /// Identity trust is tracked per device. A user may legitimately own
+    /// multiple devices with different identity keys.
+    pub identity_tracker: IdentityTracker,
     pub active: Option<SessionRecord>,
     pub inactive: VecDeque<SessionRecord>,
     pub stale: bool,
@@ -93,28 +60,27 @@ pub struct DeviceRecord {
 
 impl DeviceRecord {
     fn session_count(&self) -> usize {
-        self.inactive.len() + if self.active.is_some() { 1 } else { 0 }
+        self.inactive.len() + usize::from(self.active.is_some())
     }
 
-    /// Promote an inactive session to active; demote previous active.
     fn activate(&mut self, session_id: &SessionId) -> Result<(), PrimitiveError> {
-        if let Some(ref active) = self.active {
-            if active.id == *session_id {
-                return Ok(()); // already active
-            }
+        if self.active.as_ref().is_some_and(|active| active.id == *session_id) {
+            return Ok(());
         }
         let pos = self
             .inactive
             .iter()
-            .position(|s| s.id == *session_id)
+            .position(|session| session.id == *session_id)
             .ok_or(PrimitiveError::Internal)?;
-        let mut new_active = self.inactive.remove(pos).ok_or(PrimitiveError::Internal)?;
+        let mut new_active = self
+            .inactive
+            .remove(pos)
+            .ok_or(PrimitiveError::Internal)?;
         new_active.status = SessionStatus::Active;
         if let Some(mut old) = self.active.take() {
             old.status = SessionStatus::Inactive;
             self.inactive.push_front(old);
         }
-        // Bound inactive list
         while self.inactive.len() + 1 > MAX_SESSIONS_PER_DEVICE {
             self.inactive.pop_back();
         }
@@ -126,23 +92,19 @@ impl DeviceRecord {
 pub struct UserRecord {
     pub user_id: UserId,
     pub devices: HashMap<DeviceId, DeviceRecord>,
-    /// Tracks cryptographic identity changes for this user (any device).
+    /// Legacy user-level tracker retained for API compatibility only. Security
+    /// gates use the per-device tracker above because devices may have distinct
+    /// identity keys.
     pub identity_tracker: IdentityTracker,
     pub stale: bool,
     pub stale_timestamp: Option<u64>,
 }
 
-// ---------------------------------------------------------------------------
-// Session manager
-// ---------------------------------------------------------------------------
-
-/// Local device’s view of all remote users and their devices.
 pub struct SessionManager {
     pub local_user_id: UserId,
     pub local_device_id: DeviceId,
     pub local_identity: IdentityMaterial,
     pub(crate) users: HashMap<UserId, UserRecord>,
-    /// Global count of initiating sessions (anti-DoS).
     initiating_count: usize,
 }
 
@@ -161,13 +123,10 @@ impl SessionManager {
         }
     }
 
-    /// Number of remote users currently tracked.
     pub fn user_count(&self) -> usize {
         self.users.len()
     }
 
-    /// Prepare or retrieve the active session for a remote device.
-    /// Creates an initiating session if none exists (subject to limits).
     pub fn prepare_outbound(
         &mut self,
         remote_user: &UserId,
@@ -177,67 +136,62 @@ impl SessionManager {
         remote_dh_public: &crate::primitives::x25519::X25519Public,
         now: u64,
     ) -> Result<SessionId, PrimitiveError> {
-        self.ensure_user_device(remote_user, remote_device, remote_identity, now)?;
+        self.ensure_user_device(remote_user, remote_device, remote_identity)?;
+        self.ensure_device_identity(remote_user, remote_device, remote_identity)?;
 
-        // Identity-change gate
-        let user = self
+        let can_reuse = self
             .users
-            .get_mut(remote_user)
-            .ok_or(PrimitiveError::Internal)?;
-        match user.identity_tracker.observe(remote_identity) {
-            IdentityState::IdentityChanged { .. } => {
-                return Err(PrimitiveError::Internal); // application must surface IDENTITY_CHANGED
-            }
-            IdentityState::Unknown | IdentityState::Verified => {}
+            .get(remote_user)
+            .and_then(|user| user.devices.get(remote_device))
+            .and_then(|device| device.active.as_ref())
+            .filter(|active| {
+                matches!(active.status, SessionStatus::Active | SessionStatus::Initiating)
+            })
+            .map(|active| active.id);
+        if let Some(id) = can_reuse {
+            return Ok(id);
         }
 
-        let device = user
-            .devices
-            .get_mut(remote_device)
-            .ok_or(PrimitiveError::Internal)?;
-        if let Some(ref active) = device.active {
-            if active.status == SessionStatus::Active || active.status == SessionStatus::Initiating
-            {
-                return Ok(active.id);
-            }
-        }
-
-        // Need a new initiating session
         if self.initiating_count >= MAX_INITIATING_SESSIONS {
-            return Err(PrimitiveError::InvalidLength); // resource limit
+            return Err(PrimitiveError::LimitExceeded);
         }
-        if device.session_count() >= MAX_SESSIONS_PER_DEVICE {
-            // Evict oldest inactive
-            device.inactive.pop_back();
-        }
-
+        let id = self.new_unique_session_id()?;
         let ratchet =
             DoubleRatchetState::init_alice(sk, remote_dh_public, crate::ratchet::DEFAULT_MAX_SKIP)?;
-        let id = new_session_id()?;
-        let record = SessionRecord {
+        let device = self
+            .users
+            .get_mut(remote_user)
+            .and_then(|user| user.devices.get_mut(remote_device))
+            .ok_or(PrimitiveError::Internal)?;
+        if device.session_count() >= MAX_SESSIONS_PER_DEVICE {
+            device.inactive.pop_back();
+        }
+        device.active = Some(SessionRecord {
             id,
             status: SessionStatus::Initiating,
             ratchet,
             timestamp: now,
-        };
-        device.active = Some(record);
-        self.initiating_count += 1;
+        });
+        self.initiating_count = self
+            .initiating_count
+            .checked_add(1)
+            .ok_or(PrimitiveError::LimitExceeded)?;
         Ok(id)
     }
 
-    /// Mark a session as established (e.g. after first successful use).
     pub fn confirm_session(
         &mut self,
         remote_user: &UserId,
         remote_device: &DeviceId,
         session_id: &SessionId,
     ) -> Result<(), PrimitiveError> {
+        validate_remote_ids(remote_user, remote_device)?;
         let device = self
             .users
             .get_mut(remote_user)
-            .and_then(|u| u.devices.get_mut(remote_device))
+            .and_then(|user| user.devices.get_mut(remote_device))
             .ok_or(PrimitiveError::Internal)?;
-        if let Some(ref mut active) = device.active {
+        if let Some(active) = device.active.as_mut() {
             if active.id == *session_id && active.status == SessionStatus::Initiating {
                 active.status = SessionStatus::Active;
                 self.initiating_count = self.initiating_count.saturating_sub(1);
@@ -246,8 +200,6 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Create a matching (Bob) session from a shared secret and the local
-    /// DH secret used in the handshake (Sesame §2.2 recipient session creation).
     pub fn prepare_inbound(
         &mut self,
         remote_user: &UserId,
@@ -257,24 +209,29 @@ impl SessionManager {
         local_dh: crate::primitives::x25519::X25519Secret,
         now: u64,
     ) -> Result<SessionId, PrimitiveError> {
-        self.ensure_user_device(remote_user, remote_device, remote_identity, now)?;
-        let user = self
+        self.ensure_user_device(remote_user, remote_device, remote_identity)?;
+        self.ensure_device_identity(remote_user, remote_device, remote_identity)?;
+        if let Some(id) = self
+            .users
+            .get(remote_user)
+            .and_then(|user| user.devices.get(remote_device))
+            .and_then(|device| device.active.as_ref())
+            .filter(|active| active.status != SessionStatus::Failed)
+            .map(|active| active.id)
+        {
+            return Ok(id);
+        }
+
+        let id = self.new_unique_session_id()?;
+        let ratchet = DoubleRatchetState::init_bob(sk, local_dh, crate::ratchet::DEFAULT_MAX_SKIP);
+        let device = self
             .users
             .get_mut(remote_user)
+            .and_then(|user| user.devices.get_mut(remote_device))
             .ok_or(PrimitiveError::Internal)?;
-        match user.identity_tracker.observe(remote_identity) {
-            IdentityState::IdentityChanged { .. } => return Err(PrimitiveError::Internal),
-            IdentityState::Unknown | IdentityState::Verified => {}
+        if device.session_count() >= MAX_SESSIONS_PER_DEVICE {
+            device.inactive.pop_back();
         }
-        let device = user
-            .devices
-            .get_mut(remote_device)
-            .ok_or(PrimitiveError::Internal)?;
-        if let Some(ref active) = device.active {
-            return Ok(active.id);
-        }
-        let ratchet = DoubleRatchetState::init_bob(sk, local_dh, crate::ratchet::DEFAULT_MAX_SKIP);
-        let id = new_session_id()?;
         device.active = Some(SessionRecord {
             id,
             status: SessionStatus::Active,
@@ -284,134 +241,221 @@ impl SessionManager {
         Ok(id)
     }
 
-    /// Sesame §3.1 — delete stale records older than [`MAX_LATENCY_SECS`].
     pub fn sweep_stale(&mut self, now: u64) {
         self.users.retain(|_, user| {
-            if user.stale {
-                if let Some(ts) = user.stale_timestamp {
-                    if now.saturating_sub(ts) > MAX_LATENCY_SECS {
-                        return false;
-                    }
-                }
+            if user.stale
+                && user
+                    .stale_timestamp
+                    .is_some_and(|ts| now.saturating_sub(ts) > MAX_LATENCY_SECS)
+            {
+                return false;
             }
-            user.devices.retain(|_, dev| {
-                if dev.stale {
-                    if let Some(ts) = dev.stale_timestamp {
-                        return now.saturating_sub(ts) <= MAX_LATENCY_SECS;
-                    }
-                }
-                true
+            user.devices.retain(|_, device| {
+                !device.stale
+                    || device
+                        .stale_timestamp
+                        .is_none_or(|ts| now.saturating_sub(ts) <= MAX_LATENCY_SECS)
             });
             !user.devices.is_empty()
         });
+        self.recompute_initiating_count();
     }
 
-    /// Mark a device record stale (Sesame §3.3 step 6).
     pub fn mark_device_stale(
         &mut self,
         remote_user: &UserId,
         remote_device: &DeviceId,
         now: u64,
     ) -> Result<(), PrimitiveError> {
-        let dev = self
+        validate_remote_ids(remote_user, remote_device)?;
+        let device = self
             .users
             .get_mut(remote_user)
-            .and_then(|u| u.devices.get_mut(remote_device))
+            .and_then(|user| user.devices.get_mut(remote_device))
             .ok_or(PrimitiveError::Internal)?;
-        dev.stale = true;
-        dev.stale_timestamp = Some(now);
+        device.stale = true;
+        device.stale_timestamp = Some(now);
         Ok(())
     }
 
-    /// Process an inbound message that may activate an inactive session
-    /// or create a matching session (Bob side after PQXDH).
     pub fn receive_on_session(
         &mut self,
         remote_user: &UserId,
         remote_device: &DeviceId,
         session_id: &SessionId,
     ) -> Result<(), PrimitiveError> {
+        validate_remote_ids(remote_user, remote_device)?;
         let device = self
             .users
             .get_mut(remote_user)
-            .and_then(|u| u.devices.get_mut(remote_device))
+            .and_then(|user| user.devices.get_mut(remote_device))
             .ok_or(PrimitiveError::Internal)?;
-        // If the session is inactive, promote it
-        if device.inactive.iter().any(|s| s.id == *session_id) {
+        if device.inactive.iter().any(|session| session.id == *session_id) {
             device.activate(session_id)?;
+            self.recompute_initiating_count();
         }
         Ok(())
     }
 
-    /// Explicitly mark a session failed (crypto failure, etc.).
     pub fn mark_failed(
         &mut self,
         remote_user: &UserId,
         remote_device: &DeviceId,
         session_id: &SessionId,
     ) -> Result<(), PrimitiveError> {
+        validate_remote_ids(remote_user, remote_device)?;
         let device = self
             .users
             .get_mut(remote_user)
-            .and_then(|u| u.devices.get_mut(remote_device))
+            .and_then(|user| user.devices.get_mut(remote_device))
             .ok_or(PrimitiveError::Internal)?;
-        if let Some(ref mut active) = device.active {
+        let mut found = false;
+        if let Some(active) = device.active.as_mut() {
             if active.id == *session_id {
                 active.status = SessionStatus::Failed;
-                return Ok(());
+                found = true;
             }
         }
-        for s in device.inactive.iter_mut() {
-            if s.id == *session_id {
-                s.status = SessionStatus::Failed;
-                return Ok(());
+        if !found {
+            if let Some(session) = device
+                .inactive
+                .iter_mut()
+                .find(|session| session.id == *session_id)
+            {
+                session.status = SessionStatus::Failed;
+                found = true;
             }
         }
-        Err(PrimitiveError::Internal)
+        if !found {
+            return Err(PrimitiveError::Internal);
+        }
+        self.recompute_initiating_count();
+        Ok(())
     }
 
-    /// Acknowledge a remote identity change (user verified new safety number).
+    /// Legacy single-device acknowledgement. If a user has multiple devices,
+    /// the target is ambiguous and callers must use `acknowledge_device_identity`.
     pub fn acknowledge_identity(
         &mut self,
         remote_user: &UserId,
         new_identity: IdentityMaterial,
     ) -> Result<(), PrimitiveError> {
+        validate_user_id(remote_user)?;
+        validate_identity_material(&new_identity)?;
         let user = self
             .users
             .get_mut(remote_user)
             .ok_or(PrimitiveError::Internal)?;
+        if user.devices.len() != 1 {
+            return Err(PrimitiveError::InvalidLength);
+        }
+        let device = user
+            .devices
+            .values_mut()
+            .next()
+            .ok_or(PrimitiveError::Internal)?;
+        device.identity_tracker.acknowledge(new_identity.clone());
+        device.identity = Some(new_identity.clone());
         user.identity_tracker.acknowledge(new_identity);
         Ok(())
     }
 
-    /// Current identity state for a remote user.
+    pub fn acknowledge_device_identity(
+        &mut self,
+        remote_user: &UserId,
+        remote_device: &DeviceId,
+        new_identity: IdentityMaterial,
+    ) -> Result<(), PrimitiveError> {
+        validate_remote_ids(remote_user, remote_device)?;
+        validate_identity_material(&new_identity)?;
+        let user = self
+            .users
+            .get_mut(remote_user)
+            .ok_or(PrimitiveError::Internal)?;
+        let device = user
+            .devices
+            .get_mut(remote_device)
+            .ok_or(PrimitiveError::Internal)?;
+        device.identity_tracker.acknowledge(new_identity.clone());
+        device.identity = Some(new_identity);
+        Ok(())
+    }
+
+    /// Legacy user-level identity state. Multi-device users are ambiguous.
     pub fn identity_state(
         &self,
         remote_user: &UserId,
         observed: &IdentityMaterial,
     ) -> Result<IdentityState, PrimitiveError> {
-        let user = self
-            .users
-            .get(remote_user)
-            .ok_or(PrimitiveError::Internal)?;
-        Ok(user.identity_tracker.observe(observed))
+        validate_user_id(remote_user)?;
+        validate_identity_material(observed)?;
+        let user = self.users.get(remote_user).ok_or(PrimitiveError::Internal)?;
+        if user.devices.len() != 1 {
+            return Err(PrimitiveError::InvalidLength);
+        }
+        let device = user.devices.values().next().ok_or(PrimitiveError::Internal)?;
+        Ok(device.identity_tracker.observe(observed))
     }
 
-    // -----------------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------------
+    pub fn device_identity_state(
+        &self,
+        remote_user: &UserId,
+        remote_device: &DeviceId,
+        observed: &IdentityMaterial,
+    ) -> Result<IdentityState, PrimitiveError> {
+        validate_remote_ids(remote_user, remote_device)?;
+        validate_identity_material(observed)?;
+        let device = self
+            .users
+            .get(remote_user)
+            .and_then(|user| user.devices.get(remote_device))
+            .ok_or(PrimitiveError::Internal)?;
+        if device
+            .identity
+            .as_ref()
+            .is_some_and(|first_seen| first_seen != observed)
+            && matches!(device.identity_tracker.observe(observed), IdentityState::Unknown)
+        {
+            return Ok(IdentityState::IdentityChanged {
+                previous: device.identity.clone().ok_or(PrimitiveError::Internal)?,
+                current: observed.clone(),
+                reason: identity_change_reason(
+                    device.identity.as_ref().ok_or(PrimitiveError::Internal)?,
+                    observed,
+                ),
+            });
+        }
+        Ok(device.identity_tracker.observe(observed))
+    }
 
     fn ensure_user_device(
         &mut self,
         remote_user: &UserId,
         remote_device: &DeviceId,
         remote_identity: &IdentityMaterial,
-        now: u64,
     ) -> Result<(), PrimitiveError> {
-        if !self.users.contains_key(remote_user) {
-            if self.users.len() >= MAX_USERS {
-                return Err(PrimitiveError::InvalidLength);
+        validate_remote_ids(remote_user, remote_device)?;
+        validate_identity_material(remote_identity)?;
+
+        if let Some(user) = self.users.get(remote_user) {
+            if let Some(device) = user.devices.get(remote_device) {
+                if device
+                    .identity
+                    .as_ref()
+                    .is_some_and(|first_seen| first_seen != remote_identity)
+                {
+                    return Err(PrimitiveError::Internal);
+                }
+                return Ok(());
             }
+            if user.devices.len() >= MAX_DEVICES_PER_USER {
+                return Err(PrimitiveError::LimitExceeded);
+            }
+        } else if self.users.len() >= MAX_USERS {
+            return Err(PrimitiveError::LimitExceeded);
+        }
+
+        if !self.users.contains_key(remote_user) {
             self.users.insert(
                 remote_user.clone(),
                 UserRecord {
@@ -427,50 +471,123 @@ impl SessionManager {
             .users
             .get_mut(remote_user)
             .ok_or(PrimitiveError::Internal)?;
-        if !user.devices.contains_key(remote_device) {
-            if user.devices.len() >= MAX_DEVICES_PER_USER {
-                return Err(PrimitiveError::InvalidLength);
-            }
-            user.devices.insert(
-                remote_device.clone(),
-                DeviceRecord {
-                    device_id: remote_device.clone(),
-                    identity: Some(remote_identity.clone()),
-                    active: None,
-                    inactive: VecDeque::new(),
-                    stale: false,
-                    stale_timestamp: None,
-                },
-            );
+        user.devices.insert(
+            remote_device.clone(),
+            DeviceRecord {
+                device_id: remote_device.clone(),
+                identity: Some(remote_identity.clone()),
+                identity_tracker: IdentityTracker::new(),
+                active: None,
+                inactive: VecDeque::new(),
+                stale: false,
+                stale_timestamp: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn ensure_device_identity(
+        &self,
+        remote_user: &UserId,
+        remote_device: &DeviceId,
+        remote_identity: &IdentityMaterial,
+    ) -> Result<(), PrimitiveError> {
+        let state = self.device_identity_state(remote_user, remote_device, remote_identity)?;
+        if matches!(state, IdentityState::IdentityChanged { .. }) {
+            return Err(PrimitiveError::Internal);
         }
-        let _ = now;
+        Ok(())
+    }
+
+    fn recompute_initiating_count(&mut self) {
+        self.initiating_count = self
+            .users
+            .values()
+            .flat_map(|user| user.devices.values())
+            .map(|device| {
+                usize::from(
+                    device
+                        .active
+                        .as_ref()
+                        .is_some_and(|session| session.status == SessionStatus::Initiating),
+                ) + device
+                    .inactive
+                    .iter()
+                    .filter(|session| session.status == SessionStatus::Initiating)
+                    .count()
+            })
+            .sum();
+    }
+
+    fn new_unique_session_id(&self) -> Result<SessionId, PrimitiveError> {
+        for _ in 0..8 {
+            let mut id = [0u8; 16];
+            crate::primitives::random::fill_random(&mut id)?;
+            if id != [0u8; 16] && !self.session_id_exists(&id) {
+                return Ok(id);
+            }
+        }
+        Err(PrimitiveError::Internal)
+    }
+
+    fn session_id_exists(&self, id: &SessionId) -> bool {
+        self.users.values().any(|user| {
+            user.devices.values().any(|device| {
+                device.active.as_ref().is_some_and(|session| session.id == *id)
+                    || device.inactive.iter().any(|session| session.id == *id)
+            })
+        })
+    }
+}
+
+fn validate_user_id(user: &[u8]) -> Result<(), PrimitiveError> {
+    if user.is_empty() || user.len() > MAX_USER_ID_LEN {
+        Err(PrimitiveError::InvalidLength)
+    } else {
         Ok(())
     }
 }
 
-fn new_session_id() -> Result<SessionId, PrimitiveError> {
-    let mut id = [0u8; 16];
-    crate::primitives::random::fill_random(&mut id)?;
-    Ok(id)
+fn validate_device_id(device: &[u8]) -> Result<(), PrimitiveError> {
+    if device.is_empty() || device.len() > MAX_DEVICE_ID_LEN {
+        Err(PrimitiveError::InvalidLength)
+    } else {
+        Ok(())
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic simulations
-// ---------------------------------------------------------------------------
+fn validate_remote_ids(user: &[u8], device: &[u8]) -> Result<(), PrimitiveError> {
+    validate_user_id(user)?;
+    validate_device_id(device)
+}
+
+fn identity_change_reason(
+    previous: &IdentityMaterial,
+    current: &IdentityMaterial,
+) -> crate::fingerprint::IdentityChangeReason {
+    use crate::fingerprint::IdentityChangeReason;
+    let key_changed = previous.identity_key.to_bytes() != current.identity_key.to_bytes();
+    let device_changed = previous.device_id != current.device_id;
+    match (key_changed, device_changed) {
+        (true, true) => IdentityChangeReason::Both,
+        (true, false) => IdentityChangeReason::IdentityKeyChanged,
+        (false, true) => IdentityChangeReason::DeviceIdChanged,
+        (false, false) => unreachable!(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::IdentityMaterial;
     use crate::primitives::x25519::X25519Secret;
 
     fn id_material(seed: u8) -> IdentityMaterial {
-        let mut b = [seed; 32];
-        if b == [0u8; 32] {
-            b[0] = 1;
+        let mut bytes = [seed; 32];
+        if bytes == [0u8; 32] {
+            bytes[0] = 1;
         }
         IdentityMaterial {
-            identity_key: X25519Secret::from_bytes(b).public_key(),
+            identity_key: X25519Secret::from_bytes(bytes).public_key(),
             device_id: Some(vec![seed]),
         }
     }
@@ -502,40 +619,30 @@ mod tests {
     }
 
     #[test]
-    fn device_limit_enforced() {
+    fn oversized_remote_id_is_rejected_before_insertion() {
         let local = id_material(1);
+        let remote = id_material(2);
         let mut mgr = SessionManager::new(b"user-a".to_vec(), b"dev-a1".to_vec(), local);
         let bob_dh = X25519Secret::generate().unwrap();
-        for i in 0..MAX_DEVICES_PER_USER {
-            let remote = id_material(10 + i as u8);
-            let dev = vec![i as u8];
-            mgr.prepare_outbound(
-                &b"user-b".to_vec(),
-                &dev,
+        let oversized = vec![7u8; MAX_USER_ID_LEN + 1];
+        assert!(mgr
+            .prepare_outbound(
+                &oversized,
+                &b"dev-b1".to_vec(),
                 &remote,
                 &sk(9),
                 &bob_dh.public_key(),
-                1000 + i as u64,
+                1,
             )
-            .unwrap();
-        }
-        // One more must fail
-        let remote = id_material(99);
-        let err = mgr.prepare_outbound(
-            &b"user-b".to_vec(),
-            &vec![99u8],
-            &remote,
-            &sk(9),
-            &bob_dh.public_key(),
-            2000,
-        );
-        assert!(err.is_err());
+            .is_err());
+        assert_eq!(mgr.user_count(), 0);
     }
 
     #[test]
-    fn identity_change_blocks_outbound() {
+    fn first_seen_identity_replacement_is_blocked_even_before_ack() {
         let local = id_material(1);
         let remote1 = id_material(2);
+        let remote2 = id_material(3);
         let mut mgr = SessionManager::new(b"user-a".to_vec(), b"dev-a1".to_vec(), local);
         let bob_dh = X25519Secret::generate().unwrap();
         mgr.prepare_outbound(
@@ -544,50 +651,111 @@ mod tests {
             &remote1,
             &sk(9),
             &bob_dh.public_key(),
-            1000,
+            1,
         )
         .unwrap();
-        // Acknowledge so tracker has a baseline
-        mgr.acknowledge_identity(&b"user-b".to_vec(), remote1.clone())
-            .unwrap();
-
-        // New identity (SIM-swap style)
-        let remote2 = id_material(3);
-        let err = mgr.prepare_outbound(
-            &b"user-b".to_vec(),
-            &b"dev-b1".to_vec(),
-            &remote2,
-            &sk(9),
-            &bob_dh.public_key(),
-            2000,
-        );
-        assert!(err.is_err());
-
-        // After explicit ack, allowed again
-        mgr.acknowledge_identity(&b"user-b".to_vec(), remote2.clone())
-            .unwrap();
-        let ok = mgr.prepare_outbound(
-            &b"user-b".to_vec(),
-            &b"dev-b1".to_vec(),
-            &remote2,
-            &sk(9),
-            &bob_dh.public_key(),
-            3000,
-        );
-        assert!(ok.is_ok());
+        assert!(mgr
+            .prepare_outbound(
+                &b"user-b".to_vec(),
+                &b"dev-b1".to_vec(),
+                &remote2,
+                &sk(9),
+                &bob_dh.public_key(),
+                2,
+            )
+            .is_err());
     }
 
     #[test]
-    fn multi_device_data_model() {
-        // Data model holds multiple devices for one user without special-casing.
+    fn explicit_single_device_ack_allows_replacement() {
+        let local = id_material(1);
+        let remote1 = id_material(2);
+        let remote2 = id_material(3);
+        let mut mgr = SessionManager::new(b"user-a".to_vec(), b"dev-a1".to_vec(), local);
+        let bob_dh = X25519Secret::generate().unwrap();
+        mgr.prepare_outbound(
+            &b"user-b".to_vec(),
+            &b"dev-b1".to_vec(),
+            &remote1,
+            &sk(9),
+            &bob_dh.public_key(),
+            1,
+        )
+        .unwrap();
+        mgr.acknowledge_identity(&b"user-b".to_vec(), remote2.clone())
+            .unwrap();
+        assert!(mgr
+            .prepare_outbound(
+                &b"user-b".to_vec(),
+                &b"dev-b1".to_vec(),
+                &remote2,
+                &sk(9),
+                &bob_dh.public_key(),
+                2,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn multi_device_ack_requires_device_specific_api() {
         let local = id_material(1);
         let mut mgr = SessionManager::new(b"user-a".to_vec(), b"dev-a1".to_vec(), local);
         let bob_dh = X25519Secret::generate().unwrap();
-        for (i, seed) in [(1u8, 20u8), (2, 21), (3, 22)] {
-            let remote = id_material(seed);
+        let a = id_material(2);
+        let b = id_material(3);
+        mgr.prepare_outbound(
+            &b"user-b".to_vec(),
+            &b"d1".to_vec(),
+            &a,
+            &sk(9),
+            &bob_dh.public_key(),
+            1,
+        )
+        .unwrap();
+        mgr.prepare_outbound(
+            &b"user-b".to_vec(),
+            &b"d2".to_vec(),
+            &b,
+            &sk(9),
+            &bob_dh.public_key(),
+            1,
+        )
+        .unwrap();
+        assert!(mgr.acknowledge_identity(&b"user-b".to_vec(), a).is_err());
+    }
+
+    #[test]
+    fn stale_sweep_reclaims_initiating_quota() {
+        let local = id_material(1);
+        let remote = id_material(2);
+        let mut mgr = SessionManager::new(b"user-a".to_vec(), b"dev-a1".to_vec(), local);
+        let bob_dh = X25519Secret::generate().unwrap();
+        mgr.prepare_outbound(
+            &b"user-b".to_vec(),
+            &b"dev-b1".to_vec(),
+            &remote,
+            &sk(9),
+            &bob_dh.public_key(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(mgr.initiating_count, 1);
+        mgr.mark_device_stale(&b"user-b".to_vec(), &b"dev-b1".to_vec(), 1)
+            .unwrap();
+        mgr.sweep_stale(1 + MAX_LATENCY_SECS + 1);
+        assert_eq!(mgr.initiating_count, 0);
+    }
+
+    #[test]
+    fn device_limit_enforced() {
+        let local = id_material(1);
+        let mut mgr = SessionManager::new(b"user-a".to_vec(), b"dev-a1".to_vec(), local);
+        let bob_dh = X25519Secret::generate().unwrap();
+        for i in 0..MAX_DEVICES_PER_USER {
+            let remote = id_material(10 + i as u8);
             mgr.prepare_outbound(
                 &b"user-b".to_vec(),
-                &vec![i],
+                &vec![i as u8],
                 &remote,
                 &sk(9),
                 &bob_dh.public_key(),
@@ -595,7 +763,15 @@ mod tests {
             )
             .unwrap();
         }
-        let user = mgr.users.get(&b"user-b".to_vec()).unwrap();
-        assert_eq!(user.devices.len(), 3);
+        assert!(mgr
+            .prepare_outbound(
+                &b"user-b".to_vec(),
+                &vec![99u8],
+                &id_material(99),
+                &sk(9),
+                &bob_dh.public_key(),
+                2000,
+            )
+            .is_err());
     }
 }
