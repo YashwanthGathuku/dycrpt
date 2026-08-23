@@ -3,74 +3,108 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   rust:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          toolchain: 1.85.0
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: Install exact Rust toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.85.0
       - name: Verify locked Rust workspace
         run: bash scripts/verify.sh
 
   opk-allocator:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: voicechat_ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d voicechat_ci"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/voicechat_ci
+      DYCRPT_COMMIT: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          python-version: '3.12'
+          persist-credentials: false
       - name: Install PostgreSQL client and psycopg
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-client
-          python -m pip install --disable-pip-version-check 'psycopg[binary]>=3.2,<4'
-      - name: Install allocator schema and fixtures
+          sudo apt-get install -y postgresql-client python3-pip
+          python3 -m pip install --break-system-packages --disable-pip-version-check 'psycopg[binary]>=3.2,<4'
+      - name: Start isolated PostgreSQL with release-scale connection budget
+        shell: bash
         run: |
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/postgres/001_opk_allocator.sql
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/postgres/002_rollback_anchor.sql
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/postgres/ci_seed.sql
-      - name: Stress atomic OPK allocation
+          set -euo pipefail
+          docker run -d --name dycrpt-postgres \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=voicechat_ci \
+            -p 5432:5432 \
+            postgres:16 -c max_connections=300
+          for _ in $(seq 1 60); do
+            if pg_isready -h 127.0.0.1 -U postgres -d voicechat_ci; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs dycrpt-postgres
+          exit 1
+      - name: Install allocator schema and release-scale fixtures
         run: |
-          python server/postgres/stress_opk_allocator.py \
+          PGPASSWORD=postgres psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/postgres/001_opk_allocator.sql
+          PGPASSWORD=postgres psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/postgres/002_rollback_anchor.sql
+          PGPASSWORD=postgres psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/postgres/ci_seed.sql
+      - name: Stress 10k atomic OPK allocations with 128 concurrent clients
+        run: |
+          mkdir -p opk-evidence
+          python3 server/postgres/stress_opk_allocator.py \
             --device-hex 6465766963652d6369 \
-            --requests 500 \
-            --workers 64 \
-            --require-one-time-pq
-
-  fuzz-linux:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+            --requests 10000 \
+            --workers 128 \
+            --require-one-time-pq \
+            --commit "$GITHUB_SHA" \
+            --json-out opk-evidence/summary.json
+      - name: Capture database and schema evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGPASSWORD=postgres psql "$DATABASE_URL" -Atc 'SHOW server_version;' > opk-evidence/postgres-version.txt
+          sha256sum server/postgres/001_opk_allocator.sql server/postgres/002_rollback_anchor.sql \
+            > opk-evidence/schema-sha256.txt
+          git rev-parse HEAD > opk-evidence/commit.txt
+      - name: Upload OPK release evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          toolchain: 1.85.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --manifest-path fuzz/Cargo.toml
-      - run: cargo run --locked --manifest-path fuzz/Cargo.toml --bin host_runner -- 5000
+          name: opk-stress-${{ github.sha }}
+          path: opk-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  fuzz-host-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install exact Rust toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+      - name: Build bounded host parser walker
+        run: cargo build --locked --manifest-path fuzz/Cargo.toml --bin host_runner
+      - name: Run 100k deterministic parser mutations
+        run: cargo run --locked --manifest-path fuzz/Cargo.toml --bin host_runner -- 100000
