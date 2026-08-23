@@ -30,8 +30,6 @@ bash scripts/codespace_verify.sh 2>&1 | tee "$MASTER_LOG"
 STATUS=${PIPESTATUS[0]}
 set -e
 
-# Build a compact report. Avoid dumping the entire potentially huge fuzz/sanitizer
-# transcript into the PR; the local evidence directory retains the complete logs.
 REPORT="$REPORT_DIR/pr-report.md"
 {
   echo "## Codespace verification — $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -42,15 +40,33 @@ REPORT="$REPORT_DIR/pr-report.md"
   echo "- Result: **$([[ $STATUS -eq 0 ]] && echo PASS || echo FAIL)**"
   echo
   if [[ $STATUS -ne 0 ]]; then
-    echo "### Failure tail"
+    if [[ -f "$REPORT_DIR/summary.json" ]]; then
+      echo "### Failed stages"
+      python3 - "$REPORT_DIR/summary.json" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(p.read_text())
+except Exception:
+    data = {}
+failures = data.get('failures') or []
+if failures:
+    for failure in failures:
+        print(f"- `{failure}`")
+else:
+    print("- Failure occurred before a structured stage summary was produced.")
+PY
+      echo
+    fi
+    echo "### Final log tail"
     echo '```text'
-    tail -n 180 "$MASTER_LOG" | sed -E \
+    tail -n 140 "$MASTER_LOG" | sed -E \
       -e 's/(gh[pousr]_[A-Za-z0-9_=-]+)/[REDACTED_GITHUB_TOKEN]/g' \
       -e 's/(sk-[A-Za-z0-9_-]{16,})/[REDACTED_API_KEY]/g' \
       -e 's#(postgresql://[^:[:space:]]+):[^@[:space:]]+@#\1:[REDACTED]@#g'
     echo '```'
     echo
-    echo "Full logs remain inside the Codespace at \`$REPORT_DIR/\`."
+    echo "Per-stage logs and the complete transcript remain inside \`$REPORT_DIR/\`."
   else
     echo "All configured Codespace verification stages completed successfully."
     echo
