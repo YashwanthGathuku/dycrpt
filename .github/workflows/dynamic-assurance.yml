@@ -79,7 +79,7 @@ jobs:
 
   libfuzzer:
     runs-on: ubuntu-24.04
-    timeout-minutes: 110
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -102,7 +102,7 @@ jobs:
             seconds=1800
           fi
           test "$seconds" -ge 60
-          for target in envelope_parse header_decode triple_header_decode engine_wire prekey_bundle; do
+          for target in envelope_parse header_decode triple_header_decode engine_wire prekey_bundle state_decoders; do
             echo "fuzz target=$target seconds=$seconds"
             cargo +"$NIGHTLY" fuzz run "$target" -- \
               -max_total_time="$seconds" -timeout=10 -rss_limit_mb=4096 -print_final_stats=1
