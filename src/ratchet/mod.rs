@@ -17,7 +17,7 @@ pub mod spqr;
 pub mod triple;
 
 use std::collections::HashMap;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::primitives::aead::{self, AeadKey};
 use crate::primitives::error::PrimitiveError;
@@ -137,7 +137,7 @@ impl RatchetScalarSnapshot {
             dhs: state
                 .dhs
                 .as_ref()
-                .map(|s| X25519Secret::from_bytes(s.to_bytes())),
+                .map(|secret| X25519Secret::from_bytes(secret.to_bytes())),
             dhr: state.dhr,
             rk: state.rk,
             cks: state.cks,
@@ -174,7 +174,7 @@ impl DoubleRatchetState {
         max_skip: u32,
     ) -> Result<Self, PrimitiveError> {
         let dhs = X25519Secret::generate()?;
-        let dh_out = dhs.diffie_hellman(bob_dh_public);
+        let dh_out = Zeroizing::new(dhs.diffie_hellman_checked(bob_dh_public)?);
         let (rk, cks) = kdf_rk(sk, &dh_out)?;
         Ok(Self {
             dhs: Some(dhs),
@@ -213,11 +213,11 @@ impl DoubleRatchetState {
         let old_cks = self.cks;
         let old_ns = self.ns;
         let (ns, mut mk) = match self.ratchet_send_key() {
-            Ok(v) => v,
-            Err(e) => {
+            Ok(value) => value,
+            Err(error) => {
                 self.cks = old_cks;
                 self.ns = old_ns;
-                return Err(e);
+                return Err(error);
             }
         };
         let result = (|| {
@@ -229,8 +229,8 @@ impl DoubleRatchetState {
             };
             let associated = concat_ad(ad, &header);
             let (key, nonce) = aead_from_mk(&mk)?;
-            let ct = aead::seal(&key, &nonce, plaintext, &associated)?;
-            Ok((header, ct))
+            let ciphertext = aead::seal(&key, &nonce, plaintext, &associated)?;
+            Ok((header, ciphertext))
         })();
         mk.zeroize();
         if result.is_err() {
@@ -250,29 +250,44 @@ impl DoubleRatchetState {
         let mut journal = SkippedMutationJournal::default();
         let mut mk = match self.ratchet_receive_key_journaled(header, &mut journal) {
             Ok(mk) => mk,
-            Err(e) => {
+            Err(error) => {
                 self.rollback_receive(&snapshot, &mut journal)?;
-                return Err(e);
+                return Err(error);
             }
         };
         let associated = concat_ad(ad, header);
         let plaintext = match aead_from_mk(&mk) {
             Ok((key, nonce)) => aead::open(&key, &nonce, ciphertext, &associated),
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         };
         mk.zeroize();
         match plaintext {
-            Ok(pt) => Ok(pt),
-            Err(e) => {
+            Ok(plaintext) => Ok(plaintext),
+            Err(error) => {
                 self.rollback_receive(&snapshot, &mut journal)?;
-                Err(e)
+                Err(error)
             }
         }
     }
 
+    /// Derive a sending message key transactionally for Triple Ratchet.
     pub fn send_message_key(&mut self) -> Result<(Header, [u8; 32]), PrimitiveError> {
-        let (ns, mk) = self.ratchet_send_key()?;
-        let dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
+        let old_cks = self.cks;
+        let old_ns = self.ns;
+        let (ns, mut mk) = match self.ratchet_send_key() {
+            Ok(value) => value,
+            Err(error) => {
+                self.cks = old_cks;
+                self.ns = old_ns;
+                return Err(error);
+            }
+        };
+        let Some(dhs) = self.dhs.as_ref() else {
+            self.cks = old_cks;
+            self.ns = old_ns;
+            mk.zeroize();
+            return Err(PrimitiveError::Internal);
+        };
         Ok((
             Header {
                 dh: dhs.public_key(),
@@ -283,8 +298,17 @@ impl DoubleRatchetState {
         ))
     }
 
+    /// Derive a receiving message key transactionally for Triple Ratchet.
     pub fn receive_message_key(&mut self, header: &Header) -> Result<[u8; 32], PrimitiveError> {
-        self.ratchet_receive_key(header)
+        let snapshot = RatchetScalarSnapshot::capture(self);
+        let mut journal = SkippedMutationJournal::default();
+        match self.ratchet_receive_key_journaled(header, &mut journal) {
+            Ok(mk) => Ok(mk),
+            Err(error) => {
+                self.rollback_receive(&snapshot, &mut journal)?;
+                Err(error)
+            }
+        }
     }
 
     fn ratchet_send_key(&mut self) -> Result<(u32, [u8; 32]), PrimitiveError> {
@@ -297,23 +321,6 @@ impl DoubleRatchetState {
         Ok((ns, mk))
     }
 
-    fn ratchet_receive_key(&mut self, header: &Header) -> Result<[u8; 32], PrimitiveError> {
-        if let Some(mk) = self.try_skipped_message_keys(header) {
-            return Ok(mk);
-        }
-        if self.dhr.map(|d| d.to_bytes()) != Some(header.dh.to_bytes()) {
-            self.skip_message_keys(header.pn)?;
-            self.dh_ratchet(header)?;
-        }
-        self.skip_message_keys(header.n)?;
-        let ckr = self.ckr.ok_or(PrimitiveError::Internal)?;
-        let next_nr = checked_inc(self.nr)?;
-        let (new_ckr, mk) = kdf_ck(&ckr)?;
-        self.ckr = Some(new_ckr);
-        self.nr = next_nr;
-        Ok(mk)
-    }
-
     fn ratchet_receive_key_journaled(
         &mut self,
         header: &Header,
@@ -324,7 +331,7 @@ impl DoubleRatchetState {
             journal.removed = Some((skipped_key, mk));
             return Ok(mk);
         }
-        if self.dhr.map(|d| d.to_bytes()) != Some(header.dh.to_bytes()) {
+        if self.dhr.map(|dh| dh.to_bytes()) != Some(header.dh.to_bytes()) {
             self.skip_message_keys_journaled(header.pn, journal)?;
             self.dh_ratchet(header)?;
         }
@@ -335,36 +342,6 @@ impl DoubleRatchetState {
         self.ckr = Some(new_ckr);
         self.nr = next_nr;
         Ok(mk)
-    }
-
-    fn try_skipped_message_keys(&mut self, header: &Header) -> Option<[u8; 32]> {
-        self.mkskipped.remove(&(header.dh.to_bytes(), header.n))
-    }
-
-    fn skip_message_keys(&mut self, until: u32) -> Result<(), PrimitiveError> {
-        let limit = self
-            .nr
-            .checked_add(self.max_skip)
-            .ok_or(PrimitiveError::LimitExceeded)?;
-        if limit < until {
-            return Err(PrimitiveError::LimitExceeded);
-        }
-        if let Some(mut ckr) = self.ckr {
-            while self.nr < until {
-                if self.mkskipped.len() as u32 >= self.max_skip {
-                    return Err(PrimitiveError::LimitExceeded);
-                }
-                let next_nr = checked_inc(self.nr)?;
-                let (new_ckr, mk) = kdf_ck(&ckr)?;
-                let dhr = self.dhr.ok_or(PrimitiveError::Internal)?;
-                self.mkskipped
-                    .insert_unique((dhr.to_bytes(), self.nr), mk)?;
-                ckr = new_ckr;
-                self.nr = next_nr;
-            }
-            self.ckr = Some(ckr);
-        }
-        Ok(())
     }
 
     fn skip_message_keys_journaled(
@@ -398,20 +375,24 @@ impl DoubleRatchetState {
         Ok(())
     }
 
+    /// Perform the two DH root-ratchet KDFs without committing any field until
+    /// both peer DH operations have passed the all-zero contributory check and
+    /// both KDFs have succeeded.
     fn dh_ratchet(&mut self, header: &Header) -> Result<(), PrimitiveError> {
+        let current_dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
+        let dh_out1 = Zeroizing::new(current_dhs.diffie_hellman_checked(&header.dh)?);
+        let (rk1, ckr) = kdf_rk(&self.rk, &dh_out1)?;
+
+        let new_dhs = X25519Secret::generate()?;
+        let dh_out2 = Zeroizing::new(new_dhs.diffie_hellman_checked(&header.dh)?);
+        let (rk2, cks) = kdf_rk(&rk1, &dh_out2)?;
+
         self.pn = self.ns;
         self.ns = 0;
         self.nr = 0;
         self.dhr = Some(header.dh);
-        let dhs = self.dhs.as_ref().ok_or(PrimitiveError::Internal)?;
-        let dh_out1 = dhs.diffie_hellman(&header.dh);
-        let (rk1, ckr) = kdf_rk(&self.rk, &dh_out1)?;
-        self.rk = rk1;
-        self.ckr = Some(ckr);
-        let new_dhs = X25519Secret::generate()?;
-        let dh_out2 = new_dhs.diffie_hellman(&header.dh);
-        let (rk2, cks) = kdf_rk(&self.rk, &dh_out2)?;
         self.rk = rk2;
+        self.ckr = Some(ckr);
         self.cks = Some(cks);
         self.dhs = Some(new_dhs);
         Ok(())
@@ -435,7 +416,7 @@ impl DoubleRatchetState {
         self.dhs = snapshot
             .dhs
             .as_ref()
-            .map(|s| X25519Secret::from_bytes(s.to_bytes()));
+            .map(|secret| X25519Secret::from_bytes(secret.to_bytes()));
         self.dhr = snapshot.dhr;
         self.rk = snapshot.rk;
         self.cks = snapshot.cks;
@@ -451,7 +432,7 @@ impl DoubleRatchetState {
             dhs: self
                 .dhs
                 .as_ref()
-                .map(|s| X25519Secret::from_bytes(s.to_bytes())),
+                .map(|secret| X25519Secret::from_bytes(secret.to_bytes())),
             dhr: self.dhr,
             rk: self.rk,
             cks: self.cks,
@@ -467,16 +448,16 @@ impl DoubleRatchetState {
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match &self.dhs {
-            Some(s) => {
+            Some(secret) => {
                 out.push(1);
-                out.extend_from_slice(&s.to_bytes());
+                out.extend_from_slice(&secret.to_bytes());
             }
             None => out.push(0),
         }
         match &self.dhr {
-            Some(p) => {
+            Some(public) => {
                 out.push(1);
-                out.extend_from_slice(&p.to_bytes());
+                out.extend_from_slice(&public.to_bytes());
             }
             None => out.push(0),
         }
@@ -580,9 +561,9 @@ fn read_u32(data: &[u8], i: &mut usize) -> Result<u32, PrimitiveError> {
 
 fn write_opt32(out: &mut Vec<u8>, value: Option<&[u8; 32]>) {
     match value {
-        Some(v) => {
+        Some(value) => {
             out.push(1);
-            out.extend_from_slice(v);
+            out.extend_from_slice(value);
         }
         None => out.push(0),
     }
@@ -602,7 +583,10 @@ fn read_opt32(data: &[u8], i: &mut usize) -> Result<Option<[u8; 32]>, PrimitiveE
 
 fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), PrimitiveError> {
     let mut okm = [0u8; 64];
-    hkdf_extract_expand(Some(rk), dh_out, LABELS::DR_ROOT, &mut okm)?;
+    if let Err(error) = hkdf_extract_expand(Some(rk), dh_out, LABELS::DR_ROOT, &mut okm) {
+        okm.zeroize();
+        return Err(error);
+    }
     let mut new_rk = [0u8; 32];
     let mut ck = [0u8; 32];
     new_rk.copy_from_slice(&okm[..32]);
@@ -620,7 +604,10 @@ fn kdf_ck(ck: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), PrimitiveError> {
 fn aead_from_mk(mk: &[u8; 32]) -> Result<(AeadKey, [u8; 12]), PrimitiveError> {
     let salt = [0u8; 32];
     let mut okm = [0u8; 44];
-    hkdf_extract_expand(Some(&salt), mk, LABELS::DR_MESSAGE, &mut okm)?;
+    if let Err(error) = hkdf_extract_expand(Some(&salt), mk, LABELS::DR_MESSAGE, &mut okm) {
+        okm.zeroize();
+        return Err(error);
+    }
     let mut key = [0u8; 32];
     let mut nonce = [0u8; 12];
     key.copy_from_slice(&okm[..32]);
@@ -647,6 +634,38 @@ mod tests {
         sk
     }
 
+    fn low_order_public() -> X25519Public {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1;
+        X25519Public::from_bytes(bytes).unwrap()
+    }
+
+    #[test]
+    fn alice_init_rejects_noncontributory_peer_dh() {
+        assert!(matches!(
+            DoubleRatchetState::init_alice(&fresh_sk(), &low_order_public(), DEFAULT_MAX_SKIP),
+            Err(PrimitiveError::InvalidPublicKey)
+        ));
+    }
+
+    #[test]
+    fn low_order_ratchet_header_fails_without_state_change() {
+        let sk = fresh_sk();
+        let bob_dh = X25519Secret::generate().unwrap();
+        let mut bob = DoubleRatchetState::init_bob(&sk, bob_dh, DEFAULT_MAX_SKIP);
+        let before = bob.serialize();
+        let header = Header {
+            dh: low_order_public(),
+            pn: 0,
+            n: 0,
+        };
+        assert!(matches!(
+            bob.decrypt(&header, &[0u8; 16], b"ad"),
+            Err(PrimitiveError::InvalidPublicKey)
+        ));
+        assert_eq!(before, bob.serialize());
+    }
+
     #[test]
     fn sequence_a1_a2_a3_b1_b2_a4() {
         let sk = fresh_sk();
@@ -654,16 +673,16 @@ mod tests {
         let bob_pub = bob_dh.public_key();
         let mut alice = DoubleRatchetState::init_alice(&sk, &bob_pub, DEFAULT_MAX_SKIP).unwrap();
         let mut bob = DoubleRatchetState::init_bob(&sk, bob_dh, DEFAULT_MAX_SKIP);
-        for msg in [b"A1".as_slice(), b"A2", b"A3"] {
-            let (h, c) = alice.encrypt(msg, b"ad").unwrap();
-            assert_eq!(bob.decrypt(&h, &c, b"ad").unwrap(), msg);
+        for message in [b"A1".as_slice(), b"A2", b"A3"] {
+            let (header, ciphertext) = alice.encrypt(message, b"ad").unwrap();
+            assert_eq!(bob.decrypt(&header, &ciphertext, b"ad").unwrap(), message);
         }
-        for msg in [b"B1".as_slice(), b"B2"] {
-            let (h, c) = bob.encrypt(msg, b"ad").unwrap();
-            assert_eq!(alice.decrypt(&h, &c, b"ad").unwrap(), msg);
+        for message in [b"B1".as_slice(), b"B2"] {
+            let (header, ciphertext) = bob.encrypt(message, b"ad").unwrap();
+            assert_eq!(alice.decrypt(&header, &ciphertext, b"ad").unwrap(), message);
         }
-        let (h, c) = alice.encrypt(b"A4", b"ad").unwrap();
-        assert_eq!(bob.decrypt(&h, &c, b"ad").unwrap(), b"A4");
+        let (header, ciphertext) = alice.encrypt(b"A4", b"ad").unwrap();
+        assert_eq!(bob.decrypt(&header, &ciphertext, b"ad").unwrap(), b"A4");
     }
 
     #[test]
@@ -673,12 +692,12 @@ mod tests {
         let mut alice =
             DoubleRatchetState::init_alice(&sk, &bob_dh.public_key(), DEFAULT_MAX_SKIP).unwrap();
         let mut bob = DoubleRatchetState::init_bob(&sk, bob_dh, DEFAULT_MAX_SKIP);
-        let (h, mut ct) = alice.encrypt(b"secret", b"ad").unwrap();
+        let (header, mut ciphertext) = alice.encrypt(b"secret", b"ad").unwrap();
         let before = bob.serialize();
-        if let Some(byte) = ct.last_mut() {
+        if let Some(byte) = ciphertext.last_mut() {
             *byte ^= 0xff;
         }
-        assert!(bob.decrypt(&h, &ct, b"ad").is_err());
+        assert!(bob.decrypt(&header, &ciphertext, b"ad").is_err());
         assert_eq!(before, bob.serialize());
     }
 
@@ -708,9 +727,9 @@ mod tests {
         let mut bob = DoubleRatchetState::init_bob(&sk, bob_dh, 5);
         let (h0, c0) = alice.encrypt(b"0", b"ad").unwrap();
         bob.decrypt(&h0, &c0, b"ad").unwrap();
-        let (mut h, c) = alice.encrypt(b"far", b"ad").unwrap();
-        h.n = 10_000;
-        assert!(bob.decrypt(&h, &c, b"ad").is_err());
+        let (mut header, ciphertext) = alice.encrypt(b"far", b"ad").unwrap();
+        header.n = 10_000;
+        assert!(bob.decrypt(&header, &ciphertext, b"ad").is_err());
         assert!(bob.skipped_count() <= 5);
     }
 
@@ -721,11 +740,17 @@ mod tests {
         let mut alice =
             DoubleRatchetState::init_alice(&sk, &bob_dh.public_key(), DEFAULT_MAX_SKIP).unwrap();
         let bob = DoubleRatchetState::init_bob(&sk, bob_dh, DEFAULT_MAX_SKIP);
-        let (h, c) = alice.encrypt(b"before-reload", b"ad").unwrap();
+        let (header, ciphertext) = alice.encrypt(b"before-reload", b"ad").unwrap();
         let mut bob2 = DoubleRatchetState::deserialize(&bob.serialize(), DEFAULT_MAX_SKIP).unwrap();
-        assert_eq!(bob2.decrypt(&h, &c, b"ad").unwrap(), b"before-reload");
-        let (h2, c2) = bob2.encrypt(b"after-reload", b"ad").unwrap();
-        assert_eq!(alice.decrypt(&h2, &c2, b"ad").unwrap(), b"after-reload");
+        assert_eq!(
+            bob2.decrypt(&header, &ciphertext, b"ad").unwrap(),
+            b"before-reload"
+        );
+        let (header2, ciphertext2) = bob2.encrypt(b"after-reload", b"ad").unwrap();
+        assert_eq!(
+            alice.decrypt(&header2, &ciphertext2, b"ad").unwrap(),
+            b"after-reload"
+        );
     }
 
     #[test]
