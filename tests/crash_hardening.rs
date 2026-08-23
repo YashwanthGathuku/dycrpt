@@ -14,8 +14,7 @@ const TEST_MAX_SKIP: u32 = 8;
 fn pair() -> (DoubleRatchetState, DoubleRatchetState) {
     let sk = [7u8; 32];
     let bob_dh = X25519Secret::generate().unwrap();
-    let alice =
-        DoubleRatchetState::init_alice(&sk, &bob_dh.public_key(), TEST_MAX_SKIP).unwrap();
+    let alice = DoubleRatchetState::init_alice(&sk, &bob_dh.public_key(), TEST_MAX_SKIP).unwrap();
     let bob = DoubleRatchetState::init_bob(&sk, bob_dh, TEST_MAX_SKIP);
     (alice, bob)
 }
@@ -102,12 +101,12 @@ fn padding_hides_length_in_bucket() {
 #[test]
 fn engine_reload_after_commit() {
     use voicechat_crypto::{CryptoEngineApi, CryptoProfile, DeviceConfig, VoiceChatCryptoEngine};
-    let mut a = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let a = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"a".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
     .unwrap();
-    let mut b = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let b = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"b".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
