@@ -32,6 +32,7 @@ use crate::ratchet::{DoubleRatchetState, Header, DEFAULT_MAX_SKIP};
 use crate::replay::{ReplayCache, ReplayKey, DEFAULT_REPLAY_CACHE_SIZE};
 use crate::storage::monotonic::{MemoryCounter, MonotonicCounter};
 use crate::storage::{MemoryStorage, RollbackGuard, StateBlob, StorageEpoch, TransactionalStorage};
+#[cfg(feature = "header-encrypt")]
 use zeroize::Zeroize;
 
 const MAX_DEVICE_ID_LEN: usize = 4 * 1024;
