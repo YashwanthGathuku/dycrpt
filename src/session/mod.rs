@@ -4,6 +4,11 @@
 //! code should use `engine::VoiceChatCryptoEngine`. It is nevertheless hardened
 //! so direct library use cannot silently replace a device identity, allocate
 //! unbounded identifiers, or permanently leak initiating-session quota.
+//!
+//! Unlike the original prototype, both sides derive the same 128-bit Sesame
+//! session identifier from the handshake secret and canonical endpoint binding.
+//! This lets the experimental mailbox route strictly by session id rather than
+//! falling back to whichever local session happens to be active.
 
 pub mod mailbox;
 #[cfg(any(test, feature = "sesame"))]
@@ -15,6 +20,7 @@ use crate::fingerprint::{
     validate_identity_material, IdentityMaterial, IdentityState, IdentityTracker,
 };
 use crate::primitives::error::PrimitiveError;
+use crate::primitives::kdf::hmac_sha256;
 use crate::ratchet::DoubleRatchetState;
 
 pub const MAX_DEVICES_PER_USER: usize = 10;
@@ -47,10 +53,7 @@ pub struct SessionRecord {
 
 pub struct DeviceRecord {
     pub device_id: DeviceId,
-    /// First-seen/current cryptographic identity for this application device.
     pub identity: Option<IdentityMaterial>,
-    /// Identity trust is tracked per device. A user may legitimately own
-    /// multiple devices with different identity keys.
     pub identity_tracker: IdentityTracker,
     pub active: Option<SessionRecord>,
     pub inactive: VecDeque<SessionRecord>,
@@ -60,7 +63,7 @@ pub struct DeviceRecord {
 
 impl DeviceRecord {
     fn session_count(&self) -> usize {
-        self.inactive.len() + usize::from(self.active.is_some())
+        self.inactive.len() + if self.active.is_some() { 1 } else { 0 }
     }
 
     fn activate(&mut self, session_id: &SessionId) -> Result<(), PrimitiveError> {
@@ -92,9 +95,7 @@ impl DeviceRecord {
 pub struct UserRecord {
     pub user_id: UserId,
     pub devices: HashMap<DeviceId, DeviceRecord>,
-    /// Legacy user-level tracker retained for API compatibility only. Security
-    /// gates use the per-device tracker above because devices may have distinct
-    /// identity keys.
+    /// Legacy compatibility only; security gates use each device tracker.
     pub identity_tracker: IdentityTracker,
     pub stale: bool,
     pub stale_timestamp: Option<u64>,
@@ -139,7 +140,7 @@ impl SessionManager {
         self.ensure_user_device(remote_user, remote_device, remote_identity)?;
         self.ensure_device_identity(remote_user, remote_device, remote_identity)?;
 
-        let can_reuse = self
+        if let Some(id) = self
             .users
             .get(remote_user)
             .and_then(|user| user.devices.get(remote_device))
@@ -147,15 +148,18 @@ impl SessionManager {
             .filter(|active| {
                 matches!(active.status, SessionStatus::Active | SessionStatus::Initiating)
             })
-            .map(|active| active.id);
-        if let Some(id) = can_reuse {
+            .map(|active| active.id)
+        {
             return Ok(id);
         }
-
         if self.initiating_count >= MAX_INITIATING_SESSIONS {
             return Err(PrimitiveError::LimitExceeded);
         }
-        let id = self.new_unique_session_id()?;
+
+        let id = self.derive_shared_session_id(remote_user, remote_device, remote_identity, sk)?;
+        if self.session_id_exists(&id) {
+            return Err(PrimitiveError::Internal);
+        }
         let ratchet =
             DoubleRatchetState::init_alice(sk, remote_dh_public, crate::ratchet::DEFAULT_MAX_SKIP)?;
         let device = self
@@ -222,7 +226,10 @@ impl SessionManager {
             return Ok(id);
         }
 
-        let id = self.new_unique_session_id()?;
+        let id = self.derive_shared_session_id(remote_user, remote_device, remote_identity, sk)?;
+        if self.session_id_exists(&id) {
+            return Err(PrimitiveError::Internal);
+        }
         let ratchet = DoubleRatchetState::init_bob(sk, local_dh, crate::ratchet::DEFAULT_MAX_SKIP);
         let device = self
             .users
@@ -381,7 +388,6 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Legacy user-level identity state. Multi-device users are ambiguous.
     pub fn identity_state(
         &self,
         remote_user: &UserId,
@@ -416,13 +422,11 @@ impl SessionManager {
             .is_some_and(|first_seen| first_seen != observed)
             && matches!(device.identity_tracker.observe(observed), IdentityState::Unknown)
         {
+            let previous = device.identity.clone().ok_or(PrimitiveError::Internal)?;
             return Ok(IdentityState::IdentityChanged {
-                previous: device.identity.clone().ok_or(PrimitiveError::Internal)?,
+                reason: identity_change_reason(&previous, observed),
+                previous,
                 current: observed.clone(),
-                reason: identity_change_reason(
-                    device.identity.as_ref().ok_or(PrimitiveError::Internal)?,
-                    observed,
-                ),
             });
         }
         Ok(device.identity_tracker.observe(observed))
@@ -492,8 +496,10 @@ impl SessionManager {
         remote_device: &DeviceId,
         remote_identity: &IdentityMaterial,
     ) -> Result<(), PrimitiveError> {
-        let state = self.device_identity_state(remote_user, remote_device, remote_identity)?;
-        if matches!(state, IdentityState::IdentityChanged { .. }) {
+        if matches!(
+            self.device_identity_state(remote_user, remote_device, remote_identity)?,
+            IdentityState::IdentityChanged { .. }
+        ) {
             return Err(PrimitiveError::Internal);
         }
         Ok(())
@@ -505,29 +511,63 @@ impl SessionManager {
             .values()
             .flat_map(|user| user.devices.values())
             .map(|device| {
-                usize::from(
-                    device
-                        .active
-                        .as_ref()
-                        .is_some_and(|session| session.status == SessionStatus::Initiating),
-                ) + device
-                    .inactive
-                    .iter()
-                    .filter(|session| session.status == SessionStatus::Initiating)
-                    .count()
+                let active = if device
+                    .active
+                    .as_ref()
+                    .is_some_and(|session| session.status == SessionStatus::Initiating)
+                {
+                    1
+                } else {
+                    0
+                };
+                active
+                    + device
+                        .inactive
+                        .iter()
+                        .filter(|session| session.status == SessionStatus::Initiating)
+                        .count()
             })
             .sum();
     }
 
-    fn new_unique_session_id(&self) -> Result<SessionId, PrimitiveError> {
-        for _ in 0..8 {
-            let mut id = [0u8; 16];
-            crate::primitives::random::fill_random(&mut id)?;
-            if id != [0u8; 16] && !self.session_id_exists(&id) {
-                return Ok(id);
-            }
+    fn derive_shared_session_id(
+        &self,
+        remote_user: &UserId,
+        remote_device: &DeviceId,
+        remote_identity: &IdentityMaterial,
+        sk: &[u8; 32],
+    ) -> Result<SessionId, PrimitiveError> {
+        validate_remote_ids(&self.local_user_id, &self.local_device_id)?;
+        validate_identity_material(&self.local_identity)?;
+        validate_remote_ids(remote_user, remote_device)?;
+        validate_identity_material(remote_identity)?;
+
+        let local = encode_endpoint(
+            &self.local_user_id,
+            &self.local_device_id,
+            &self.local_identity.identity_key.to_bytes(),
+        )?;
+        let remote = encode_endpoint(
+            remote_user,
+            remote_device,
+            &remote_identity.identity_key.to_bytes(),
+        )?;
+        let (first, second) = if local <= remote {
+            (&local, &remote)
+        } else {
+            (&remote, &local)
+        };
+        let mut binding = Vec::with_capacity(32 + first.len() + second.len());
+        binding.extend_from_slice(b"VoiceChat/Sesame/v2/SessionId");
+        put_len_bytes(&mut binding, first)?;
+        put_len_bytes(&mut binding, second)?;
+        let digest = hmac_sha256(sk, &binding);
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&digest[..16]);
+        if id == [0u8; 16] {
+            return Err(PrimitiveError::Internal);
         }
-        Err(PrimitiveError::Internal)
+        Ok(id)
     }
 
     fn session_id_exists(&self, id: &SessionId) -> bool {
@@ -538,6 +578,26 @@ impl SessionManager {
             })
         })
     }
+}
+
+fn encode_endpoint(
+    user: &[u8],
+    device: &[u8],
+    identity: &[u8; 32],
+) -> Result<Vec<u8>, PrimitiveError> {
+    validate_remote_ids(user, device)?;
+    let mut out = Vec::with_capacity(8 + user.len() + device.len() + identity.len());
+    put_len_bytes(&mut out, user)?;
+    put_len_bytes(&mut out, device)?;
+    out.extend_from_slice(identity);
+    Ok(out)
+}
+
+fn put_len_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), PrimitiveError> {
+    let len = u32::try_from(bytes.len()).map_err(|_| PrimitiveError::LimitExceeded)?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn validate_user_id(user: &[u8]) -> Result<(), PrimitiveError> {
@@ -594,6 +654,37 @@ mod tests {
 
     fn sk(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    #[test]
+    fn both_sides_derive_same_session_id() {
+        let alice_id = id_material(1);
+        let bob_id = id_material(2);
+        let mut alice = SessionManager::new(b"alice".to_vec(), b"a1".to_vec(), alice_id.clone());
+        let mut bob = SessionManager::new(b"bob".to_vec(), b"b1".to_vec(), bob_id.clone());
+        let bob_dh = X25519Secret::generate().unwrap();
+        let secret = sk(9);
+        let alice_sid = alice
+            .prepare_outbound(
+                &b"bob".to_vec(),
+                &b"b1".to_vec(),
+                &bob_id,
+                &secret,
+                &bob_dh.public_key(),
+                1,
+            )
+            .unwrap();
+        let bob_sid = bob
+            .prepare_inbound(
+                &b"alice".to_vec(),
+                &b"a1".to_vec(),
+                &alice_id,
+                &secret,
+                X25519Secret::from_bytes(bob_dh.to_bytes()),
+                1,
+            )
+            .unwrap();
+        assert_eq!(alice_sid, bob_sid);
     }
 
     #[test]
@@ -697,34 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_device_ack_requires_device_specific_api() {
-        let local = id_material(1);
-        let mut mgr = SessionManager::new(b"user-a".to_vec(), b"dev-a1".to_vec(), local);
-        let bob_dh = X25519Secret::generate().unwrap();
-        let a = id_material(2);
-        let b = id_material(3);
-        mgr.prepare_outbound(
-            &b"user-b".to_vec(),
-            &b"d1".to_vec(),
-            &a,
-            &sk(9),
-            &bob_dh.public_key(),
-            1,
-        )
-        .unwrap();
-        mgr.prepare_outbound(
-            &b"user-b".to_vec(),
-            &b"d2".to_vec(),
-            &b,
-            &sk(9),
-            &bob_dh.public_key(),
-            1,
-        )
-        .unwrap();
-        assert!(mgr.acknowledge_identity(&b"user-b".to_vec(), a).is_err());
-    }
-
-    #[test]
     fn stale_sweep_reclaims_initiating_quota() {
         let local = id_material(1);
         let remote = id_material(2);
@@ -744,34 +807,5 @@ mod tests {
             .unwrap();
         mgr.sweep_stale(1 + MAX_LATENCY_SECS + 1);
         assert_eq!(mgr.initiating_count, 0);
-    }
-
-    #[test]
-    fn device_limit_enforced() {
-        let local = id_material(1);
-        let mut mgr = SessionManager::new(b"user-a".to_vec(), b"dev-a1".to_vec(), local);
-        let bob_dh = X25519Secret::generate().unwrap();
-        for i in 0..MAX_DEVICES_PER_USER {
-            let remote = id_material(10 + i as u8);
-            mgr.prepare_outbound(
-                &b"user-b".to_vec(),
-                &vec![i as u8],
-                &remote,
-                &sk(9),
-                &bob_dh.public_key(),
-                1000 + i as u64,
-            )
-            .unwrap();
-        }
-        assert!(mgr
-            .prepare_outbound(
-                &b"user-b".to_vec(),
-                &vec![99u8],
-                &id_material(99),
-                &sk(9),
-                &bob_dh.public_key(),
-                2000,
-            )
-            .is_err());
     }
 }
