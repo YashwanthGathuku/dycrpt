@@ -34,16 +34,12 @@ final class VoiceChatStorageKey {
             throw StorageKeyError.random(status)
         }
 
-        let data = Data(bytes)
+        let candidate = Data(bytes)
         bytes.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) }
-        do {
-            try store(data)
-            return data
-        } catch {
-            // Data is value-semantic and may have copies; callers should keep
-            // its lifetime short and hand it directly to the Rust initializer.
-            throw error
-        }
+        // `storeOrLoadWinner` returns the exact Keychain value. If another
+        // process/scene wins a simultaneous create race, its durable key is
+        // returned instead of this process's unstored candidate.
+        return try storeOrLoadWinner(candidate)
     }
 
     func destroy() throws {
@@ -77,8 +73,8 @@ final class VoiceChatStorageKey {
         return data
     }
 
-    private func store(_ data: Data) throws {
-        guard data.count == keyLength else {
+    private func storeOrLoadWinner(_ candidate: Data) throws -> Data {
+        guard candidate.count == keyLength else {
             throw StorageKeyError.invalidLength
         }
         let query: [String: Any] = [
@@ -86,19 +82,18 @@ final class VoiceChatStorageKey {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-            kSecValueData as String: data,
+            kSecValueData as String: candidate,
         ]
         let status = SecItemAdd(query as CFDictionary, nil)
+        if status == errSecSuccess {
+            return candidate
+        }
         if status == errSecDuplicateItem {
-            // Another process/scene may have raced creation. Never overwrite an
-            // existing key because doing so would orphan the encrypted store.
             guard let existing = try load(), existing.count == keyLength else {
                 throw StorageKeyError.invalidLength
             }
-            return
+            return existing
         }
-        guard status == errSecSuccess else {
-            throw StorageKeyError.keychain(status)
-        }
+        throw StorageKeyError.keychain(status)
     }
 }
