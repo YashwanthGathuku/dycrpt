@@ -75,9 +75,7 @@ impl Coordination {
         if pending != Some(target) {
             return Err(PrimitiveError::Internal);
         }
-        let previous = target
-            .checked_sub(1)
-            .ok_or(PrimitiveError::Internal)?;
+        let previous = target.checked_sub(1).ok_or(PrimitiveError::Internal)?;
 
         let current = self.anchor.current()?;
         if current == target {
@@ -262,13 +260,7 @@ impl<S: TransactionalStorage> TransactionalStorage for AnchoredStorage<S> {
 pub fn coordinated_backends_for_initialize<S>(
     storage: S,
     anchor: Arc<dyn RollbackAnchor>,
-) -> Result<
-    (
-        Box<dyn TransactionalStorage>,
-        Box<dyn MonotonicCounter>,
-    ),
-    PrimitiveError,
->
+) -> Result<(Box<dyn TransactionalStorage>, Box<dyn MonotonicCounter>), PrimitiveError>
 where
     S: TransactionalStorage + 'static,
 {
@@ -288,13 +280,7 @@ where
 pub fn coordinated_backends_for_restore<S>(
     storage: S,
     anchor: Arc<dyn RollbackAnchor>,
-) -> Result<
-    (
-        Box<dyn TransactionalStorage>,
-        Box<dyn MonotonicCounter>,
-    ),
-    PrimitiveError,
->
+) -> Result<(Box<dyn TransactionalStorage>, Box<dyn MonotonicCounter>), PrimitiveError>
 where
     S: TransactionalStorage + 'static,
 {
@@ -316,7 +302,11 @@ where
         return build_pair(storage, anchor);
     }
 
-    if local == anchored.checked_add(1).ok_or(PrimitiveError::LimitExceeded)? {
+    if local
+        == anchored
+            .checked_add(1)
+            .ok_or(PrimitiveError::LimitExceeded)?
+    {
         match anchor.compare_and_increment(anchored) {
             Ok(value) if value == local => return build_pair(storage, anchor),
             Ok(_) => return Err(PrimitiveError::Internal),
@@ -337,13 +327,7 @@ where
 fn build_pair<S>(
     storage: S,
     anchor: Arc<dyn RollbackAnchor>,
-) -> Result<
-    (
-        Box<dyn TransactionalStorage>,
-        Box<dyn MonotonicCounter>,
-    ),
-    PrimitiveError,
->
+) -> Result<(Box<dyn TransactionalStorage>, Box<dyn MonotonicCounter>), PrimitiveError>
 where
     S: TransactionalStorage + 'static,
 {
@@ -373,7 +357,8 @@ mod tests {
         }
 
         fn fail_after_next_increment(&self) {
-            self.fail_once_after_increment.store(true, Ordering::Release);
+            self.fail_once_after_increment
+                .store(true, Ordering::Release);
         }
     }
 
@@ -389,10 +374,7 @@ mod tests {
             self.value
                 .compare_exchange(expected, target, Ordering::AcqRel, Ordering::Acquire)
                 .map_err(|_| PrimitiveError::Internal)?;
-            if self
-                .fail_once_after_increment
-                .swap(false, Ordering::AcqRel)
-            {
+            if self.fail_once_after_increment.swap(false, Ordering::AcqRel) {
                 return Err(PrimitiveError::Internal);
             }
             Ok(target)
@@ -428,7 +410,11 @@ mod tests {
             .put(tx, b"state", &StateBlob(b"one".to_vec()))
             .unwrap();
         storage
-            .put(tx, STORAGE_EPOCH_KEY, &StateBlob(1u64.to_le_bytes().to_vec()))
+            .put(
+                tx,
+                STORAGE_EPOCH_KEY,
+                &StateBlob(1u64.to_le_bytes().to_vec()),
+            )
             .unwrap();
         storage.commit(tx).unwrap();
         assert_eq!(anchor.current().unwrap(), 1);
@@ -442,7 +428,11 @@ mod tests {
         assert_eq!(counter.increment().unwrap(), 1);
         let tx = storage.begin().unwrap();
         storage
-            .put(tx, STORAGE_EPOCH_KEY, &StateBlob(1u64.to_le_bytes().to_vec()))
+            .put(
+                tx,
+                STORAGE_EPOCH_KEY,
+                &StateBlob(1u64.to_le_bytes().to_vec()),
+            )
             .unwrap();
         storage.abort(tx).unwrap();
         assert_eq!(anchor.current().unwrap(), 0);
@@ -455,7 +445,10 @@ mod tests {
         anchor.fail_after_next_increment();
         let (mut storage, mut counter) =
             coordinated_backends_for_initialize(MemoryStorage::default(), anchor.clone()).unwrap();
-        assert_eq!(commit_epoch(&mut *storage, &mut *counter, b"one").unwrap(), 1);
+        assert_eq!(
+            commit_epoch(&mut *storage, &mut *counter, b"one").unwrap(),
+            1
+        );
         assert_eq!(anchor.current().unwrap(), 1);
     }
 
@@ -465,7 +458,11 @@ mod tests {
         let mut storage = MemoryStorage::default();
         let tx = storage.begin().unwrap();
         storage
-            .put(tx, STORAGE_EPOCH_KEY, &StateBlob(1u64.to_le_bytes().to_vec()))
+            .put(
+                tx,
+                STORAGE_EPOCH_KEY,
+                &StateBlob(1u64.to_le_bytes().to_vec()),
+            )
             .unwrap();
         storage.commit(tx).unwrap();
         assert!(coordinated_backends_for_restore(storage, anchor).is_err());
@@ -477,7 +474,11 @@ mod tests {
         let mut storage = MemoryStorage::default();
         let tx = storage.begin().unwrap();
         storage
-            .put(tx, STORAGE_EPOCH_KEY, &StateBlob(5u64.to_le_bytes().to_vec()))
+            .put(
+                tx,
+                STORAGE_EPOCH_KEY,
+                &StateBlob(5u64.to_le_bytes().to_vec()),
+            )
             .unwrap();
         storage.commit(tx).unwrap();
         let _ = coordinated_backends_for_restore(storage, anchor.clone()).unwrap();
@@ -490,7 +491,11 @@ mod tests {
         let mut storage = MemoryStorage::default();
         let tx = storage.begin().unwrap();
         storage
-            .put(tx, STORAGE_EPOCH_KEY, &StateBlob(6u64.to_le_bytes().to_vec()))
+            .put(
+                tx,
+                STORAGE_EPOCH_KEY,
+                &StateBlob(6u64.to_le_bytes().to_vec()),
+            )
             .unwrap();
         storage.commit(tx).unwrap();
         assert!(coordinated_backends_for_restore(storage, anchor).is_err());

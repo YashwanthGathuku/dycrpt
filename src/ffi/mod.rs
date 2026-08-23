@@ -747,8 +747,7 @@ pub unsafe extern "C" fn vc_pending_outbound_initiation(
             Err(e) => return e as i32,
         };
         let packet = match with_engine(engine, |eng| {
-            eng.pending_outbound_initiation(&sid)
-                .map_err(VcError::from)
+            eng.pending_outbound_initiation(&sid).map_err(VcError::from)
         }) {
             Ok(Some(v)) => v.encode(),
             Ok(None) => {
@@ -883,13 +882,7 @@ mod tests {
         let mut handle = 0u64;
         let mut pk = [0u8; 32];
         assert_eq!(
-            vc_engine_create(
-                id.as_ptr(),
-                id.len(),
-                1,
-                &mut handle,
-                pk.as_mut_ptr(),
-            ),
+            vc_engine_create(id.as_ptr(), id.len(), 1, &mut handle, pk.as_mut_ptr(),),
             VcError::Ok as i32
         );
         (handle, pk)

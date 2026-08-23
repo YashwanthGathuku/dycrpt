@@ -407,8 +407,7 @@ impl PrekeyStore {
 
     /// Explicitly expire all retained LR-PQ keys older than `min_id`.
     pub fn expire_last_resort_pq_before(&mut self, min_id: PqPrekeyId) {
-        self.previous_last_resort_pq
-            .retain(|id, _| *id >= min_id);
+        self.previous_last_resort_pq.retain(|id, _| *id >= min_id);
     }
 
     pub fn retained_signed_count(&self) -> usize {

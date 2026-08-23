@@ -75,7 +75,8 @@ impl EncryptedFileStorage {
         key: &AeadKey,
     ) -> Result<(HashMap<Vec<u8>, Vec<u8>>, u64), PrimitiveError> {
         let metadata = fs::metadata(path).map_err(|_| PrimitiveError::Internal)?;
-        let file_len = usize::try_from(metadata.len()).map_err(|_| PrimitiveError::LimitExceeded)?;
+        let file_len =
+            usize::try_from(metadata.len()).map_err(|_| PrimitiveError::LimitExceeded)?;
         if file_len < FILE_MAGIC.len() + NONCE_LEN + TAG_LEN || file_len > MAX_STORAGE_FILE {
             return Err(PrimitiveError::InvalidLength);
         }
@@ -125,12 +126,17 @@ impl EncryptedFileStorage {
         Ok((map, epoch))
     }
 
-    fn effective_record_count(&self, staged: &HashMap<Vec<u8>, StagedValue>) -> Result<usize, PrimitiveError> {
+    fn effective_record_count(
+        &self,
+        staged: &HashMap<Vec<u8>, StagedValue>,
+    ) -> Result<usize, PrimitiveError> {
         let mut count = self.committed.len();
         for (key, value) in staged {
             let existed = self.committed.contains_key(key);
             match (&value.0, existed) {
-                (Some(_), false) => count = count.checked_add(1).ok_or(PrimitiveError::LimitExceeded)?,
+                (Some(_), false) => {
+                    count = count.checked_add(1).ok_or(PrimitiveError::LimitExceeded)?
+                }
                 (None, true) => count = count.checked_sub(1).ok_or(PrimitiveError::Internal)?,
                 _ => {}
             }
@@ -158,7 +164,11 @@ impl EncryptedFileStorage {
             match staged.get(key).and_then(|v| v.0.as_ref()) {
                 Some(value) => append_record(&mut out, key, value)?,
                 None if staged.contains_key(key) => continue,
-                None => append_record(&mut out, key, self.committed.get(key).ok_or(PrimitiveError::Internal)?)?,
+                None => append_record(
+                    &mut out,
+                    key,
+                    self.committed.get(key).ok_or(PrimitiveError::Internal)?,
+                )?,
             }
             emitted.insert(key.clone());
         }
@@ -189,10 +199,7 @@ impl EncryptedFileStorage {
         Ok(out)
     }
 
-    fn persist_staged(
-        &self,
-        staged: &HashMap<Vec<u8>, StagedValue>,
-    ) -> Result<(), PrimitiveError> {
+    fn persist_staged(&self, staged: &HashMap<Vec<u8>, StagedValue>) -> Result<(), PrimitiveError> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent).map_err(|_| PrimitiveError::Internal)?;
 
@@ -220,9 +227,12 @@ impl EncryptedFileStorage {
                 .create_new(true)
                 .open(&temp_path)
                 .map_err(|_| PrimitiveError::Internal)?;
-            temp.write_all(FILE_MAGIC).map_err(|_| PrimitiveError::Internal)?;
-            temp.write_all(&nonce).map_err(|_| PrimitiveError::Internal)?;
-            temp.write_all(&encrypted).map_err(|_| PrimitiveError::Internal)?;
+            temp.write_all(FILE_MAGIC)
+                .map_err(|_| PrimitiveError::Internal)?;
+            temp.write_all(&nonce)
+                .map_err(|_| PrimitiveError::Internal)?;
+            temp.write_all(&encrypted)
+                .map_err(|_| PrimitiveError::Internal)?;
             temp.sync_all().map_err(|_| PrimitiveError::Internal)?;
             drop(temp);
             fs::rename(&temp_path, &self.path).map_err(|_| PrimitiveError::Internal)?;
@@ -262,7 +272,10 @@ impl TransactionalStorage for EncryptedFileStorage {
             return Err(PrimitiveError::Internal);
         }
         let tx = TransactionId(self.next_tx);
-        self.next_tx = self.next_tx.checked_add(1).ok_or(PrimitiveError::LimitExceeded)?;
+        self.next_tx = self
+            .next_tx
+            .checked_add(1)
+            .ok_or(PrimitiveError::LimitExceeded)?;
         self.staged = Some((tx, HashMap::new()));
         Ok(tx)
     }
@@ -280,7 +293,9 @@ impl TransactionalStorage for EncryptedFileStorage {
         if staged.0 != tx {
             return Err(PrimitiveError::Internal);
         }
-        staged.1.insert(key.to_vec(), StagedValue(Some(value.0.clone())));
+        staged
+            .1
+            .insert(key.to_vec(), StagedValue(Some(value.0.clone())));
         Ok(())
     }
 
@@ -336,7 +351,10 @@ impl TransactionalStorage for EncryptedFileStorage {
     }
 
     fn advance_epoch(&mut self) -> Result<StorageEpoch, PrimitiveError> {
-        self.local_epoch = self.local_epoch.checked_add(1).ok_or(PrimitiveError::LimitExceeded)?;
+        self.local_epoch = self
+            .local_epoch
+            .checked_add(1)
+            .ok_or(PrimitiveError::LimitExceeded)?;
         Ok(StorageEpoch(self.local_epoch))
     }
 }
@@ -378,11 +396,19 @@ fn take<'a>(data: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8], Primiti
 }
 
 fn read_u32(data: &[u8], i: &mut usize) -> Result<u32, PrimitiveError> {
-    Ok(u32::from_le_bytes(take(data, i, 4)?.try_into().map_err(|_| PrimitiveError::InvalidLength)?))
+    Ok(u32::from_le_bytes(
+        take(data, i, 4)?
+            .try_into()
+            .map_err(|_| PrimitiveError::InvalidLength)?,
+    ))
 }
 
 fn read_u64(data: &[u8], i: &mut usize) -> Result<u64, PrimitiveError> {
-    Ok(u64::from_le_bytes(take(data, i, 8)?.try_into().map_err(|_| PrimitiveError::InvalidLength)?))
+    Ok(u64::from_le_bytes(
+        take(data, i, 8)?
+            .try_into()
+            .map_err(|_| PrimitiveError::InvalidLength)?,
+    ))
 }
 
 #[cfg(test)]
@@ -403,14 +429,18 @@ mod tests {
         {
             let mut store = EncryptedFileStorage::open(&path, key).unwrap();
             let tx = store.begin().unwrap();
-            store.put(tx, b"session", &StateBlob(b"secret-state".to_vec())).unwrap();
+            store
+                .put(tx, b"session", &StateBlob(b"secret-state".to_vec()))
+                .unwrap();
             store.commit(tx).unwrap();
         }
         let store = EncryptedFileStorage::open(&path, key).unwrap();
         assert_eq!(store.get(b"session").unwrap().unwrap().0, b"secret-state");
         assert!(EncryptedFileStorage::open(&path, [8u8; 32]).is_err());
         let raw = fs::read(&path).unwrap();
-        assert!(!raw.windows(b"secret-state".len()).any(|w| w == b"secret-state"));
+        assert!(!raw
+            .windows(b"secret-state".len())
+            .any(|w| w == b"secret-state"));
         let _ = fs::remove_file(path);
     }
 

@@ -177,8 +177,7 @@ impl PeerIdentityStore {
                 1 => true,
                 _ => return Err(PrimitiveError::InvalidLength),
             };
-            let acknowledged_unix =
-                u64::from_le_bytes(take(data, &mut i, 8)?.try_into().unwrap());
+            let acknowledged_unix = u64::from_le_bytes(take(data, &mut i, 8)?.try_into().unwrap());
             let method = match take(data, &mut i, 1)?[0] {
                 0 => VerificationMethod::None,
                 1 => VerificationMethod::SafetyNumber,
@@ -186,7 +185,11 @@ impl PeerIdentityStore {
             };
             let identity = IdentityMaterial {
                 identity_key: X25519Public::from_bytes(key)?,
-                device_id: if device.is_empty() { None } else { Some(device) },
+                device_id: if device.is_empty() {
+                    None
+                } else {
+                    Some(device)
+                },
             };
             validate_peer_identity(&identity)?;
             if by_peer

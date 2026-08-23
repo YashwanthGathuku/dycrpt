@@ -152,7 +152,9 @@ fn oversized_remote_device_is_rejected_before_outbound_session_creation() {
     let (_, packet) = alice
         .establish_outbound_session(&bundle, b"conv", b"first", b"ad")
         .unwrap();
-    let (_, plaintext) = bob.process_inbound_session(&packet, b"conv", b"ad").unwrap();
+    let (_, plaintext) = bob
+        .process_inbound_session(&packet, b"conv", b"ad")
+        .unwrap();
     assert_eq!(plaintext, b"first");
 }
 
@@ -179,7 +181,9 @@ fn oversized_peer_id_is_rejected_before_outbound_session_creation() {
     let (_, packet) = alice
         .establish_outbound_session(&bundle, b"conv", b"first", b"ad")
         .unwrap();
-    let (_, plaintext) = bob.process_inbound_session(&packet, b"conv", b"ad").unwrap();
+    let (_, plaintext) = bob
+        .process_inbound_session(&packet, b"conv", b"ad")
+        .unwrap();
     assert_eq!(plaintext, b"first");
 }
 
@@ -205,17 +209,11 @@ fn pending_initiation_survives_crash_byte_for_byte() {
         .establish_outbound_session(&bundle, b"pending", b"first", b"ad")
         .unwrap();
 
-    let pending = alice
-        .pending_outbound_initiation(&sid_a)
-        .unwrap()
-        .unwrap();
+    let pending = alice.pending_outbound_initiation(&sid_a).unwrap().unwrap();
     assert_eq!(pending.encode(), packet.encode());
 
     alice.simulate_crash_reload().unwrap();
-    let restored = alice
-        .pending_outbound_initiation(&sid_a)
-        .unwrap()
-        .unwrap();
+    let restored = alice.pending_outbound_initiation(&sid_a).unwrap().unwrap();
     assert_eq!(restored.encode(), packet.encode());
 
     let (sid_b, _) = bob

@@ -8,9 +8,7 @@
 
 use std::collections::VecDeque;
 
-use super::mailbox::{
-    Directory, MailboxBody, MailboxEnvelope, MAX_MAILBOX_CIPHERTEXT_LEN,
-};
+use super::mailbox::{Directory, MailboxBody, MailboxEnvelope, MAX_MAILBOX_CIPHERTEXT_LEN};
 use super::{DeviceId, SessionId, SessionManager, UserId, MAX_RESEND_ATTEMPTS};
 use crate::fingerprint::IdentityMaterial;
 use crate::primitives::aead::TAG_LEN;
@@ -95,9 +93,9 @@ impl SesameNode {
                     return Err(PrimitiveError::LimitExceeded);
                 }
 
-                let sid = self
-                    .mgr
-                    .prepare_outbound(user, dev, remote_identity, sk, remote_dh, now)?;
+                let sid =
+                    self.mgr
+                        .prepare_outbound(user, dev, remote_identity, sk, remote_dh, now)?;
                 let (header, ciphertext, trial) = {
                     let record = self
                         .mgr
@@ -238,12 +236,7 @@ impl SesameNode {
                     }
                 }
                 MailboxBody::RetryRequest { message_id } => {
-                    self.handle_retry(
-                        dir,
-                        &env.from_user,
-                        &env.from_device,
-                        message_id,
-                    )?;
+                    self.handle_retry(dir, &env.from_user, &env.from_device, message_id)?;
                 }
                 MailboxBody::DeliveryReceipt { message_id } => {
                     self.records.retain(|record| {
@@ -381,7 +374,12 @@ impl SesameNode {
 }
 
 fn msg_id(session_id: &SessionId, header: &[u8], ciphertext: &[u8]) -> [u8; 16] {
-    let digest = sha256_parts(&[b"VoiceChat/Sesame/v2/MessageId", session_id, header, ciphertext]);
+    let digest = sha256_parts(&[
+        b"VoiceChat/Sesame/v2/MessageId",
+        session_id,
+        header,
+        ciphertext,
+    ]);
     let mut id = [0u8; 16];
     id.copy_from_slice(&digest[..16]);
     id
@@ -626,7 +624,10 @@ mod tests {
                 2,
             )
             .unwrap();
-        let original = directory.fetch(&b"bob".to_vec(), &b"b1".to_vec()).pop().unwrap();
+        let original = directory
+            .fetch(&b"bob".to_vec(), &b"b1".to_vec())
+            .pop()
+            .unwrap();
         directory
             .send(&b"bob".to_vec(), &b"b1".to_vec(), original.clone())
             .unwrap();
@@ -637,6 +638,9 @@ mod tests {
         directory
             .send(&b"bob".to_vec(), &b"b1".to_vec(), original)
             .unwrap();
-        assert!(bob.receive_all(&mut directory, &alice_id, 4).unwrap().is_empty());
+        assert!(bob
+            .receive_all(&mut directory, &alice_id, 4)
+            .unwrap()
+            .is_empty());
     }
 }

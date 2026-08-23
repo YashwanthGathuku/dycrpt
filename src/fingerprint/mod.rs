@@ -304,7 +304,8 @@ impl TrustStore {
         for _ in 0..count {
             let mut key = [0u8; 32];
             key.copy_from_slice(take(data, &mut i, 32)?);
-            let device_len = u16::from_le_bytes(take(data, &mut i, 2)?.try_into().unwrap()) as usize;
+            let device_len =
+                u16::from_le_bytes(take(data, &mut i, 2)?.try_into().unwrap()) as usize;
             if device_len > MAX_IDENTITY_DEVICE_ID_LEN {
                 return Err(PrimitiveError::LimitExceeded);
             }
@@ -314,8 +315,7 @@ impl TrustStore {
                 1 => true,
                 _ => return Err(PrimitiveError::InvalidLength),
             };
-            let acknowledged_unix =
-                u64::from_le_bytes(take(data, &mut i, 8)?.try_into().unwrap());
+            let acknowledged_unix = u64::from_le_bytes(take(data, &mut i, 8)?.try_into().unwrap());
             let method = match take(data, &mut i, 1)?[0] {
                 0 => VerificationMethod::None,
                 1 => VerificationMethod::SafetyNumber,

@@ -125,9 +125,7 @@ impl Encoder {
         if n != expected_symbols {
             return Err(PrimitiveError::InvalidLength);
         }
-        let payload_len = n
-            .checked_mul(2)
-            .ok_or(PrimitiveError::LimitExceeded)?;
+        let payload_len = n.checked_mul(2).ok_or(PrimitiveError::LimitExceeded)?;
         let expected_len = 10usize
             .checked_add(payload_len)
             .ok_or(PrimitiveError::LimitExceeded)?;

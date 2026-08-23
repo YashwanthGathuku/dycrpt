@@ -147,7 +147,10 @@ fn malformed_reload_is_atomic_and_poisons_engine() {
     // stored anti-rollback epoch. The loader must parse into temporary state and
     // must not partially replace live identity/session state before failure.
     storage.put_committed_raw(b"trust", b"corrupt-trust-state");
-    assert_eq!(alice.simulate_crash_reload().unwrap_err(), CryptoError::Storage);
+    assert_eq!(
+        alice.simulate_crash_reload().unwrap_err(),
+        CryptoError::Storage
+    );
     assert_eq!(alice.local_identity_public(), identity_before);
     assert!(alice.has_session(&sid));
     assert_eq!(
@@ -172,7 +175,9 @@ fn duplicate_persisted_session_tags_are_rejected_on_reload() {
     let (sid1, init1) = alice
         .establish_outbound_session(&bundle1, b"tag-1", b"one", b"ad")
         .unwrap();
-    let (bob_sid1, _) = bob.process_inbound_session(&init1, b"tag-1", b"ad").unwrap();
+    let (bob_sid1, _) = bob
+        .process_inbound_session(&init1, b"tag-1", b"ad")
+        .unwrap();
     let ack1 = bob.encrypt(&bob_sid1, b"ack-1", b"ad").unwrap();
     alice.decrypt(&sid1, &ack1, b"ad").unwrap();
 
@@ -180,7 +185,9 @@ fn duplicate_persisted_session_tags_are_rejected_on_reload() {
     let (sid2, init2) = alice
         .establish_outbound_session(&bundle2, b"tag-2", b"two", b"ad")
         .unwrap();
-    let (bob_sid2, _) = bob.process_inbound_session(&init2, b"tag-2", b"ad").unwrap();
+    let (bob_sid2, _) = bob
+        .process_inbound_session(&init2, b"tag-2", b"ad")
+        .unwrap();
     let ack2 = bob.encrypt(&bob_sid2, b"ack-2", b"ad").unwrap();
     alice.decrypt(&sid2, &ack2, b"ad").unwrap();
 
@@ -195,7 +202,10 @@ fn duplicate_persisted_session_tags_are_rejected_on_reload() {
     second_blob[tag_start..tag_end].copy_from_slice(&first_blob[tag_start..tag_end]);
     storage.put_committed_raw(&sid2.0, &second_blob);
 
-    assert_eq!(alice.simulate_crash_reload().unwrap_err(), CryptoError::Storage);
+    assert_eq!(
+        alice.simulate_crash_reload().unwrap_err(),
+        CryptoError::Storage
+    );
     assert!(alice.has_session(&sid1));
     assert!(alice.has_session(&sid2));
 }

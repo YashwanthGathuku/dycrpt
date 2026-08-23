@@ -130,7 +130,10 @@ fn initiation_packet_encode_decode_roundtrip() {
         .establish_outbound_session(&bundle, b"c", b"A0", b"ad")
         .unwrap();
     let decoded = InitiationPacket::decode(&packet.encode()).unwrap();
-    assert_eq!(decoded.sender_identity_public, packet.sender_identity_public);
+    assert_eq!(
+        decoded.sender_identity_public,
+        packet.sender_identity_public
+    );
     assert_eq!(decoded.kem_ciphertext, packet.kem_ciphertext);
     assert_eq!(decoded.used_spk_id, packet.used_spk_id);
     let (_, pt) = bob.process_inbound_session(&decoded, b"c", b"ad").unwrap();
@@ -264,12 +267,7 @@ fn stable_peer_binding_blocks_identity_replacement() {
         )
         .unwrap();
     alice
-        .acknowledge_peer_identity(
-            peer,
-            &bob.local_identity_public(),
-            Some(b"bob-device"),
-            123,
-        )
+        .acknowledge_peer_identity(peer, &bob.local_identity_public(), Some(b"bob-device"), 123)
         .unwrap();
 
     let mut impostor = VoiceChatCryptoEngine::initialize_device(DeviceConfig {

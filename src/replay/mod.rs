@@ -115,10 +115,8 @@ impl ReplayCache {
         let mut i = 16;
         let mut cache = Self::new(capacity);
         for _ in 0..n {
-            let conversation_id =
-                take_vec(data, &mut i, MAX_CONVERSATION_ID_LEN)?;
-            let sender_device_id =
-                take_vec(data, &mut i, MAX_SENDER_DEVICE_ID_LEN)?;
+            let conversation_id = take_vec(data, &mut i, MAX_CONVERSATION_ID_LEN)?;
+            let sender_device_id = take_vec(data, &mut i, MAX_SENDER_DEVICE_ID_LEN)?;
             let message_id = take_vec(data, &mut i, MAX_MESSAGE_ID_LEN)?;
             let key = ReplayKey {
                 conversation_id,

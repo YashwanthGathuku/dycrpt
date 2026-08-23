@@ -40,7 +40,11 @@ impl OnlineStats {
 fn welch_t(a: &OnlineStats, b: &OnlineStats) -> f64 {
     let denom = (a.variance() / a.n as f64 + b.variance() / b.n as f64).sqrt();
     if denom == 0.0 {
-        if a.mean == b.mean { 0.0 } else { f64::INFINITY }
+        if a.mean == b.mean {
+            0.0
+        } else {
+            f64::INFINITY
+        }
     } else {
         (a.mean - b.mean) / denom
     }

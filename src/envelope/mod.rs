@@ -257,7 +257,8 @@ impl Envelope {
     fn validate_payload_metadata(&self) -> Result<(), PrimitiveError> {
         match (self.payload_type, &self.synthetic_voice) {
             (PayloadType::SyntheticVoice, Some(meta)) => {
-                if meta.codec.is_empty() || meta.codec.len() > MAX_ID_LEN || !meta.codec.is_ascii() {
+                if meta.codec.is_empty() || meta.codec.len() > MAX_ID_LEN || !meta.codec.is_ascii()
+                {
                     return Err(PrimitiveError::InvalidLength);
                 }
                 if meta.payload_length as usize != self.payload.len() {
@@ -494,7 +495,11 @@ mod tests {
         assert!(!ad.is_empty());
 
         let mut changed_duration = env.clone();
-        changed_duration.synthetic_voice.as_mut().unwrap().duration_ms += 1;
+        changed_duration
+            .synthetic_voice
+            .as_mut()
+            .unwrap()
+            .duration_ms += 1;
         assert_ne!(ad, changed_duration.associated_data().unwrap());
 
         let mut changed_body = env.clone();
@@ -513,6 +518,9 @@ mod tests {
     #[test]
     fn associated_data_stable_for_same_envelope() {
         let env = sample_envelope();
-        assert_eq!(env.associated_data().unwrap(), env.associated_data().unwrap());
+        assert_eq!(
+            env.associated_data().unwrap(),
+            env.associated_data().unwrap()
+        );
     }
 }

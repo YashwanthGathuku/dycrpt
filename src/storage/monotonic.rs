@@ -46,10 +46,7 @@ impl MonotonicCounter for MemoryCounter {
     }
 
     fn increment(&mut self) -> Result<u64, PrimitiveError> {
-        self.n = self
-            .n
-            .checked_add(1)
-            .ok_or(PrimitiveError::LimitExceeded)?;
+        self.n = self.n.checked_add(1).ok_or(PrimitiveError::LimitExceeded)?;
         Ok(self.n)
     }
 }

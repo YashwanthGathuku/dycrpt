@@ -5,7 +5,7 @@
 //! attacker-sized identifiers/mailboxes so tests exercise fail-closed behavior.
 
 use super::{
-    DeviceId, UserId, MAX_DEVICE_ID_LEN, MAX_DEVICES_PER_USER, MAX_USER_ID_LEN, MAX_USERS,
+    DeviceId, UserId, MAX_DEVICES_PER_USER, MAX_DEVICE_ID_LEN, MAX_USERS, MAX_USER_ID_LEN,
 };
 use crate::primitives::error::PrimitiveError;
 use crate::primitives::x25519::X25519Public;
@@ -174,8 +174,7 @@ fn validate_body(body: &MailboxBody) -> Result<(), PrimitiveError> {
                 return Err(PrimitiveError::InvalidLength);
             }
         }
-        MailboxBody::RetryRequest { message_id }
-        | MailboxBody::DeliveryReceipt { message_id } => {
+        MailboxBody::RetryRequest { message_id } | MailboxBody::DeliveryReceipt { message_id } => {
             if *message_id == [0u8; 16] {
                 return Err(PrimitiveError::InvalidLength);
             }
@@ -202,7 +201,10 @@ mod tests {
         assert!(directory
             .register(b"u".to_vec(), b"d".to_vec(), public(2))
             .is_err());
-        assert_eq!(directory.query_devices(&b"u".to_vec()).unwrap()[0].1, public(1));
+        assert_eq!(
+            directory.query_devices(&b"u".to_vec()).unwrap()[0].1,
+            public(1)
+        );
     }
 
     #[test]
@@ -233,8 +235,6 @@ mod tests {
                 .send(&b"u".to_vec(), &b"d".to_vec(), env.clone())
                 .unwrap();
         }
-        assert!(directory
-            .send(&b"u".to_vec(), &b"d".to_vec(), env)
-            .is_err());
+        assert!(directory.send(&b"u".to_vec(), &b"d".to_vec(), env).is_err());
     }
 }

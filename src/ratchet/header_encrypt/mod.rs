@@ -471,11 +471,8 @@ impl HeaderEncryptState {
         out.extend_from_slice(&self.pn.to_le_bytes());
         out.extend_from_slice(&self.max_skip.to_le_bytes());
 
-        let mut skipped: Vec<(HeSkipKey, [u8; 32])> = self
-            .mkskipped
-            .iter()
-            .map(|(key, mk)| (*key, *mk))
-            .collect();
+        let mut skipped: Vec<(HeSkipKey, [u8; 32])> =
+            self.mkskipped.iter().map(|(key, mk)| (*key, *mk)).collect();
         skipped.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         out.extend_from_slice(&(skipped.len() as u32).to_le_bytes());
         for ((hk, n), mut mk) in skipped {
@@ -513,9 +510,7 @@ impl HeaderEncryptState {
         if count > max_skip as usize {
             return Err(PrimitiveError::LimitExceeded);
         }
-        let needed = count
-            .checked_mul(68)
-            .ok_or(PrimitiveError::LimitExceeded)?;
+        let needed = count.checked_mul(68).ok_or(PrimitiveError::LimitExceeded)?;
         if data.len().saturating_sub(i) != needed {
             return Err(PrimitiveError::InvalidLength);
         }
@@ -721,7 +716,9 @@ mod tests {
         trailing.push(0);
         assert!(bob.decrypt(&trailing, &ct, b"ad").is_err());
         assert_eq!(bob.serialize(), before);
-        assert!(bob.decrypt(&header[..header.len() - 1], &ct, b"ad").is_err());
+        assert!(bob
+            .decrypt(&header[..header.len() - 1], &ct, b"ad")
+            .is_err());
         assert_eq!(bob.serialize(), before);
     }
 

@@ -67,7 +67,11 @@ impl DeviceRecord {
     }
 
     fn activate(&mut self, session_id: &SessionId) -> Result<(), PrimitiveError> {
-        if self.active.as_ref().is_some_and(|active| active.id == *session_id) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == *session_id)
+        {
             return Ok(());
         }
         let pos = self
@@ -75,10 +79,7 @@ impl DeviceRecord {
             .iter()
             .position(|session| session.id == *session_id)
             .ok_or(PrimitiveError::Internal)?;
-        let mut new_active = self
-            .inactive
-            .remove(pos)
-            .ok_or(PrimitiveError::Internal)?;
+        let mut new_active = self.inactive.remove(pos).ok_or(PrimitiveError::Internal)?;
         new_active.status = SessionStatus::Active;
         if let Some(mut old) = self.active.take() {
             old.status = SessionStatus::Inactive;
@@ -146,7 +147,10 @@ impl SessionManager {
             .and_then(|user| user.devices.get(remote_device))
             .and_then(|device| device.active.as_ref())
             .filter(|active| {
-                matches!(active.status, SessionStatus::Active | SessionStatus::Initiating)
+                matches!(
+                    active.status,
+                    SessionStatus::Active | SessionStatus::Initiating
+                )
             })
             .map(|active| active.id)
         {
@@ -297,7 +301,11 @@ impl SessionManager {
             .get_mut(remote_user)
             .and_then(|user| user.devices.get_mut(remote_device))
             .ok_or(PrimitiveError::Internal)?;
-        if device.inactive.iter().any(|session| session.id == *session_id) {
+        if device
+            .inactive
+            .iter()
+            .any(|session| session.id == *session_id)
+        {
             device.activate(session_id)?;
             self.recompute_initiating_count();
         }
@@ -395,11 +403,18 @@ impl SessionManager {
     ) -> Result<IdentityState, PrimitiveError> {
         validate_user_id(remote_user)?;
         validate_identity_material(observed)?;
-        let user = self.users.get(remote_user).ok_or(PrimitiveError::Internal)?;
+        let user = self
+            .users
+            .get(remote_user)
+            .ok_or(PrimitiveError::Internal)?;
         if user.devices.len() != 1 {
             return Err(PrimitiveError::InvalidLength);
         }
-        let device = user.devices.values().next().ok_or(PrimitiveError::Internal)?;
+        let device = user
+            .devices
+            .values()
+            .next()
+            .ok_or(PrimitiveError::Internal)?;
         Ok(device.identity_tracker.observe(observed))
     }
 
@@ -420,7 +435,10 @@ impl SessionManager {
             .identity
             .as_ref()
             .is_some_and(|first_seen| first_seen != observed)
-            && matches!(device.identity_tracker.observe(observed), IdentityState::Unknown)
+            && matches!(
+                device.identity_tracker.observe(observed),
+                IdentityState::Unknown
+            )
         {
             let previous = device.identity.clone().ok_or(PrimitiveError::Internal)?;
             return Ok(IdentityState::IdentityChanged {
@@ -573,7 +591,10 @@ impl SessionManager {
     fn session_id_exists(&self, id: &SessionId) -> bool {
         self.users.values().any(|user| {
             user.devices.values().any(|device| {
-                device.active.as_ref().is_some_and(|session| session.id == *id)
+                device
+                    .active
+                    .as_ref()
+                    .is_some_and(|session| session.id == *id)
                     || device.inactive.iter().any(|session| session.id == *id)
             })
         })

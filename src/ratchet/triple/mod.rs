@@ -143,8 +143,7 @@ impl TripleRatchetState {
     pub fn init_bob(sk: &[u8; 32], bob_dh_keypair: X25519Secret) -> Result<Self, PrimitiveError> {
         let (mut sk_ec, mut sk_pq) = Self::split_sk(sk)?;
         let result = (|| {
-            let classical =
-                DoubleRatchetState::init_bob(&sk_ec, bob_dh_keypair, DEFAULT_MAX_SKIP);
+            let classical = DoubleRatchetState::init_bob(&sk_ec, bob_dh_keypair, DEFAULT_MAX_SKIP);
             let mut spqr = SpqrState::init(&sk_pq, SPQR_MAX_SKIP_EPOCHS);
             spqr.advance_epoch(&sk_pq)?;
             let braid = BraidScka::init_bob(&sk_pq)?;
@@ -450,7 +449,10 @@ mod tests {
             TripleRatchetState::deserialize(&alice.serialize(), DEFAULT_MAX_SKIP).unwrap();
         let mut bob = TripleRatchetState::deserialize(&bob.serialize(), DEFAULT_MAX_SKIP).unwrap();
         let (header, ciphertext) = bob.encrypt(b"after", b"ad").unwrap();
-        assert_eq!(alice.decrypt(&header, &ciphertext, b"ad").unwrap(), b"after");
+        assert_eq!(
+            alice.decrypt(&header, &ciphertext, b"ad").unwrap(),
+            b"after"
+        );
     }
 
     #[test]

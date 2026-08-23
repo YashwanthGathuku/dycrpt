@@ -96,11 +96,7 @@ impl SkippedKeys {
         self.0.remove(key)
     }
 
-    fn insert_unique(
-        &mut self,
-        key: SkipKey,
-        mut mk: [u8; 32],
-    ) -> Result<(), PrimitiveError> {
+    fn insert_unique(&mut self, key: SkipKey, mut mk: [u8; 32]) -> Result<(), PrimitiveError> {
         if self.0.contains_key(&key) {
             mk.zeroize();
             return Err(PrimitiveError::Internal);
@@ -468,11 +464,8 @@ impl DoubleRatchetState {
         out.extend_from_slice(&self.nr.to_le_bytes());
         out.extend_from_slice(&self.pn.to_le_bytes());
         out.extend_from_slice(&self.max_skip.to_le_bytes());
-        let mut skipped: Vec<(SkipKey, [u8; 32])> = self
-            .mkskipped
-            .iter()
-            .map(|(key, mk)| (*key, *mk))
-            .collect();
+        let mut skipped: Vec<(SkipKey, [u8; 32])> =
+            self.mkskipped.iter().map(|(key, mk)| (*key, *mk)).collect();
         skipped.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         out.extend_from_slice(&(skipped.len() as u32).to_le_bytes());
         for ((pk, n), mut mk) in skipped {
@@ -506,9 +499,7 @@ impl DoubleRatchetState {
         if count > max_skip as usize {
             return Err(PrimitiveError::LimitExceeded);
         }
-        let needed = count
-            .checked_mul(68)
-            .ok_or(PrimitiveError::LimitExceeded)?;
+        let needed = count.checked_mul(68).ok_or(PrimitiveError::LimitExceeded)?;
         if data.len().saturating_sub(i) != needed {
             return Err(PrimitiveError::InvalidLength);
         }
@@ -783,9 +774,7 @@ mod tests {
         let sk = fresh_sk();
         let bob_dh = X25519Secret::generate().unwrap();
         let bob = DoubleRatchetState::init_bob(&sk, bob_dh, DEFAULT_MAX_SKIP);
-        assert!(
-            DoubleRatchetState::deserialize(&bob.serialize(), DEFAULT_MAX_SKIP - 1).is_err()
-        );
+        assert!(DoubleRatchetState::deserialize(&bob.serialize(), DEFAULT_MAX_SKIP - 1).is_err());
     }
 
     #[test]

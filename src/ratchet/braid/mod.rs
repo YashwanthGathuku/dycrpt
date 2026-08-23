@@ -634,11 +634,7 @@ fn take<'a>(data: &'a [u8], i: &mut usize, len: usize) -> Result<&'a [u8], Primi
     Ok(out)
 }
 
-fn take_vec_bounded(
-    data: &[u8],
-    i: &mut usize,
-    max: usize,
-) -> Result<Vec<u8>, PrimitiveError> {
+fn take_vec_bounded(data: &[u8], i: &mut usize, max: usize) -> Result<Vec<u8>, PrimitiveError> {
     let len = u32::from_le_bytes(take(data, i, 4)?.try_into().unwrap()) as usize;
     if len > max {
         return Err(PrimitiveError::LimitExceeded);
@@ -646,11 +642,7 @@ fn take_vec_bounded(
     Ok(take(data, i, len)?.to_vec())
 }
 
-fn take_exact_vec(
-    data: &[u8],
-    i: &mut usize,
-    expected: usize,
-) -> Result<Vec<u8>, PrimitiveError> {
+fn take_exact_vec(data: &[u8], i: &mut usize, expected: usize) -> Result<Vec<u8>, PrimitiveError> {
     if expected > MAX_AGENT_VECTOR {
         return Err(PrimitiveError::LimitExceeded);
     }

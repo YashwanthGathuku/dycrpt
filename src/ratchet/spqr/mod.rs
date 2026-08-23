@@ -46,11 +46,7 @@ impl SpqrSkippedKeys {
         self.0.remove(key)
     }
 
-    fn insert_unique(
-        &mut self,
-        key: (u32, u32),
-        mut mk: [u8; 32],
-    ) -> Result<(), PrimitiveError> {
+    fn insert_unique(&mut self, key: (u32, u32), mut mk: [u8; 32]) -> Result<(), PrimitiveError> {
         if self.0.len() >= SPQR_MAX_SKIPPED_KEYS || self.0.contains_key(&key) {
             mk.zeroize();
             return Err(PrimitiveError::LimitExceeded);
@@ -242,11 +238,8 @@ impl SpqrState {
         out.extend_from_slice(&self.max_skip_epochs.to_le_bytes());
         Self::write_chain(&mut out, &self.sending);
         Self::write_chain(&mut out, &self.receiving);
-        let mut skipped: Vec<((u32, u32), [u8; 32])> = self
-            .skipped
-            .iter()
-            .map(|(key, mk)| (*key, *mk))
-            .collect();
+        let mut skipped: Vec<((u32, u32), [u8; 32])> =
+            self.skipped.iter().map(|(key, mk)| (*key, *mk)).collect();
         skipped.sort_unstable_by_key(|entry| entry.0);
         out.extend_from_slice(&(skipped.len() as u32).to_le_bytes());
         for ((e, n), mut mk) in skipped {
