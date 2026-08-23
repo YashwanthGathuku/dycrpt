@@ -14,6 +14,11 @@ keywords = ["crypto", "signal", "pqxdh", "ratchet"]
 categories = ["cryptography"]
 publish = false
 
+[lib]
+# rlib is used by Rust tests/parity tooling, staticlib by iOS, and cdylib by
+# Android/desktop FFI. Production artifacts no longer rely on ad-hoc rustc flags.
+crate-type = ["rlib", "staticlib", "cdylib"]
+
 [dependencies]
 # All versions chosen for permissive licensing (see docs/LICENSE_AUDIT.md)
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "zeroize"] }
