@@ -3,12 +3,16 @@
 //! Invariant: never produce externally sendable ciphertext unless the
 //! corresponding ratchet-state transition can be committed safely.
 //!
-//! The storage transaction itself is only one half of rollback resistance.
-//! The engine also binds every successful commit to an external monotonic
-//! counter (`storage::monotonic::MonotonicCounter`). If the counter advances
-//! but a storage commit has an unknown/failed outcome, the engine fails closed.
+//! Production hosts should combine [`encrypted_file::EncryptedFileStorage`]
+//! with [`coordinated`] and a non-restorable [`trusted_anchor::RollbackAnchor`].
+//! The coordinated adapter makes the durable ordering local-state-first then
+//! anchor-finalization, and supports one-step forward recovery after a crash
+//! between those two durable operations.
 
+pub mod coordinated;
+pub mod encrypted_file;
 pub mod monotonic;
+pub mod trusted_anchor;
 
 use crate::primitives::error::PrimitiveError;
 use zeroize::Zeroize;
@@ -57,6 +61,8 @@ pub trait TransactionalStorage: Send + Sync {
     fn advance_epoch(&mut self) -> Result<StorageEpoch, PrimitiveError>;
 }
 
+/// Process-local transactional backend for tests and ephemeral development.
+/// It is deliberately not encrypted and not rollback-resistant.
 #[derive(Default)]
 #[allow(clippy::type_complexity)]
 pub struct MemoryStorage {
@@ -69,9 +75,7 @@ pub struct MemoryStorage {
     epoch: u64,
 }
 
-fn zeroize_staged(
-    staged: &mut std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
-) {
+fn zeroize_staged(staged: &mut std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>) {
     for value in staged.values_mut() {
         if let Some(bytes) = value.as_mut() {
             bytes.zeroize();
@@ -180,17 +184,14 @@ impl TransactionalStorage for MemoryStorage {
 }
 
 /// Detects restoration of an older storage epoch within a running process.
-///
-/// Production anti-rollback additionally compares the durable epoch stored in
-/// the transaction with an external monotonic counter that is not restored by
-/// application backup/rollback.
+/// Production anti-rollback also requires an external anchor that cannot be
+/// restored together with app data.
 #[derive(Clone, Debug, Default)]
 pub struct RollbackGuard {
     last_seen: u64,
 }
 
 impl RollbackGuard {
-    /// Observe a loaded epoch. Fails if it is older than the last seen value.
     pub fn observe(&mut self, epoch: StorageEpoch) -> Result<(), PrimitiveError> {
         if epoch.0 < self.last_seen {
             return Err(PrimitiveError::Internal);
@@ -205,14 +206,10 @@ impl RollbackGuard {
 }
 
 impl MemoryStorage {
-    /// Committed keys (test convenience wrapper).
     pub fn keys(&self) -> Vec<Vec<u8>> {
         self.committed.keys().cloned().collect()
     }
 
-    /// Drop every committed blob. This is intentionally not part of the
-    /// `TransactionalStorage` trait because the crypto engine must not erase
-    /// identity/prekey/trust state when a user only requests session deletion.
     pub fn clear(&mut self) {
         for v in self.committed.values_mut() {
             v.zeroize();
