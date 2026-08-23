@@ -6,10 +6,16 @@
 //! no borrowed raw-pointer slice is ever assigned a fabricated `'static`
 //! lifetime. Every fallible ABI entry point catches Rust panics. Registry locks
 //! are short-lived: expensive crypto locks only the selected engine handle.
+//!
+//! `vc_engine_create` currently uses the in-memory development backend. It is
+//! intentionally not a production persistence solution; mobile production
+//! integration must supply the platform durable-storage/rollback adapters
+//! documented by the hardening gate before this ABI is promoted as production.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::engine::{
@@ -50,7 +56,21 @@ impl From<CryptoError> for VcError {
     }
 }
 
-type SharedEngine = Arc<Mutex<VoiceChatCryptoEngine>>;
+struct EngineSlot {
+    closed: AtomicBool,
+    engine: Mutex<VoiceChatCryptoEngine>,
+}
+
+impl EngineSlot {
+    fn new(engine: VoiceChatCryptoEngine) -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            engine: Mutex::new(engine),
+        }
+    }
+}
+
+type SharedEngine = Arc<EngineSlot>;
 
 struct Registry {
     next: u64,
@@ -86,8 +106,17 @@ fn with_engine<R>(
     handle: VcHandle,
     f: impl FnOnce(&mut VoiceChatCryptoEngine) -> Result<R, VcError>,
 ) -> Result<R, VcError> {
-    let engine = engine_for(handle)?;
-    let mut guard = engine.lock().map_err(|_| VcError::Internal)?;
+    let slot = engine_for(handle)?;
+    if slot.closed.load(Ordering::Acquire) {
+        return Err(VcError::NotFound);
+    }
+    let mut guard = slot.engine.lock().map_err(|_| VcError::Internal)?;
+    // Destroy may have removed/closed the handle while this caller was queued
+    // on the per-engine mutex. Recheck after acquiring the mutex so a queued
+    // operation cannot resume after destroy has begun.
+    if slot.closed.load(Ordering::Acquire) {
+        return Err(VcError::NotFound);
+    }
     f(&mut guard)
 }
 
@@ -206,7 +235,7 @@ pub unsafe extern "C" fn vc_engine_create(
             Err(e) => return VcError::from(e) as i32,
         };
         let pk = engine.local_identity_public();
-        let shared = Arc::new(Mutex::new(engine));
+        let shared = Arc::new(EngineSlot::new(engine));
         let handle = {
             let mut reg = match registry().lock() {
                 Ok(v) => v,
@@ -240,15 +269,28 @@ pub unsafe extern "C" fn vc_create_device_identity(
 #[no_mangle]
 pub unsafe extern "C" fn vc_engine_destroy(engine: VcHandle) -> i32 {
     ffi_guard(|| {
-        let mut reg = match registry().lock() {
-            Ok(v) => v,
-            Err(_) => return VcError::Internal as i32,
+        let slot = {
+            let mut reg = match registry().lock() {
+                Ok(v) => v,
+                Err(_) => return VcError::Internal as i32,
+            };
+            let Some(slot) = reg.engines.remove(&engine) else {
+                return VcError::NotFound as i32;
+            };
+            // Mark closed while the registry lock is held so no later lookup can
+            // race with removal and obtain a logically live handle.
+            slot.closed.store(true, Ordering::Release);
+            slot
         };
-        if reg.engines.remove(&engine).is_some() {
-            VcError::Ok as i32
-        } else {
-            VcError::NotFound as i32
+
+        // Wait for an operation that acquired the per-engine lock before the
+        // close flag was set. Once this lock is obtained/released, every older
+        // operation has completed and every queued holder will observe closed.
+        match slot.engine.lock() {
+            Ok(guard) => drop(guard),
+            Err(_) => return VcError::Internal as i32,
         }
+        VcError::Ok as i32
     })
 }
 
@@ -868,6 +910,20 @@ mod tests {
     #[test]
     fn protocol_version_is_v2() {
         assert_eq!(vc_protocol_version(), 2);
+    }
+
+    #[test]
+    fn destroyed_handle_is_terminal() {
+        unsafe {
+            let (handle, _) = create_engine(b"destroyed");
+            assert_eq!(vc_engine_destroy(handle), VcError::Ok as i32);
+            let mut pk = [0u8; 32];
+            assert_eq!(
+                vc_engine_public_identity(handle, pk.as_mut_ptr()),
+                VcError::NotFound as i32
+            );
+            assert_eq!(vc_engine_destroy(handle), VcError::NotFound as i32);
+        }
     }
 
     #[test]
