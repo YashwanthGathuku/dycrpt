@@ -1523,7 +1523,6 @@ impl VoiceChatCryptoEngine {
     ) -> Result<(SessionId, Vec<u8>), CryptoError> {
         let _life = self.lifecycle_write()?;
         self.ensure_storage_healthy()?;
-        self.ensure_session_capacity()?;
         validate_context_lengths(conversation_context, associated_data)?;
         validate_ciphertext_len(message.first_message.ciphertext.len())?;
         if message.protocol_version != PROTOCOL_VERSION
@@ -1539,13 +1538,15 @@ impl VoiceChatCryptoEngine {
         {
             return Err(CryptoError::LimitExceeded);
         }
-        if self.session_tag_in_use(message.first_message.session_tag)? {
-            return Err(CryptoError::CryptoFailure);
-        }
         let should_record_peer = match &peer {
             Some((peer_id, material)) => self.check_peer(peer_id, material)?,
             None => false,
         };
+
+        // Exact whole-initiation replays must be classified before admission
+        // checks that naturally become true after the first successful handshake
+        // (session-tag occupancy and session capacity). Otherwise a durable replay
+        // can be misreported as CryptoFailure/LimitExceeded after reload or OPK use.
         let initiation_replay = Self::initiation_replay_key(message, conversation_context);
         {
             let replay = self.mutex(&self.replay)?;
@@ -1554,6 +1555,10 @@ impl VoiceChatCryptoEngine {
             {
                 return Err(CryptoError::Replay);
             }
+        }
+        self.ensure_session_capacity()?;
+        if self.session_tag_in_use(message.first_message.session_tag)? {
+            return Err(CryptoError::CryptoFailure);
         }
 
         let alice_ik =

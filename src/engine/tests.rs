@@ -195,6 +195,40 @@ fn initiation_replay_without_one_time_prekeys_is_rejected() {
 }
 
 #[test]
+fn modified_initiation_reusing_live_session_tag_is_not_replay() {
+    let alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+        device_id: b"bob".to_vec(),
+        profile: CryptoProfile::ClassicalV1,
+    })
+    .unwrap();
+    let bundle = bob.generate_public_prekey_bundle(1).unwrap();
+    let (_, init) = alice
+        .establish_outbound_session(&bundle, b"collision-conv", b"hello", b"ad")
+        .unwrap();
+    let (_, plaintext) = bob
+        .process_inbound_session(&init, b"collision-conv", b"ad")
+        .unwrap();
+    assert_eq!(plaintext, b"hello");
+
+    let mut modified = init.clone();
+    let last = modified
+        .first_message
+        .ciphertext
+        .last_mut()
+        .expect("AEAD ciphertext is non-empty");
+    *last ^= 1;
+
+    // Only the exact persisted initiation is a Replay. A distinct packet that
+    // collides with an already-live session tag remains a cryptographic failure.
+    assert_eq!(
+        bob.process_inbound_session(&modified, b"collision-conv", b"ad")
+            .unwrap_err(),
+        CryptoError::CryptoFailure
+    );
+}
+
+#[test]
 fn handshake_opk_and_session_atomic_across_reload() {
     let mut alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
     let mut bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
