@@ -3,17 +3,20 @@
 use voicechat_crypto::padding::{pad_to_bucket, unpad, DEFAULT_BUCKETS};
 use voicechat_crypto::policy::{select_profile, CryptoProfile};
 use voicechat_crypto::primitives::x25519::X25519Secret;
-use voicechat_crypto::ratchet::{DoubleRatchetState, DEFAULT_MAX_SKIP};
+use voicechat_crypto::ratchet::DoubleRatchetState;
 use voicechat_crypto::replay::{ReplayCache, ReplayKey};
 use voicechat_crypto::storage::{
     MemoryStorage, RollbackGuard, StateBlob, StorageEpoch, TransactionalStorage,
 };
 
+const TEST_MAX_SKIP: u32 = 8;
+
 fn pair() -> (DoubleRatchetState, DoubleRatchetState) {
     let sk = [7u8; 32];
     let bob_dh = X25519Secret::generate().unwrap();
-    let alice = DoubleRatchetState::init_alice(&sk, &bob_dh.public_key(), 8).unwrap();
-    let bob = DoubleRatchetState::init_bob(&sk, bob_dh, 8);
+    let alice =
+        DoubleRatchetState::init_alice(&sk, &bob_dh.public_key(), TEST_MAX_SKIP).unwrap();
+    let bob = DoubleRatchetState::init_bob(&sk, bob_dh, TEST_MAX_SKIP);
     (alice, bob)
 }
 
@@ -52,7 +55,7 @@ fn decrypt_crash_before_commit_keeps_old_blob() {
     store.abort(tx2).unwrap();
 
     let old = store.get(b"bob").unwrap().unwrap();
-    let mut restored = DoubleRatchetState::deserialize(&old.0, DEFAULT_MAX_SKIP).unwrap();
+    let mut restored = DoubleRatchetState::deserialize(&old.0, TEST_MAX_SKIP).unwrap();
     // Old state can still decrypt the same message (commit never happened).
     assert_eq!(restored.decrypt(&h, &ct, b"ad").unwrap(), b"m");
 }
@@ -85,7 +88,7 @@ fn max_skip_and_packet_size_bounds() {
     let (mut h, c) = alice.encrypt(b"far", b"ad").unwrap();
     h.n = 10_000;
     assert!(bob.decrypt(&h, &c, b"ad").is_err());
-    assert!(bob.skipped_count() <= 8);
+    assert!(bob.skipped_count() <= TEST_MAX_SKIP as usize);
 }
 
 #[test]
