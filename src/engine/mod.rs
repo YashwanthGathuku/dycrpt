@@ -1,11 +1,14 @@
 //! Application-facing CryptoEngine.
 //!
-//! This is the only surface application code should use. Ratchet/private state
-//! never leaves this boundary. Protocol v2 separates a local session handle
-//! from a shared authenticated network session tag and persists outbound
-//! initiation packets until the peer is known to have processed them.
+//! The engine owns long-lived identity/prekey state and provides internally
+//! synchronized per-session execution. Steady-state ratchet/AEAD work for
+//! different sessions can run concurrently; operations on the same session are
+//! serialized by that session's mutex. Durable storage/rollback epoch commits
+//! remain globally ordered through a short persistence critical section.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::fingerprint::{
     compute_fingerprint, validate_identity_material, IdentityMaterial, IdentityState,
@@ -46,14 +49,12 @@ const MAX_SESSIONS: usize = 100_000;
 const DEVICE_CONFIG_MAGIC: &[u8; 8] = b"VCCFG002";
 
 // ---------------------------------------------------------------------------
-// Public domain types / v2 wire format
+// Public wire/domain types
 // ---------------------------------------------------------------------------
 
-/// Local-only session database/API handle. Peers do not need to share this id.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(pub [u8; 16]);
 
-/// Shared network-routing tag authenticated inside every message's AEAD AD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SessionTag(pub [u8; 16]);
 
@@ -78,8 +79,6 @@ impl DeviceConfig {
     }
 }
 
-/// Public network message. Protocol/profile/tag are authenticated by the
-/// ratchet payload because the engine includes them in associated data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedMessage {
     pub protocol_version: u16,
@@ -89,8 +88,6 @@ pub struct SealedMessage {
     pub ciphertext: Vec<u8>,
 }
 
-/// PQXDH initiation packet. v2 binds its protocol/profile to the first sealed
-/// ratchet message and carries the shared SessionTag inside that message.
 #[derive(Clone, Debug)]
 pub struct InitiationPacket {
     pub protocol_version: u16,
@@ -127,7 +124,7 @@ impl SealedMessage {
             return Err(CryptoError::LimitExceeded);
         }
         let mut i = 8usize;
-        let protocol_version = read_u16(data, &mut i).map_err(|_| CryptoError::InvalidArgument)?;
+        let protocol_version = read_u16(data, &mut i)?;
         if protocol_version != PROTOCOL_VERSION {
             return Err(CryptoError::CryptoFailure);
         }
@@ -278,11 +275,19 @@ fn take<'a>(data: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8], CryptoE
 }
 
 fn read_u16(data: &[u8], i: &mut usize) -> Result<u16, CryptoError> {
-    Ok(u16::from_le_bytes(take(data, i, 2)?.try_into().unwrap()))
+    Ok(u16::from_le_bytes(
+        take(data, i, 2)?
+            .try_into()
+            .map_err(|_| CryptoError::InvalidArgument)?,
+    ))
 }
 
 fn read_u32(data: &[u8], i: &mut usize) -> Result<u32, CryptoError> {
-    Ok(u32::from_le_bytes(take(data, i, 4)?.try_into().unwrap()))
+    Ok(u32::from_le_bytes(
+        take(data, i, 4)?
+            .try_into()
+            .map_err(|_| CryptoError::InvalidArgument)?,
+    ))
 }
 
 fn validate_context_lengths(
@@ -320,6 +325,18 @@ fn validate_peer_id_input(peer_id: &[u8]) -> Result<(), CryptoError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_device_id(device_id: &[u8]) -> Result<(), CryptoError> {
+    if device_id.is_empty() || device_id.len() > MAX_DEVICE_ID_LEN {
+        Err(CryptoError::InvalidArgument)
+    } else {
+        Ok(())
+    }
+}
+
+fn contains_seq(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
 fn encode_device_config(device_id: &[u8], profile: CryptoProfile) -> Vec<u8> {
@@ -374,33 +391,36 @@ fn ensure_config_matches(
 // Application API
 // ---------------------------------------------------------------------------
 
-pub trait CryptoEngineApi {
+/// Thread-safe application API. Every mutating method uses interior
+/// synchronization; callers may share one engine through `Arc` without placing
+/// an outer global mutex around it.
+pub trait CryptoEngineApi: Send + Sync {
     fn generate_public_prekey_bundle(
-        &mut self,
+        &self,
         one_time_count: usize,
     ) -> Result<PublicPrekeyBundle, CryptoError>;
     fn replenish_prekeys(
-        &mut self,
+        &self,
         one_time_count: usize,
     ) -> Result<PublicPrekeyBundle, CryptoError>;
     fn rotate_signed_prekey(
-        &mut self,
+        &self,
         retain_previous: usize,
     ) -> Result<PublicPrekeyBundle, CryptoError>;
     fn rotate_last_resort_pq(
-        &mut self,
+        &self,
         retain_previous: usize,
     ) -> Result<PublicPrekeyBundle, CryptoError>;
 
     fn establish_outbound_session(
-        &mut self,
+        &self,
         remote_bundle: &PublicPrekeyBundle,
         conversation_context: &[u8],
         first_plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<(SessionId, InitiationPacket), CryptoError>;
     fn establish_outbound_session_for_peer(
-        &mut self,
+        &self,
         peer_id: &[u8],
         remote_device_id: Option<&[u8]>,
         remote_bundle: &PublicPrekeyBundle,
@@ -409,13 +429,13 @@ pub trait CryptoEngineApi {
         associated_data: &[u8],
     ) -> Result<(SessionId, InitiationPacket), CryptoError>;
     fn process_inbound_session(
-        &mut self,
+        &self,
         message: &InitiationPacket,
         conversation_context: &[u8],
         associated_data: &[u8],
     ) -> Result<(SessionId, Vec<u8>), CryptoError>;
     fn process_inbound_session_from_peer(
-        &mut self,
+        &self,
         peer_id: &[u8],
         remote_device_id: Option<&[u8]>,
         message: &InitiationPacket,
@@ -423,14 +443,12 @@ pub trait CryptoEngineApi {
         associated_data: &[u8],
     ) -> Result<(SessionId, Vec<u8>), CryptoError>;
 
-    /// Return the exact persisted outbound initiation for crash-safe retry.
     fn pending_outbound_initiation(
         &self,
         session_id: &SessionId,
     ) -> Result<Option<InitiationPacket>, CryptoError>;
-    /// Clear the persisted retry packet after transport/peer acknowledgement.
     fn acknowledge_outbound_initiation(
-        &mut self,
+        &self,
         session_id: &SessionId,
     ) -> Result<(), CryptoError>;
 
@@ -441,7 +459,7 @@ pub trait CryptoEngineApi {
         remote_device_id: Option<&[u8]>,
     ) -> Result<IdentityState, CryptoError>;
     fn acknowledge_peer_identity(
-        &mut self,
+        &self,
         peer_id: &[u8],
         remote_identity_public: &[u8; 32],
         remote_device_id: Option<&[u8]>,
@@ -449,19 +467,19 @@ pub trait CryptoEngineApi {
     ) -> Result<(), CryptoError>;
 
     fn encrypt(
-        &mut self,
+        &self,
         session_id: &SessionId,
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<SealedMessage, CryptoError>;
     fn encrypt_voice_payload(
-        &mut self,
+        &self,
         session_id: &SessionId,
         voice_payload: &[u8],
         associated_data: &[u8],
     ) -> Result<SealedMessage, CryptoError>;
     fn decrypt(
-        &mut self,
+        &self,
         session_id: &SessionId,
         sealed: &SealedMessage,
         associated_data: &[u8],
@@ -473,13 +491,13 @@ pub trait CryptoEngineApi {
         remote_device_id: Option<&[u8]>,
     ) -> Result<SafetyFingerprint, CryptoError>;
     fn acknowledge_identity_change(
-        &mut self,
+        &self,
         remote_identity_public: &[u8; 32],
         remote_device_id: Option<&[u8]>,
     ) -> Result<(), CryptoError>;
     fn has_session(&self, session_id: &SessionId) -> bool;
-    fn delete_session(&mut self, session_id: &SessionId) -> Result<(), CryptoError>;
-    fn delete_all_sessions(&mut self) -> Result<(), CryptoError>;
+    fn delete_session(&self, session_id: &SessionId) -> Result<(), CryptoError>;
+    fn delete_all_sessions(&self) -> Result<(), CryptoError>;
     fn local_identity_public(&self) -> [u8; 32];
 }
 
@@ -613,11 +631,13 @@ fn init_alice_ratchet(
         )),
         #[cfg(feature = "header-encrypt")]
         CryptoProfile::ClassicalHeV1 => {
-            let (hka, nhkb) = he_keys_from_sk(sk)?;
-            Ok(LiveRatchet::HeaderEncrypt(
-                HeaderEncryptState::init_alice(sk, bob_spk, &hka, &nhkb, DEFAULT_MAX_SKIP)
-                    .map_err(CryptoError::from)?,
-            ))
+            let (mut hka, mut nhkb) = he_keys_from_sk(sk)?;
+            let result = HeaderEncryptState::init_alice(sk, bob_spk, &hka, &nhkb, DEFAULT_MAX_SKIP)
+                .map(LiveRatchet::HeaderEncrypt)
+                .map_err(CryptoError::from);
+            hka.zeroize();
+            nhkb.zeroize();
+            result
         }
         #[cfg(feature = "hybrid")]
         CryptoProfile::HybridPqV1 => Ok(LiveRatchet::Hybrid(
@@ -639,14 +659,11 @@ fn init_bob_ratchet(
         ))),
         #[cfg(feature = "header-encrypt")]
         CryptoProfile::ClassicalHeV1 => {
-            let (hka, nhkb) = he_keys_from_sk(sk)?;
-            Ok(LiveRatchet::HeaderEncrypt(HeaderEncryptState::init_bob(
-                sk,
-                bob_dh,
-                &hka,
-                &nhkb,
-                DEFAULT_MAX_SKIP,
-            )))
+            let (mut hka, mut nhkb) = he_keys_from_sk(sk)?;
+            let state = HeaderEncryptState::init_bob(sk, bob_dh, &hka, &nhkb, DEFAULT_MAX_SKIP);
+            hka.zeroize();
+            nhkb.zeroize();
+            Ok(LiveRatchet::HeaderEncrypt(state))
         }
         #[cfg(feature = "hybrid")]
         CryptoProfile::HybridPqV1 => Ok(LiveRatchet::Hybrid(
@@ -666,9 +683,28 @@ struct LiveSession {
     pending_initiation: Option<Vec<u8>>,
 }
 
+struct SessionEntry {
+    tag: SessionTag,
+    inner: Mutex<LiveSession>,
+}
+
+impl SessionEntry {
+    fn new(session: LiveSession) -> Self {
+        Self {
+            tag: session.session_tag,
+            inner: Mutex::new(session),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Session persistence v2
+// Persistence format
 // ---------------------------------------------------------------------------
+
+fn put_u32_vec(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
 
 fn encode_session(sid: &SessionId, sess: &LiveSession) -> Vec<u8> {
     let ratchet = sess.ratchet.persist_blob();
@@ -691,9 +727,14 @@ fn encode_session(sid: &SessionId, sess: &LiveSession) -> Vec<u8> {
     out
 }
 
-fn put_u32_vec(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
+fn take_bounded_vec(data: &[u8], i: &mut usize, max: usize) -> Result<Vec<u8>, CryptoError> {
+    let n = read_u32(data, i).map_err(|_| CryptoError::Storage)? as usize;
+    if n > max {
+        return Err(CryptoError::Storage);
+    }
+    Ok(take(data, i, n)
+        .map_err(|_| CryptoError::Storage)?
+        .to_vec())
 }
 
 fn decode_session(data: &[u8]) -> Result<(SessionId, LiveSession), CryptoError> {
@@ -709,6 +750,9 @@ fn decode_session(data: &[u8]) -> Result<(SessionId, LiveSession), CryptoError> 
     }
     let mut sid = [0u8; 16];
     sid.copy_from_slice(take(data, &mut i, 16).map_err(|_| CryptoError::Storage)?);
+    if sid == [0u8; 16] {
+        return Err(CryptoError::Storage);
+    }
     let profile = CryptoProfile::from_u8(
         take(data, &mut i, 1).map_err(|_| CryptoError::Storage)?[0],
     )
@@ -753,16 +797,6 @@ fn decode_session(data: &[u8]) -> Result<(SessionId, LiveSession), CryptoError> 
             pending_initiation,
         },
     ))
-}
-
-fn take_bounded_vec(data: &[u8], i: &mut usize, max: usize) -> Result<Vec<u8>, CryptoError> {
-    let n = read_u32(data, i).map_err(|_| CryptoError::Storage)? as usize;
-    if n > max {
-        return Err(CryptoError::Storage);
-    }
-    Ok(take(data, i, n)
-        .map_err(|_| CryptoError::Storage)?
-        .to_vec())
 }
 
 fn load_sessions(
@@ -839,15 +873,16 @@ fn load_state(
         Some(blob) => PeerIdentityStore::deserialize(&blob.0).map_err(CryptoError::from)?,
         None => PeerIdentityStore::new(),
     };
-    let sessions = load_sessions(storage, profile)?;
+    let mut sessions = load_sessions(storage, profile)?;
     let local_identity = identity.public().to_bytes();
-    for session in sessions.values() {
+    for session in sessions.values_mut() {
         if let Some(packet) = &session.pending_initiation {
             let parsed = InitiationPacket::decode(packet).map_err(|_| CryptoError::Storage)?;
             if parsed.sender_identity_public != local_identity {
                 return Err(CryptoError::Storage);
             }
         }
+        session.identity_tracker = trust.tracker_for(&session.remote_identity);
     }
     Ok(LoadedState {
         identity,
@@ -859,26 +894,53 @@ fn load_state(
     })
 }
 
+struct ReplayState {
+    cache: ReplayCache,
+    pending: HashSet<ReplayKey>,
+}
+
+impl ReplayState {
+    fn new(cache: ReplayCache) -> Self {
+        Self {
+            cache,
+            pending: HashSet::new(),
+        }
+    }
+}
+
+struct PersistenceState {
+    storage: Box<dyn TransactionalStorage>,
+    monotonic: Box<dyn MonotonicCounter>,
+    rollback_guard: RollbackGuard,
+}
+
 // ---------------------------------------------------------------------------
-// Engine and persistence
+// Engine
 // ---------------------------------------------------------------------------
 
 pub struct VoiceChatCryptoEngine {
     identity: IdentityKeyPair,
     device_id: Vec<u8>,
     profile: CryptoProfile,
-    prekeys: PrekeyStore,
-    sessions: HashMap<SessionId, LiveSession>,
-    replay: ReplayCache,
-    trust: TrustStore,
-    peer_identities: PeerIdentityStore,
-    storage: Box<dyn TransactionalStorage>,
-    monotonic: Box<dyn MonotonicCounter>,
-    rollback_guard: RollbackGuard,
-    storage_poisoned: bool,
+    prekeys: Mutex<PrekeyStore>,
+    sessions: RwLock<HashMap<SessionId, Arc<SessionEntry>>>,
+    replay: Mutex<ReplayState>,
+    trust: Mutex<TrustStore>,
+    peer_identities: Mutex<PeerIdentityStore>,
+    persistence: Mutex<PersistenceState>,
+    lifecycle: RwLock<()>,
+    storage_poisoned: AtomicBool,
 }
 
 impl VoiceChatCryptoEngine {
+    const KEY_IDENTITY: &'static [u8] = b"identity";
+    const KEY_PREKEYS: &'static [u8] = b"prekeys";
+    const KEY_REPLAY: &'static [u8] = b"replay";
+    const KEY_TRUST: &'static [u8] = b"trust";
+    const KEY_PEER_IDENTITIES: &'static [u8] = b"peer-identities-v1";
+    const KEY_DEVICE_CONFIG: &'static [u8] = b"device-config-v2";
+    const KEY_STORAGE_EPOCH: &'static [u8] = b"storage-epoch-v1";
+
     pub fn initialize_device(config: DeviceConfig) -> Result<Self, CryptoError> {
         Self::initialize_device_with_backends(
             config,
@@ -906,19 +968,22 @@ impl VoiceChatCryptoEngine {
         }
         let identity = IdentityKeyPair::generate().map_err(CryptoError::from)?;
         let prekeys = PrekeyStore::new(&identity).map_err(CryptoError::from)?;
-        let mut engine = Self {
+        let engine = Self {
             identity,
             device_id: config.device_id,
             profile: config.profile,
-            prekeys,
-            sessions: HashMap::new(),
-            replay: ReplayCache::new(DEFAULT_REPLAY_CACHE_SIZE),
-            trust: TrustStore::new(),
-            peer_identities: PeerIdentityStore::new(),
-            storage,
-            monotonic,
-            rollback_guard: RollbackGuard::default(),
-            storage_poisoned: false,
+            prekeys: Mutex::new(prekeys),
+            sessions: RwLock::new(HashMap::new()),
+            replay: Mutex::new(ReplayState::new(ReplayCache::new(DEFAULT_REPLAY_CACHE_SIZE))),
+            trust: Mutex::new(TrustStore::new()),
+            peer_identities: Mutex::new(PeerIdentityStore::new()),
+            persistence: Mutex::new(PersistenceState {
+                storage,
+                monotonic,
+                rollback_guard: RollbackGuard::default(),
+            }),
+            lifecycle: RwLock::new(()),
+            storage_poisoned: AtomicBool::new(false),
         };
         engine.persist_device_state()?;
         Ok(engine)
@@ -938,7 +1003,11 @@ impl VoiceChatCryptoEngine {
             return Err(CryptoError::Storage);
         }
         let persisted_epoch = u64::from_le_bytes(
-            epoch_blob.0.as_slice().try_into().map_err(|_| CryptoError::Storage)?,
+            epoch_blob
+                .0
+                .as_slice()
+                .try_into()
+                .map_err(|_| CryptoError::Storage)?,
         );
         let counter_epoch = monotonic.current().map_err(|_| CryptoError::Storage)?;
         if persisted_epoch != counter_epoch {
@@ -946,143 +1015,109 @@ impl VoiceChatCryptoEngine {
         }
         ensure_config_matches(storage.as_ref(), &config)?;
         let loaded = load_state(storage.as_ref(), config.profile)?;
-
         let mut rollback_guard = RollbackGuard::default();
         rollback_guard
             .observe(StorageEpoch(persisted_epoch))
             .map_err(|_| CryptoError::Storage)?;
-        let mut engine = Self {
+        let sessions = loaded
+            .sessions
+            .into_iter()
+            .map(|(id, session)| (id, Arc::new(SessionEntry::new(session))))
+            .collect();
+        Ok(Self {
             identity: loaded.identity,
             device_id: config.device_id,
             profile: config.profile,
-            prekeys: loaded.prekeys,
-            sessions: loaded.sessions,
-            replay: loaded.replay,
-            trust: loaded.trust,
-            peer_identities: loaded.peer_identities,
-            storage,
-            monotonic,
-            rollback_guard,
-            storage_poisoned: false,
-        };
-        engine.restore_identity_trackers();
-        Ok(engine)
+            prekeys: Mutex::new(loaded.prekeys),
+            sessions: RwLock::new(sessions),
+            replay: Mutex::new(ReplayState::new(loaded.replay)),
+            trust: Mutex::new(loaded.trust),
+            peer_identities: Mutex::new(loaded.peer_identities),
+            persistence: Mutex::new(PersistenceState {
+                storage,
+                monotonic,
+                rollback_guard,
+            }),
+            lifecycle: RwLock::new(()),
+            storage_poisoned: AtomicBool::new(false),
+        })
     }
 
-    const KEY_IDENTITY: &'static [u8] = b"identity";
-    const KEY_PREKEYS: &'static [u8] = b"prekeys";
-    const KEY_REPLAY: &'static [u8] = b"replay";
-    const KEY_TRUST: &'static [u8] = b"trust";
-    const KEY_PEER_IDENTITIES: &'static [u8] = b"peer-identities-v1";
-    const KEY_DEVICE_CONFIG: &'static [u8] = b"device-config-v2";
-    const KEY_STORAGE_EPOCH: &'static [u8] = b"storage-epoch-v1";
-
-    fn restore_identity_trackers(&mut self) {
-        for sess in self.sessions.values_mut() {
-            sess.identity_tracker = self.trust.tracker_for(&sess.remote_identity);
-        }
+    fn mutex<'a, T>(&self, mutex: &'a Mutex<T>) -> Result<MutexGuard<'a, T>, CryptoError> {
+        mutex.lock().map_err(|_| {
+            self.storage_poisoned.store(true, Ordering::Release);
+            CryptoError::Internal
+        })
     }
 
-    fn persisted_config(&self) -> Vec<u8> {
-        encode_device_config(&self.device_id, self.profile)
+    fn read_lock<'a, T>(&self, lock: &'a RwLock<T>) -> Result<RwLockReadGuard<'a, T>, CryptoError> {
+        lock.read().map_err(|_| {
+            self.storage_poisoned.store(true, Ordering::Release);
+            CryptoError::Internal
+        })
     }
 
-    fn persist_device_state(&mut self) -> Result<(), CryptoError> {
-        let identity = self.identity.serialize();
-        let prekeys = self.prekeys.serialize();
-        let replay = self.replay.serialize();
-        let trust = self.trust.serialize();
-        let peers = self.peer_identities.serialize();
-        let config = self.persisted_config();
-        self.commit_pairs(&[
-            (Self::KEY_IDENTITY, identity),
-            (Self::KEY_PREKEYS, prekeys),
-            (Self::KEY_REPLAY, replay),
-            (Self::KEY_TRUST, trust),
-            (Self::KEY_PEER_IDENTITIES, peers),
-            (Self::KEY_DEVICE_CONFIG, config),
-        ])
-    }
-
-    fn persist_session_aux(&mut self, session_id: &SessionId) -> Result<(), CryptoError> {
-        let blob = {
-            let sess = self.sessions.get(session_id).ok_or(CryptoError::NoSession)?;
-            encode_session(session_id, sess)
-        };
-        let replay = self.replay.serialize();
-        let trust = self.trust.serialize();
-        let peers = self.peer_identities.serialize();
-        self.commit_pairs(&[
-            (session_id.0.as_slice(), blob),
-            (Self::KEY_REPLAY, replay),
-            (Self::KEY_TRUST, trust),
-            (Self::KEY_PEER_IDENTITIES, peers),
-        ])
-    }
-
-    fn persist_handshake(&mut self, session_id: &SessionId) -> Result<(), CryptoError> {
-        let blob = {
-            let sess = self.sessions.get(session_id).ok_or(CryptoError::NoSession)?;
-            encode_session(session_id, sess)
-        };
-        let identity = self.identity.serialize();
-        let prekeys = self.prekeys.serialize();
-        let replay = self.replay.serialize();
-        let trust = self.trust.serialize();
-        let peers = self.peer_identities.serialize();
-        let config = self.persisted_config();
-        self.commit_pairs(&[
-            (Self::KEY_IDENTITY, identity),
-            (Self::KEY_PREKEYS, prekeys),
-            (session_id.0.as_slice(), blob),
-            (Self::KEY_REPLAY, replay),
-            (Self::KEY_TRUST, trust),
-            (Self::KEY_PEER_IDENTITIES, peers),
-            (Self::KEY_DEVICE_CONFIG, config),
-        ])
+    fn write_lock<'a, T>(&self, lock: &'a RwLock<T>) -> Result<RwLockWriteGuard<'a, T>, CryptoError> {
+        lock.write().map_err(|_| {
+            self.storage_poisoned.store(true, Ordering::Release);
+            CryptoError::Internal
+        })
     }
 
     fn ensure_storage_healthy(&self) -> Result<(), CryptoError> {
-        if self.storage_poisoned {
+        if self.storage_poisoned.load(Ordering::Acquire) {
             Err(CryptoError::Storage)
         } else {
             Ok(())
         }
     }
 
-    fn poison_storage<T>(&mut self) -> Result<T, CryptoError> {
-        self.storage_poisoned = true;
+    fn poison<T>(&self) -> Result<T, CryptoError> {
+        self.storage_poisoned.store(true, Ordering::Release);
         Err(CryptoError::Storage)
     }
 
+    fn lifecycle_read(&self) -> Result<RwLockReadGuard<'_, ()>, CryptoError> {
+        self.read_lock(&self.lifecycle)
+    }
+
+    fn lifecycle_write(&self) -> Result<RwLockWriteGuard<'_, ()>, CryptoError> {
+        self.write_lock(&self.lifecycle)
+    }
+
+    fn persisted_config(&self) -> Vec<u8> {
+        encode_device_config(&self.device_id, self.profile)
+    }
+
     fn commit_changes(
-        &mut self,
-        pairs: &[(&[u8], Vec<u8>)],
-        deletes: &[&[u8]],
+        &self,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        deletes: &[Vec<u8>],
     ) -> Result<(), CryptoError> {
         self.ensure_storage_healthy()?;
-        let epoch = match self.monotonic.increment() {
-            Ok(v) if v > self.rollback_guard.last_seen() => v,
-            _ => return self.poison_storage(),
+        let mut p = self.mutex(&self.persistence)?;
+        self.ensure_storage_healthy()?;
+        let epoch = match p.monotonic.increment() {
+            Ok(v) if v > p.rollback_guard.last_seen() => v,
+            _ => return self.poison(),
         };
-        let tx = match self.storage.begin() {
+        let tx = match p.storage.begin() {
             Ok(tx) => tx,
-            Err(_) => return self.poison_storage(),
+            Err(_) => return self.poison(),
         };
         for (key, value) in pairs {
-            if self.storage.put(tx, key, &StateBlob(value.clone())).is_err() {
-                let _ = self.storage.abort(tx);
-                return self.poison_storage();
+            if p.storage.put(tx, key, &StateBlob(value.clone())).is_err() {
+                let _ = p.storage.abort(tx);
+                return self.poison();
             }
         }
         for key in deletes {
-            if self.storage.delete(tx, key).is_err() {
-                let _ = self.storage.abort(tx);
-                return self.poison_storage();
+            if p.storage.delete(tx, key).is_err() {
+                let _ = p.storage.abort(tx);
+                return self.poison();
             }
         }
-        if self
-            .storage
+        if p.storage
             .put(
                 tx,
                 Self::KEY_STORAGE_EPOCH,
@@ -1090,60 +1125,111 @@ impl VoiceChatCryptoEngine {
             )
             .is_err()
         {
-            let _ = self.storage.abort(tx);
-            return self.poison_storage();
+            let _ = p.storage.abort(tx);
+            return self.poison();
         }
-        if self.storage.commit(tx).is_err() {
-            return self.poison_storage();
+        if p.storage.commit(tx).is_err() {
+            return self.poison();
         }
-        if self.rollback_guard.observe(StorageEpoch(epoch)).is_err() {
-            return self.poison_storage();
+        if p.rollback_guard.observe(StorageEpoch(epoch)).is_err() {
+            return self.poison();
         }
         Ok(())
     }
 
-    fn commit_pairs(&mut self, pairs: &[(&[u8], Vec<u8>)]) -> Result<(), CryptoError> {
-        self.commit_changes(pairs, &[])
+    fn persist_device_state(&self) -> Result<(), CryptoError> {
+        let prekeys = self.mutex(&self.prekeys)?.serialize();
+        let replay = self.mutex(&self.replay)?.cache.serialize();
+        let trust = self.mutex(&self.trust)?.serialize();
+        let peers = self.mutex(&self.peer_identities)?.serialize();
+        self.commit_changes(
+            &[
+                (Self::KEY_IDENTITY.to_vec(), self.identity.serialize()),
+                (Self::KEY_PREKEYS.to_vec(), prekeys),
+                (Self::KEY_REPLAY.to_vec(), replay),
+                (Self::KEY_TRUST.to_vec(), trust),
+                (Self::KEY_PEER_IDENTITIES.to_vec(), peers),
+                (Self::KEY_DEVICE_CONFIG.to_vec(), self.persisted_config()),
+            ],
+            &[],
+        )
     }
 
-    fn verify_storage_epoch(&mut self) -> Result<(), CryptoError> {
+    fn persist_session_only(&self, session_id: &SessionId, session: &LiveSession) -> Result<(), CryptoError> {
+        self.commit_changes(
+            &[(session_id.0.to_vec(), encode_session(session_id, session))],
+            &[],
+        )
+    }
+
+    fn persist_handshake(&self, session_id: &SessionId, session: &LiveSession) -> Result<(), CryptoError> {
+        let prekeys = self.mutex(&self.prekeys)?.serialize();
+        let replay = self.mutex(&self.replay)?.cache.serialize();
+        let trust = self.mutex(&self.trust)?.serialize();
+        let peers = self.mutex(&self.peer_identities)?.serialize();
+        self.commit_changes(
+            &[
+                (Self::KEY_IDENTITY.to_vec(), self.identity.serialize()),
+                (Self::KEY_PREKEYS.to_vec(), prekeys),
+                (session_id.0.to_vec(), encode_session(session_id, session)),
+                (Self::KEY_REPLAY.to_vec(), replay),
+                (Self::KEY_TRUST.to_vec(), trust),
+                (Self::KEY_PEER_IDENTITIES.to_vec(), peers),
+                (Self::KEY_DEVICE_CONFIG.to_vec(), self.persisted_config()),
+            ],
+            &[],
+        )
+    }
+
+    fn verify_storage_epoch_locked(&self, p: &mut PersistenceState) -> Result<(), CryptoError> {
         self.ensure_storage_healthy()?;
-        let blob = match self.storage.get(Self::KEY_STORAGE_EPOCH) {
+        let blob = match p.storage.get(Self::KEY_STORAGE_EPOCH) {
             Ok(Some(blob)) => blob,
-            _ => return self.poison_storage(),
+            _ => return self.poison(),
         };
         if blob.0.len() != 8 {
-            return self.poison_storage();
+            return self.poison();
         }
-        let persisted = u64::from_le_bytes(blob.0.as_slice().try_into().unwrap());
-        let current = match self.monotonic.current() {
+        let persisted = u64::from_le_bytes(
+            blob.0
+                .as_slice()
+                .try_into()
+                .map_err(|_| CryptoError::Storage)?,
+        );
+        let current = match p.monotonic.current() {
             Ok(v) => v,
-            Err(_) => return self.poison_storage(),
+            Err(_) => return self.poison(),
         };
-        if persisted != current || self.rollback_guard.observe(StorageEpoch(persisted)).is_err() {
-            return self.poison_storage();
+        if persisted != current || p.rollback_guard.observe(StorageEpoch(persisted)).is_err() {
+            return self.poison();
         }
         Ok(())
     }
 
     fn ensure_session_capacity(&self) -> Result<(), CryptoError> {
-        if self.sessions.len() >= MAX_SESSIONS {
+        if self.read_lock(&self.sessions)?.len() >= MAX_SESSIONS {
             Err(CryptoError::LimitExceeded)
         } else {
             Ok(())
         }
     }
 
-    fn session_tag_in_use(&self, tag: SessionTag) -> bool {
-        self.sessions.values().any(|session| session.session_tag == tag)
+    fn session_tag_in_use(&self, tag: SessionTag) -> Result<bool, CryptoError> {
+        Ok(self
+            .read_lock(&self.sessions)?
+            .values()
+            .any(|entry| entry.tag == tag))
     }
 
     fn next_session_id(&self) -> Result<SessionId, CryptoError> {
         for _ in 0..8 {
             let mut id = [0u8; 16];
             crate::primitives::random::fill_random(&mut id).map_err(CryptoError::from)?;
+            if id == [0u8; 16] {
+                continue;
+            }
             let sid = SessionId(id);
-            if id != [0u8; 16] && !self.sessions.contains_key(&sid) {
+            if !self.read_lock(&self.sessions)?.contains_key(&sid) {
                 return Ok(sid);
             }
         }
@@ -1155,11 +1241,18 @@ impl VoiceChatCryptoEngine {
             let mut tag = [0u8; 16];
             crate::primitives::random::fill_random(&mut tag).map_err(CryptoError::from)?;
             let candidate = SessionTag(tag);
-            if !candidate.is_zero() && !self.session_tag_in_use(candidate) {
+            if !candidate.is_zero() && !self.session_tag_in_use(candidate)? {
                 return Ok(candidate);
             }
         }
         Err(CryptoError::Internal)
+    }
+
+    fn session_entry(&self, session_id: &SessionId) -> Result<Arc<SessionEntry>, CryptoError> {
+        self.read_lock(&self.sessions)?
+            .get(session_id)
+            .cloned()
+            .ok_or(CryptoError::NoSession)
     }
 
     fn validate_sealed_for_session(
@@ -1215,11 +1308,7 @@ impl VoiceChatCryptoEngine {
         }
     }
 
-    fn initiation_replay_key(
-        &self,
-        message: &InitiationPacket,
-        conversation: &[u8],
-    ) -> ReplayKey {
+    fn initiation_replay_key(message: &InitiationPacket, conversation: &[u8]) -> ReplayKey {
         let version = message.protocol_version.to_le_bytes();
         let profile = [message.profile.as_u8()];
         let kem_len = (message.kem_ciphertext.len() as u64).to_le_bytes();
@@ -1258,49 +1347,6 @@ impl VoiceChatCryptoEngine {
         }
     }
 
-    fn apply_decrypt(
-        &mut self,
-        session_id: &SessionId,
-        sealed: &SealedMessage,
-        associated_data: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        let rkey = {
-            let sess = self.sessions.get(session_id).ok_or(CryptoError::NoSession)?;
-            Self::validate_sealed_for_session(sess, sealed)?;
-            Self::replay_key(sess, sealed)
-        };
-        if self.replay.contains(&rkey) {
-            return Err(CryptoError::Replay);
-        }
-        let sess = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(CryptoError::NoSession)?;
-        let ad = Self::bound_ad(sess, associated_data)?;
-        let plaintext = sess
-            .ratchet
-            .decrypt(&sealed.header, &sealed.ciphertext, &ad)?;
-        if self.replay.check_and_insert(rkey).is_err() {
-            self.storage_poisoned = true;
-            return Err(CryptoError::Internal);
-        }
-        Ok(plaintext)
-    }
-
-    fn check_peer(
-        &self,
-        peer_id: &[u8],
-        material: &IdentityMaterial,
-    ) -> Result<bool, CryptoError> {
-        validate_peer_id_input(peer_id)?;
-        validate_identity_material(material).map_err(CryptoError::from)?;
-        match self.peer_identities.observe(peer_id, material) {
-            IdentityState::IdentityChanged { .. } => Err(CryptoError::IdentityChanged),
-            IdentityState::Unknown => Ok(true),
-            IdentityState::Verified => Ok(false),
-        }
-    }
-
     fn peer_material(
         remote_identity_public: &[u8; 32],
         remote_device_id: Option<&[u8]>,
@@ -1314,14 +1360,51 @@ impl VoiceChatCryptoEngine {
         Ok(material)
     }
 
+    fn check_peer(&self, peer_id: &[u8], material: &IdentityMaterial) -> Result<bool, CryptoError> {
+        validate_peer_id_input(peer_id)?;
+        validate_identity_material(material).map_err(CryptoError::from)?;
+        match self.mutex(&self.peer_identities)?.observe(peer_id, material) {
+            IdentityState::IdentityChanged { .. } => Err(CryptoError::IdentityChanged),
+            IdentityState::Unknown => Ok(true),
+            IdentityState::Verified => Ok(false),
+        }
+    }
+
+    fn restore_identity_trackers(&self) -> Result<(), CryptoError> {
+        let trust = self.mutex(&self.trust)?.clone();
+        let sessions: Vec<Arc<SessionEntry>> = self
+            .read_lock(&self.sessions)?
+            .values()
+            .cloned()
+            .collect();
+        for entry in sessions {
+            let mut session = self.mutex(&entry.inner)?;
+            session.identity_tracker = trust.tracker_for(&session.remote_identity);
+        }
+        Ok(())
+    }
+
+    fn restore_prekeys_from(&self, bytes: &[u8]) -> Result<(), CryptoError> {
+        let restored = PrekeyStore::deserialize(bytes).map_err(CryptoError::from)?;
+        *self.mutex(&self.prekeys)? = restored;
+        Ok(())
+    }
+
+    fn restore_replay_from(&self, bytes: &[u8]) -> Result<(), CryptoError> {
+        let restored = ReplayCache::deserialize(bytes).map_err(CryptoError::from)?;
+        *self.mutex(&self.replay)? = ReplayState::new(restored);
+        Ok(())
+    }
+
     fn establish_outbound_impl(
-        &mut self,
+        &self,
         peer: Option<(&[u8], IdentityMaterial)>,
         remote_bundle: &PublicPrekeyBundle,
         conversation_context: &[u8],
         first_plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<(SessionId, InitiationPacket), CryptoError> {
+        let _life = self.lifecycle_write()?;
         self.ensure_storage_healthy()?;
         self.ensure_session_capacity()?;
         validate_context_lengths(conversation_context, associated_data)?;
@@ -1344,20 +1427,21 @@ impl VoiceChatCryptoEngine {
         let sid = self.next_session_id()?;
         let session_tag = self.next_session_tag()?;
         let remote_identity = remote_bundle.identity_key;
+        let tracker = self.mutex(&self.trust)?.tracker_for(&remote_identity);
         let mut session = LiveSession {
             profile: self.profile,
             session_tag,
             ratchet,
             remote_identity,
             conversation: conversation_context.to_vec(),
-            identity_tracker: self.trust.tracker_for(&remote_identity),
+            identity_tracker: tracker,
             handshake_ad: initiation.shared.ad.clone(),
             pending_initiation: None,
         };
         let ad = Self::bound_ad(&session, associated_data)?;
         let (header, ciphertext) = session.ratchet.encrypt(first_plaintext, &ad)?;
         if header.len() > MAX_HEADER_LEN || ciphertext.len() > MAX_CIPHERTEXT_LEN {
-            return Err(CryptoError::LimitExceeded);
+            return self.poison().map_err(|_| CryptoError::Internal);
         }
         let first_message = SealedMessage {
             protocol_version: PROTOCOL_VERSION,
@@ -1383,35 +1467,54 @@ impl VoiceChatCryptoEngine {
         }
         session.pending_initiation = Some(pending);
 
-        if should_record_peer {
-            if let Some((peer_id, material)) = peer {
-                self.peer_identities
-                    .record_seen(peer_id, material)
-                    .map_err(CryptoError::from)?;
+        let trust_before = self.mutex(&self.trust)?.clone();
+        let peers_before = self.mutex(&self.peer_identities)?.clone();
+        {
+            if should_record_peer {
+                if let Some((peer_id, material)) = &peer {
+                    self.mutex(&self.peer_identities)?
+                        .record_seen(peer_id, material.clone())
+                        .map_err(CryptoError::from)?;
+                }
+            }
+            self.mutex(&self.trust)?.record_seen(IdentityMaterial {
+                identity_key: remote_identity,
+                device_id: None,
+            });
+        }
+
+        let entry = Arc::new(SessionEntry::new(session));
+        {
+            let mut sessions = self.write_lock(&self.sessions)?;
+            if sessions.insert(sid.clone(), entry.clone()).is_some() {
+                *self.mutex(&self.trust)? = trust_before;
+                *self.mutex(&self.peer_identities)? = peers_before;
+                self.storage_poisoned.store(true, Ordering::Release);
+                return Err(CryptoError::Internal);
             }
         }
-        self.trust.record_seen(IdentityMaterial {
-            identity_key: remote_identity,
-            device_id: None,
-        });
-        if self.sessions.insert(sid.clone(), session).is_some() {
-            self.storage_poisoned = true;
-            return Err(CryptoError::Internal);
-        }
-        if let Err(e) = self.persist_handshake(&sid) {
-            self.sessions.remove(&sid);
+
+        let persist_result = {
+            let session = self.mutex(&entry.inner)?;
+            self.persist_handshake(&sid, &session)
+        };
+        if let Err(e) = persist_result {
+            self.write_lock(&self.sessions)?.remove(&sid);
+            *self.mutex(&self.trust)? = trust_before;
+            *self.mutex(&self.peer_identities)? = peers_before;
             return Err(e);
         }
         Ok((sid, packet))
     }
 
     fn process_inbound_impl(
-        &mut self,
+        &self,
         peer: Option<(&[u8], IdentityMaterial)>,
         message: &InitiationPacket,
         conversation_context: &[u8],
         associated_data: &[u8],
     ) -> Result<(SessionId, Vec<u8>), CryptoError> {
+        let _life = self.lifecycle_write()?;
         self.ensure_storage_healthy()?;
         self.ensure_session_capacity()?;
         validate_context_lengths(conversation_context, associated_data)?;
@@ -1429,128 +1532,188 @@ impl VoiceChatCryptoEngine {
         {
             return Err(CryptoError::LimitExceeded);
         }
-        if self.session_tag_in_use(message.first_message.session_tag) {
+        if self.session_tag_in_use(message.first_message.session_tag)? {
             return Err(CryptoError::CryptoFailure);
         }
         let should_record_peer = match &peer {
             Some((peer_id, material)) => self.check_peer(peer_id, material)?,
             None => false,
         };
-        let initiation_replay = self.initiation_replay_key(message, conversation_context);
-        if self.replay.contains(&initiation_replay) {
-            return Err(CryptoError::Replay);
+        let initiation_replay = Self::initiation_replay_key(message, conversation_context);
+        {
+            let replay = self.mutex(&self.replay)?;
+            if replay.cache.contains(&initiation_replay) || replay.pending.contains(&initiation_replay) {
+                return Err(CryptoError::Replay);
+            }
         }
 
         let alice_ik =
             X25519Public::from_bytes(message.sender_identity_public).map_err(CryptoError::from)?;
         let alice_ek =
             X25519Public::from_bytes(message.sender_ephemeral_public).map_err(CryptoError::from)?;
-        let signed = self
-            .prekeys
-            .signed_prekey(message.used_spk_id)
-            .map_err(CryptoError::from)?;
-        let peeked_ec = match message.used_ec_opk_id {
-            Some(id) => Some(self.prekeys.peek_ec(id).map_err(CryptoError::from)?.clone()),
-            None => None,
-        };
-        let last_resort = self.prekeys.is_last_resort_pq(message.pq_prekey_id);
-        let peeked_pq = if last_resort {
-            None
-        } else {
-            Some(
-                self.prekeys
-                    .peek_pq(message.pq_prekey_id)
+
+        let (ratchet, handshake_ad, last_resort) = {
+            let prekeys = self.mutex(&self.prekeys)?;
+            let signed = prekeys
+                .signed_prekey(message.used_spk_id)
+                .map_err(CryptoError::from)?;
+            let peeked_ec = match message.used_ec_opk_id {
+                Some(id) => Some(prekeys.peek_ec(id).map_err(CryptoError::from)?.clone()),
+                None => None,
+            };
+            let last_resort = prekeys.is_last_resort_pq(message.pq_prekey_id);
+            let peeked_pq = if last_resort {
+                None
+            } else {
+                Some(
+                    prekeys
+                        .peek_pq(message.pq_prekey_id)
+                        .map_err(CryptoError::from)?
+                        .clone(),
+                )
+            };
+            let pq_secret = if let Some(ref pq) = peeked_pq {
+                &pq.secret
+            } else {
+                &prekeys
+                    .last_resort_pq(message.pq_prekey_id)
                     .map_err(CryptoError::from)?
-                    .clone(),
+                    .secret
+            };
+            let pq_public = pq_secret.public_key().map_err(CryptoError::from)?;
+            let bob_mat = BobPrivateMaterial {
+                identity: &self.identity,
+                signed_prekey: signed,
+                one_time_ec: peeked_ec.as_ref(),
+                pq_secret,
+                pq_public: &pq_public,
+                pq_prekey_id: message.pq_prekey_id,
+            };
+            let shared = bob_process(
+                &bob_mat,
+                &alice_ik,
+                &alice_ek,
+                &message.kem_ciphertext,
+                message.used_ec_opk_id,
             )
+            .map_err(CryptoError::from)?;
+            let bob_dh = X25519Secret::from_bytes(signed.secret.to_bytes());
+            let ratchet = init_bob_ratchet(self.profile, &shared.sk, bob_dh)?;
+            (ratchet, shared.ad, last_resort)
         };
-        let pq_secret = if let Some(ref pq) = peeked_pq {
-            &pq.secret
-        } else {
-            &self
-                .prekeys
-                .last_resort_pq(message.pq_prekey_id)
-                .map_err(CryptoError::from)?
-                .secret
-        };
-        let pq_public = pq_secret.public_key().map_err(CryptoError::from)?;
-        let bob_mat = BobPrivateMaterial {
-            identity: &self.identity,
-            signed_prekey: signed,
-            one_time_ec: peeked_ec.as_ref(),
-            pq_secret,
-            pq_public: &pq_public,
-            pq_prekey_id: message.pq_prekey_id,
-        };
-        let shared = bob_process(
-            &bob_mat,
-            &alice_ik,
-            &alice_ek,
-            &message.kem_ciphertext,
-            message.used_ec_opk_id,
-        )
-        .map_err(CryptoError::from)?;
-        let bob_dh = X25519Secret::from_bytes(signed.secret.to_bytes());
-        let ratchet = init_bob_ratchet(self.profile, &shared.sk, bob_dh)?;
+
         let sid = self.next_session_id()?;
-        let session = LiveSession {
+        let tracker = self.mutex(&self.trust)?.tracker_for(&alice_ik);
+        let mut session = LiveSession {
             profile: self.profile,
             session_tag: message.first_message.session_tag,
             ratchet,
             remote_identity: alice_ik,
             conversation: conversation_context.to_vec(),
-            identity_tracker: self.trust.tracker_for(&alice_ik),
-            handshake_ad: shared.ad,
+            identity_tracker: tracker,
+            handshake_ad,
             pending_initiation: None,
         };
-        if self.sessions.insert(sid.clone(), session).is_some() {
-            self.storage_poisoned = true;
-            return Err(CryptoError::Internal);
-        }
-
-        let plaintext = match self.apply_decrypt(&sid, &message.first_message, associated_data) {
-            Ok(pt) => pt,
-            Err(e) => {
-                self.sessions.remove(&sid);
-                return Err(e);
-            }
-        };
-
-        // From this point ratchet/replay state has authenticated and advanced.
-        // Any unexpected failure before durable commit makes this process state
-        // unrecoverable; fail closed instead of continuing from a split view.
-        if self.replay.check_and_insert(initiation_replay).is_err() {
-            self.storage_poisoned = true;
-            self.sessions.remove(&sid);
-            return Err(CryptoError::Internal);
-        }
-        if let Some(id) = message.used_ec_opk_id {
-            if self.prekeys.consume_ec(id).is_err() {
-                self.storage_poisoned = true;
-                self.sessions.remove(&sid);
-                return Err(CryptoError::Internal);
+        Self::validate_sealed_for_session(&session, &message.first_message)?;
+        let message_replay = Self::replay_key(&session, &message.first_message);
+        {
+            let replay = self.mutex(&self.replay)?;
+            if replay.cache.contains(&message_replay) || replay.pending.contains(&message_replay) {
+                return Err(CryptoError::Replay);
             }
         }
-        if !last_resort && self.prekeys.consume_pq(message.pq_prekey_id).is_err() {
-            self.storage_poisoned = true;
-            self.sessions.remove(&sid);
-            return Err(CryptoError::Internal);
-        }
-        if should_record_peer {
-            if let Some((peer_id, material)) = peer {
-                if self.peer_identities.record_seen(peer_id, material).is_err() {
-                    self.storage_poisoned = true;
-                    self.sessions.remove(&sid);
-                    return Err(CryptoError::Internal);
+        let ad = Self::bound_ad(&session, associated_data)?;
+        let plaintext = session
+            .ratchet
+            .decrypt(
+                &message.first_message.header,
+                &message.first_message.ciphertext,
+                &ad,
+            )?;
+
+        // The first message authenticated. All mutable global state from here to
+        // the durable commit is treated as one trial transaction and restored on
+        // any local failure. A storage ambiguity still poisons the engine.
+        let prekeys_before = self.mutex(&self.prekeys)?.serialize();
+        let replay_before = self.mutex(&self.replay)?.cache.serialize();
+        let trust_before = self.mutex(&self.trust)?.clone();
+        let peers_before = self.mutex(&self.peer_identities)?.clone();
+
+        let trial_result = (|| -> Result<(), CryptoError> {
+            {
+                let mut prekeys = self.mutex(&self.prekeys)?;
+                if let Some(id) = message.used_ec_opk_id {
+                    prekeys.consume_ec(id).map_err(CryptoError::from)?;
+                }
+                if !last_resort {
+                    prekeys
+                        .consume_pq(message.pq_prekey_id)
+                        .map_err(CryptoError::from)?;
                 }
             }
+            {
+                let mut replay = self.mutex(&self.replay)?;
+                if replay
+                    .cache
+                    .check_and_insert(message_replay.clone())
+                    .map_err(CryptoError::from)?
+                {
+                    return Err(CryptoError::Replay);
+                }
+                if replay
+                    .cache
+                    .check_and_insert(initiation_replay.clone())
+                    .map_err(CryptoError::from)?
+                {
+                    return Err(CryptoError::Replay);
+                }
+            }
+            if should_record_peer {
+                if let Some((peer_id, material)) = &peer {
+                    self.mutex(&self.peer_identities)?
+                        .record_seen(peer_id, material.clone())
+                        .map_err(CryptoError::from)?;
+                }
+            }
+            self.mutex(&self.trust)?.record_seen(IdentityMaterial {
+                identity_key: alice_ik,
+                device_id: None,
+            });
+            Ok(())
+        })();
+        if let Err(e) = trial_result {
+            let _ = self.restore_prekeys_from(&prekeys_before);
+            let _ = self.restore_replay_from(&replay_before);
+            *self.mutex(&self.trust)? = trust_before;
+            *self.mutex(&self.peer_identities)? = peers_before;
+            self.storage_poisoned.store(true, Ordering::Release);
+            return Err(e);
         }
-        self.trust.record_seen(IdentityMaterial {
-            identity_key: alice_ik,
-            device_id: None,
-        });
-        if let Err(e) = self.persist_handshake(&sid) {
-            self.sessions.remove(&sid);
+
+        let entry = Arc::new(SessionEntry::new(session));
+        if self
+            .write_lock(&self.sessions)?
+            .insert(sid.clone(), entry.clone())
+            .is_some()
+        {
+            let _ = self.restore_prekeys_from(&prekeys_before);
+            let _ = self.restore_replay_from(&replay_before);
+            *self.mutex(&self.trust)? = trust_before;
+            *self.mutex(&self.peer_identities)? = peers_before;
+            self.storage_poisoned.store(true, Ordering::Release);
+            return Err(CryptoError::Internal);
+        }
+
+        let persist_result = {
+            let session = self.mutex(&entry.inner)?;
+            self.persist_handshake(&sid, &session)
+        };
+        if let Err(e) = persist_result {
+            self.write_lock(&self.sessions)?.remove(&sid);
+            let _ = self.restore_prekeys_from(&prekeys_before);
+            let _ = self.restore_replay_from(&replay_before);
+            *self.mutex(&self.trust)? = trust_before;
+            *self.mutex(&self.peer_identities)? = peers_before;
             return Err(e);
         }
         Ok((sid, plaintext))
@@ -1561,46 +1724,45 @@ impl VoiceChatCryptoEngine {
         remote_identity_public: &[u8; 32],
         remote_device_id: Option<&[u8]>,
     ) -> Result<IdentityState, CryptoError> {
+        let _life = self.lifecycle_read()?;
+        self.ensure_storage_healthy()?;
         let mat = Self::peer_material(remote_identity_public, remote_device_id)?;
-        Ok(self.trust.tracker_for(&mat.identity_key).observe(&mat))
+        Ok(self.mutex(&self.trust)?.tracker_for(&mat.identity_key).observe(&mat))
     }
 
-    pub fn simulate_crash_reload(&mut self) -> Result<(), CryptoError> {
-        self.verify_storage_epoch()?;
+    pub fn simulate_crash_reload(&self) -> Result<(), CryptoError> {
+        let _life = self.lifecycle_write()?;
+        self.ensure_storage_healthy()?;
         let expected = DeviceConfig {
             device_id: self.device_id.clone(),
             profile: self.profile,
         };
-        if ensure_config_matches(self.storage.as_ref(), &expected).is_err() {
-            return self.poison_storage();
-        }
-        let loaded = match load_state(self.storage.as_ref(), self.profile) {
-            Ok(state) => state,
-            Err(_) => return self.poison_storage(),
+
+        let loaded = {
+            let mut p = self.mutex(&self.persistence)?;
+            self.verify_storage_epoch_locked(&mut p)?;
+            if ensure_config_matches(p.storage.as_ref(), &expected).is_err() {
+                return self.poison();
+            }
+            match load_state(p.storage.as_ref(), self.profile) {
+                Ok(state) => state,
+                Err(_) => return self.poison(),
+            }
         };
 
-        // Nothing above mutates live cryptographic state. Swap only after the
-        // complete durable snapshot has been parsed and cross-validated.
-        self.identity = loaded.identity;
-        self.prekeys = loaded.prekeys;
-        self.sessions = loaded.sessions;
-        self.replay = loaded.replay;
-        self.trust = loaded.trust;
-        self.peer_identities = loaded.peer_identities;
-        self.restore_identity_trackers();
+        *self.mutex(&self.prekeys)? = loaded.prekeys;
+        *self.mutex(&self.replay)? = ReplayState::new(loaded.replay);
+        *self.mutex(&self.trust)? = loaded.trust;
+        *self.mutex(&self.peer_identities)? = loaded.peer_identities;
+        let sessions = loaded
+            .sessions
+            .into_iter()
+            .map(|(id, session)| (id, Arc::new(SessionEntry::new(session))))
+            .collect();
+        *self.write_lock(&self.sessions)? = sessions;
+        self.restore_identity_trackers()?;
         Ok(())
     }
-}
-
-fn validate_device_id(device_id: &[u8]) -> Result<(), CryptoError> {
-    if device_id.is_empty() || device_id.len() > MAX_DEVICE_ID_LEN {
-        return Err(CryptoError::InvalidArgument);
-    }
-    Ok(())
-}
-
-fn contains_seq(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -1609,50 +1771,98 @@ fn contains_seq(hay: &[u8], needle: &[u8]) -> bool {
 
 impl CryptoEngineApi for VoiceChatCryptoEngine {
     fn generate_public_prekey_bundle(
-        &mut self,
+        &self,
         one_time_count: usize,
     ) -> Result<PublicPrekeyBundle, CryptoError> {
+        let _life = self.lifecycle_write()?;
         self.ensure_storage_healthy()?;
-        self.prekeys
-            .replenish(&self.identity, one_time_count, one_time_count)
-            .map_err(CryptoError::from)?;
-        self.persist_device_state()?;
-        self.prekeys.public_bundle(&self.identity).map_err(CryptoError::from)
+        let before = self.mutex(&self.prekeys)?.serialize();
+        let bundle = {
+            let mut prekeys = self.mutex(&self.prekeys)?;
+            if let Err(e) = prekeys.replenish(&self.identity, one_time_count, one_time_count) {
+                return Err(CryptoError::from(e));
+            }
+            match prekeys.public_bundle(&self.identity) {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    drop(prekeys);
+                    self.restore_prekeys_from(&before)?;
+                    return Err(CryptoError::from(e));
+                }
+            }
+        };
+        if let Err(e) = self.persist_device_state() {
+            let _ = self.restore_prekeys_from(&before);
+            return Err(e);
+        }
+        Ok(bundle)
     }
 
     fn replenish_prekeys(
-        &mut self,
+        &self,
         one_time_count: usize,
     ) -> Result<PublicPrekeyBundle, CryptoError> {
         self.generate_public_prekey_bundle(one_time_count)
     }
 
     fn rotate_signed_prekey(
-        &mut self,
+        &self,
         retain_previous: usize,
     ) -> Result<PublicPrekeyBundle, CryptoError> {
+        let _life = self.lifecycle_write()?;
         self.ensure_storage_healthy()?;
-        self.prekeys
-            .rotate_signed_prekey(&self.identity, retain_previous)
-            .map_err(CryptoError::from)?;
-        self.persist_device_state()?;
-        self.prekeys.public_bundle(&self.identity).map_err(CryptoError::from)
+        let before = self.mutex(&self.prekeys)?.serialize();
+        let bundle = {
+            let mut prekeys = self.mutex(&self.prekeys)?;
+            if let Err(e) = prekeys.rotate_signed_prekey(&self.identity, retain_previous) {
+                return Err(CryptoError::from(e));
+            }
+            match prekeys.public_bundle(&self.identity) {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    drop(prekeys);
+                    self.restore_prekeys_from(&before)?;
+                    return Err(CryptoError::from(e));
+                }
+            }
+        };
+        if let Err(e) = self.persist_device_state() {
+            let _ = self.restore_prekeys_from(&before);
+            return Err(e);
+        }
+        Ok(bundle)
     }
 
     fn rotate_last_resort_pq(
-        &mut self,
+        &self,
         retain_previous: usize,
     ) -> Result<PublicPrekeyBundle, CryptoError> {
+        let _life = self.lifecycle_write()?;
         self.ensure_storage_healthy()?;
-        self.prekeys
-            .rotate_last_resort_pq(&self.identity, retain_previous)
-            .map_err(CryptoError::from)?;
-        self.persist_device_state()?;
-        self.prekeys.public_bundle(&self.identity).map_err(CryptoError::from)
+        let before = self.mutex(&self.prekeys)?.serialize();
+        let bundle = {
+            let mut prekeys = self.mutex(&self.prekeys)?;
+            if let Err(e) = prekeys.rotate_last_resort_pq(&self.identity, retain_previous) {
+                return Err(CryptoError::from(e));
+            }
+            match prekeys.public_bundle(&self.identity) {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    drop(prekeys);
+                    self.restore_prekeys_from(&before)?;
+                    return Err(CryptoError::from(e));
+                }
+            }
+        };
+        if let Err(e) = self.persist_device_state() {
+            let _ = self.restore_prekeys_from(&before);
+            return Err(e);
+        }
+        Ok(bundle)
     }
 
     fn establish_outbound_session(
-        &mut self,
+        &self,
         remote_bundle: &PublicPrekeyBundle,
         conversation_context: &[u8],
         first_plaintext: &[u8],
@@ -1668,7 +1878,7 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
     }
 
     fn establish_outbound_session_for_peer(
-        &mut self,
+        &self,
         peer_id: &[u8],
         remote_device_id: Option<&[u8]>,
         remote_bundle: &PublicPrekeyBundle,
@@ -1688,7 +1898,7 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
     }
 
     fn process_inbound_session(
-        &mut self,
+        &self,
         message: &InitiationPacket,
         conversation_context: &[u8],
         associated_data: &[u8],
@@ -1697,7 +1907,7 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
     }
 
     fn process_inbound_session_from_peer(
-        &mut self,
+        &self,
         peer_id: &[u8],
         remote_device_id: Option<&[u8]>,
         message: &InitiationPacket,
@@ -1718,28 +1928,33 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<InitiationPacket>, CryptoError> {
+        let _life = self.lifecycle_read()?;
         self.ensure_storage_healthy()?;
-        let sess = self.sessions.get(session_id).ok_or(CryptoError::NoSession)?;
-        match &sess.pending_initiation {
+        let entry = self.session_entry(session_id)?;
+        let session = self.mutex(&entry.inner)?;
+        match &session.pending_initiation {
             Some(bytes) => Ok(Some(InitiationPacket::decode(bytes)?)),
             None => Ok(None),
         }
     }
 
     fn acknowledge_outbound_initiation(
-        &mut self,
+        &self,
         session_id: &SessionId,
     ) -> Result<(), CryptoError> {
+        let _life = self.lifecycle_read()?;
         self.ensure_storage_healthy()?;
-        let sess = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(CryptoError::NoSession)?;
-        if sess.pending_initiation.is_none() {
-            return Ok(());
+        let entry = self.session_entry(session_id)?;
+        let mut session = self.mutex(&entry.inner)?;
+        let previous = match session.pending_initiation.take() {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        if let Err(e) = self.persist_session_only(session_id, &session) {
+            session.pending_initiation = Some(previous);
+            return Err(e);
         }
-        sess.pending_initiation = None;
-        self.persist_session_aux(session_id)
+        Ok(())
     }
 
     fn peer_identity_state(
@@ -1748,22 +1963,26 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
         remote_identity_public: &[u8; 32],
         remote_device_id: Option<&[u8]>,
     ) -> Result<IdentityState, CryptoError> {
+        let _life = self.lifecycle_read()?;
+        self.ensure_storage_healthy()?;
         validate_peer_id_input(peer_id)?;
         let material = Self::peer_material(remote_identity_public, remote_device_id)?;
-        Ok(self.peer_identities.observe(peer_id, &material))
+        Ok(self.mutex(&self.peer_identities)?.observe(peer_id, &material))
     }
 
     fn acknowledge_peer_identity(
-        &mut self,
+        &self,
         peer_id: &[u8],
         remote_identity_public: &[u8; 32],
         remote_device_id: Option<&[u8]>,
         now_unix: u64,
     ) -> Result<(), CryptoError> {
+        let _life = self.lifecycle_write()?;
         self.ensure_storage_healthy()?;
         validate_peer_id_input(peer_id)?;
         let material = Self::peer_material(remote_identity_public, remote_device_id)?;
-        self.peer_identities
+        let before = self.mutex(&self.peer_identities)?.clone();
+        self.mutex(&self.peer_identities)?
             .acknowledge(
                 peer_id,
                 material,
@@ -1771,47 +1990,45 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
                 VerificationMethod::SafetyNumber,
             )
             .map_err(CryptoError::from)?;
-        self.persist_device_state()
+        if let Err(e) = self.persist_device_state() {
+            *self.mutex(&self.peer_identities)? = before;
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn encrypt(
-        &mut self,
+        &self,
         session_id: &SessionId,
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<SealedMessage, CryptoError> {
+        let _life = self.lifecycle_read()?;
         self.ensure_storage_healthy()?;
         validate_context_lengths(&[], associated_data)?;
         validate_plaintext_len(plaintext.len())?;
-        let (profile, tag, header, ciphertext) = {
-            let sess = self
-                .sessions
-                .get_mut(session_id)
-                .ok_or(CryptoError::NoSession)?;
-            let ad = Self::bound_ad(sess, associated_data)?;
-            let (header, ciphertext) = sess.ratchet.encrypt(plaintext, &ad)?;
-            (sess.profile, sess.session_tag, header, ciphertext)
-        };
+        let entry = self.session_entry(session_id)?;
+        let mut session = self.mutex(&entry.inner)?;
+        self.ensure_storage_healthy()?;
+        let ad = Self::bound_ad(&session, associated_data)?;
+        let (header, ciphertext) = session.ratchet.encrypt(plaintext, &ad)?;
         if header.len() > MAX_HEADER_LEN || ciphertext.len() > MAX_CIPHERTEXT_LEN {
-            self.storage_poisoned = true;
+            self.storage_poisoned.store(true, Ordering::Release);
             return Err(CryptoError::Internal);
         }
         let sealed = SealedMessage {
             protocol_version: PROTOCOL_VERSION,
-            profile,
-            session_tag: tag,
+            profile: session.profile,
+            session_tag: session.session_tag,
             header,
             ciphertext,
         };
-        if let Err(e) = self.persist_session_aux(session_id) {
-            self.storage_poisoned = true;
-            return Err(e);
-        }
+        self.persist_session_only(session_id, &session)?;
         Ok(sealed)
     }
 
     fn encrypt_voice_payload(
-        &mut self,
+        &self,
         session_id: &SessionId,
         voice_payload: &[u8],
         associated_data: &[u8],
@@ -1825,22 +2042,67 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
     }
 
     fn decrypt(
-        &mut self,
+        &self,
         session_id: &SessionId,
         sealed: &SealedMessage,
         associated_data: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
+        let _life = self.lifecycle_read()?;
         self.ensure_storage_healthy()?;
         validate_context_lengths(&[], associated_data)?;
         validate_ciphertext_len(sealed.ciphertext.len())?;
-        let plaintext = self.apply_decrypt(session_id, sealed, associated_data)?;
-        if let Some(sess) = self.sessions.get_mut(session_id) {
-            sess.pending_initiation = None;
+        let entry = self.session_entry(session_id)?;
+        let mut session = self.mutex(&entry.inner)?;
+        Self::validate_sealed_for_session(&session, sealed)?;
+        let rkey = Self::replay_key(&session, sealed);
+
+        {
+            let mut replay = self.mutex(&self.replay)?;
+            if replay.cache.contains(&rkey) || replay.pending.contains(&rkey) {
+                return Err(CryptoError::Replay);
+            }
+            replay.pending.insert(rkey.clone());
         }
-        if let Err(e) = self.persist_session_aux(session_id) {
-            self.storage_poisoned = true;
-            return Err(e);
+
+        let decrypt_result = (|| {
+            let ad = Self::bound_ad(&session, associated_data)?;
+            session
+                .ratchet
+                .decrypt(&sealed.header, &sealed.ciphertext, &ad)
+        })();
+        let plaintext = match decrypt_result {
+            Ok(plaintext) => plaintext,
+            Err(e) => {
+                self.mutex(&self.replay)?.pending.remove(&rkey);
+                return Err(e);
+            }
+        };
+        session.pending_initiation = None;
+        let session_blob = encode_session(session_id, &session);
+
+        // Replay finalization and persistence are serialized only for this short
+        // stage; expensive ratchet/AEAD work above remains per-session parallel.
+        let mut replay = self.mutex(&self.replay)?;
+        if !replay.pending.remove(&rkey) {
+            self.storage_poisoned.store(true, Ordering::Release);
+            return Err(CryptoError::Internal);
         }
+        if replay
+            .cache
+            .check_and_insert(rkey)
+            .map_err(CryptoError::from)?
+        {
+            self.storage_poisoned.store(true, Ordering::Release);
+            return Err(CryptoError::Replay);
+        }
+        let replay_blob = replay.cache.serialize();
+        self.commit_changes(
+            &[
+                (session_id.0.to_vec(), session_blob),
+                (Self::KEY_REPLAY.to_vec(), replay_blob),
+            ],
+            &[],
+        )?;
         Ok(plaintext)
     }
 
@@ -1849,6 +2111,8 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
         remote_identity_public: &[u8; 32],
         remote_device_id: Option<&[u8]>,
     ) -> Result<SafetyFingerprint, CryptoError> {
+        let _life = self.lifecycle_read()?;
+        self.ensure_storage_healthy()?;
         let remote = Self::peer_material(remote_identity_public, remote_device_id)?;
         let local = IdentityMaterial {
             identity_key: self.identity.public(),
@@ -1859,54 +2123,83 @@ impl CryptoEngineApi for VoiceChatCryptoEngine {
     }
 
     fn acknowledge_identity_change(
-        &mut self,
+        &self,
         remote_identity_public: &[u8; 32],
         remote_device_id: Option<&[u8]>,
     ) -> Result<(), CryptoError> {
+        let _life = self.lifecycle_write()?;
         self.ensure_storage_healthy()?;
         let mat = Self::peer_material(remote_identity_public, remote_device_id)?;
-        for sess in self.sessions.values_mut() {
-            if sess.remote_identity.to_bytes() == *remote_identity_public
-                || matches!(sess.identity_tracker.observe(&mat), IdentityState::IdentityChanged { .. })
-            {
-                sess.identity_tracker.acknowledge(mat.clone());
+        let trust_before = self.mutex(&self.trust)?.clone();
+        {
+            let sessions: Vec<Arc<SessionEntry>> = self
+                .read_lock(&self.sessions)?
+                .values()
+                .cloned()
+                .collect();
+            for entry in sessions {
+                let mut session = self.mutex(&entry.inner)?;
+                if session.remote_identity.to_bytes() == *remote_identity_public
+                    || matches!(
+                        session.identity_tracker.observe(&mat),
+                        IdentityState::IdentityChanged { .. }
+                    )
+                {
+                    session.identity_tracker.acknowledge(mat.clone());
+                }
             }
         }
-        self.trust
+        self.mutex(&self.trust)?
             .acknowledge(mat, 0, VerificationMethod::SafetyNumber);
-        self.persist_device_state()
-    }
-
-    fn has_session(&self, session_id: &SessionId) -> bool {
-        self.sessions.contains_key(session_id)
-    }
-
-    fn delete_session(&mut self, session_id: &SessionId) -> Result<(), CryptoError> {
-        self.ensure_storage_healthy()?;
-        if !self.sessions.contains_key(session_id) {
-            return Err(CryptoError::NoSession);
+        if let Err(e) = self.persist_device_state() {
+            *self.mutex(&self.trust)? = trust_before;
+            let _ = self.restore_identity_trackers();
+            return Err(e);
         }
-        self.commit_changes(&[], &[session_id.0.as_slice()])?;
-        self.sessions.remove(session_id);
         Ok(())
     }
 
-    fn delete_all_sessions(&mut self) -> Result<(), CryptoError> {
-        self.ensure_storage_healthy()?;
-        let mut session_keys = Vec::new();
-        for key in self.storage.keys().map_err(|_| CryptoError::Storage)? {
-            let Some(blob) = self.storage.get(&key).map_err(|_| CryptoError::Storage)? else {
-                continue;
-            };
-            if blob.0.len() >= 8
-                && (&blob.0[..8] == b"VCSESS01" || &blob.0[..8] == b"VCSESS02")
-            {
-                session_keys.push(key);
-            }
+    fn has_session(&self, session_id: &SessionId) -> bool {
+        if self.storage_poisoned.load(Ordering::Acquire) {
+            return false;
         }
-        let refs: Vec<&[u8]> = session_keys.iter().map(Vec::as_slice).collect();
-        self.commit_changes(&[], &refs)?;
-        self.sessions.clear();
+        self.sessions
+            .read()
+            .map(|sessions| sessions.contains_key(session_id))
+            .unwrap_or(false)
+    }
+
+    fn delete_session(&self, session_id: &SessionId) -> Result<(), CryptoError> {
+        let _life = self.lifecycle_write()?;
+        self.ensure_storage_healthy()?;
+        if !self.read_lock(&self.sessions)?.contains_key(session_id) {
+            return Err(CryptoError::NoSession);
+        }
+        self.commit_changes(&[], &[session_id.0.to_vec()])?;
+        self.write_lock(&self.sessions)?.remove(session_id);
+        Ok(())
+    }
+
+    fn delete_all_sessions(&self) -> Result<(), CryptoError> {
+        let _life = self.lifecycle_write()?;
+        self.ensure_storage_healthy()?;
+        let session_keys = {
+            let p = self.mutex(&self.persistence)?;
+            let mut keys = Vec::new();
+            for key in p.storage.keys().map_err(|_| CryptoError::Storage)? {
+                let Some(blob) = p.storage.get(&key).map_err(|_| CryptoError::Storage)? else {
+                    continue;
+                };
+                if blob.0.len() >= 8
+                    && (&blob.0[..8] == b"VCSESS01" || &blob.0[..8] == b"VCSESS02")
+                {
+                    keys.push(key);
+                }
+            }
+            keys
+        };
+        self.commit_changes(&[], &session_keys)?;
+        self.write_lock(&self.sessions)?.clear();
         Ok(())
     }
 
