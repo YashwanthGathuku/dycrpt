@@ -1,0 +1,119 @@
+name: dynamic-assurance
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per libFuzzer target
+        required: false
+        default: '1800'
+  schedule:
+    - cron: '17 4 * * 0'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY: nightly-2026-08-20
+
+jobs:
+  miri-ffi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned Miri nightly
+        run: |
+          rustup toolchain install "$NIGHTLY" --profile minimal --component miri
+          cargo +"$NIGHTLY" miri setup
+      - name: Interpret unsafe FFI boundary under multiple Miri schedules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for seed in 0 1 2 3 4 5 6 7; do
+            echo "Miri seed=$seed"
+            MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-seed=$seed" \
+              cargo +"$NIGHTLY" miri test --locked --features ffi 'ffi::tests::'
+          done
+
+  address-sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned sanitizer nightly
+        run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
+      - name: Run full feature matrix under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address -Cdebuginfo=1
+          RUSTDOCFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1:check_initialization_order=1
+        run: |
+          cargo +"$NIGHTLY" test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            --locked --workspace --all-targets --all-features -- --skip ten_thousand
+
+  thread-sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned sanitizer nightly
+        run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
+      - name: Run engine concurrency suite under ThreadSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=thread -Cdebuginfo=1
+          RUSTDOCFLAGS: -Zsanitizer=thread
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:history_size=7
+        run: |
+          cargo +"$NIGHTLY" test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            --locked --test p02_concurrency --features 'ffi header-encrypt'
+
+  libfuzzer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned fuzzing toolchain
+        run: |
+          rustup toolchain install "$NIGHTLY" --profile minimal
+          cargo +"$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
+      - name: Run coverage-guided parser campaigns with ASan
+        shell: bash
+        env:
+          REQUESTED_FUZZ_SECONDS: ${{ inputs.fuzz_seconds }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            seconds=120
+          elif [[ -n "${REQUESTED_FUZZ_SECONDS:-}" ]]; then
+            seconds="${REQUESTED_FUZZ_SECONDS}"
+          else
+            seconds=1800
+          fi
+          test "$seconds" -ge 60
+          for target in envelope_parse header_decode triple_header_decode engine_wire prekey_bundle; do
+            echo "fuzz target=$target seconds=$seconds"
+            cargo +"$NIGHTLY" fuzz run "$target" -- \
+              -max_total_time="$seconds" -timeout=10 -rss_limit_mb=4096 -print_final_stats=1
+          done
+      - name: Upload crash corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fuzz-crashes-${{ github.sha }}
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
+          if-no-files-found: warn
+          retention-days: 30
