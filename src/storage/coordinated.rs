@@ -254,6 +254,107 @@ impl<S: TransactionalStorage> TransactionalStorage for AnchoredStorage<S> {
     }
 }
 
+/// Why a critical-state restore was refused.
+///
+/// **Every variant is terminal for the state that produced it.** None can be
+/// retried into success, and none can be worked around by calling
+/// [`coordinated_backends_for_initialize`] instead: that function independently
+/// refuses whenever the anchor is non-pristine or local state already carries an
+/// epoch. The variants exist so the application can tell a *security event*
+/// apart from an *operational* one, which an opaque `PrimitiveError::Internal`
+/// made impossible.
+///
+/// # What the application must do next
+///
+/// This library deliberately does not choose the recovery policy, because the
+/// choice trades a bricked account against silent history loss and that is a
+/// product decision:
+///
+/// * **Refuse to start.** Safest. A genuinely corrupted anchor permanently
+///   locks the user out with no path back.
+/// * **Re-initialize from scratch and force re-keying.** Recoverable, but drops
+///   message history and *must* be surfaced to the user. If it happens silently
+///   it becomes a downgrade an attacker can trigger on purpose.
+///
+/// Whichever is chosen, [`RestoreRejection::is_security_event`] marks the
+/// variants that must never be resolved without telling the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreRejection {
+    /// `local < anchor`: an older authentic snapshot was presented for a device
+    /// whose anchor has since advanced. This is the rollback signature — the
+    /// encrypted snapshot is valid and correctly authenticated, it is simply
+    /// *stale*. Reusing it would replay message keys and nonces.
+    RollbackDetected { local_epoch: u64, anchor_epoch: u64 },
+
+    /// `local > anchor + 1`: a gap no single interrupted commit can produce.
+    /// Indicates a forked or substituted anchor, or a state file from a
+    /// different device.
+    EpochGap { local_epoch: u64, anchor_epoch: u64 },
+
+    /// No local epoch record, but the anchor has already advanced. The local
+    /// crypto database was destroyed or withheld while the anchor survived.
+    LocalStateMissing { anchor_epoch: u64 },
+
+    /// Neither local state nor a used anchor: this device was never
+    /// initialized. The only non-security variant — the correct response is to
+    /// call [`coordinated_backends_for_initialize`].
+    NotInitialized,
+
+    /// The epoch record exists but is not a well-formed little-endian `u64`.
+    EpochRecordCorrupt,
+
+    /// The anchor could not be read at all.
+    AnchorUnavailable,
+
+    /// Reconciling a single interrupted commit did not land on the expected
+    /// value, meaning the anchor moved underneath us (concurrent use of one
+    /// identity from two processes).
+    AnchorReconciliationFailed {
+        expected_epoch: u64,
+        observed_epoch: u64,
+    },
+}
+
+impl RestoreRejection {
+    /// True when the refusal indicates tampering, rollback, or state loss
+    /// rather than an ordinary un-provisioned device.
+    ///
+    /// Only [`RestoreRejection::NotInitialized`] is non-security. Everything
+    /// else must be surfaced, never silently recovered from.
+    pub fn is_security_event(self) -> bool {
+        !matches!(self, Self::NotInitialized)
+    }
+}
+
+impl core::fmt::Display for RestoreRejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RollbackDetected { .. } => f.write_str("state rollback detected"),
+            Self::EpochGap { .. } => f.write_str("impossible epoch gap"),
+            Self::LocalStateMissing { .. } => f.write_str("local crypto state missing"),
+            Self::NotInitialized => f.write_str("device not initialized"),
+            Self::EpochRecordCorrupt => f.write_str("epoch record corrupt"),
+            Self::AnchorUnavailable => f.write_str("rollback anchor unavailable"),
+            Self::AnchorReconciliationFailed { .. } => f.write_str("anchor reconciliation failed"),
+        }
+    }
+}
+
+impl std::error::Error for RestoreRejection {}
+
+impl From<RestoreRejection> for PrimitiveError {
+    /// Collapses to the previous opaque errors so existing call sites keep
+    /// compiling. Prefer matching on [`RestoreRejection`] directly.
+    fn from(value: RestoreRejection) -> Self {
+        match value {
+            RestoreRejection::EpochRecordCorrupt
+            | RestoreRejection::LocalStateMissing { .. }
+            | RestoreRejection::NotInitialized => PrimitiveError::InvalidLength,
+            _ => PrimitiveError::Internal,
+        }
+    }
+}
+
 /// Build a coordinated backend pair for first-time device initialization.
 ///
 /// The external anchor must be pristine and the local storage must not already
@@ -278,52 +379,93 @@ where
 /// - `local == anchor`: normal clean shutdown/commit;
 /// - `local == anchor + 1`: local commit completed but anchor finalization was
 ///   interrupted, so the anchor is advanced forward exactly once;
-/// - every other relationship fails closed.
+/// - every other relationship fails closed with a typed [`RestoreRejection`].
+///
+/// A refusal here cannot be bypassed by calling
+/// [`coordinated_backends_for_initialize`] instead — see the invariant tests in
+/// this module.
 pub fn coordinated_backends_for_restore<S>(
     storage: S,
     anchor: Arc<dyn RollbackAnchor>,
-) -> Result<CoordinatedBackendPair, PrimitiveError>
+) -> Result<CoordinatedBackendPair, RestoreRejection>
 where
     S: TransactionalStorage + 'static,
 {
-    let blob = storage
-        .get(STORAGE_EPOCH_KEY)?
-        .ok_or(PrimitiveError::InvalidLength)?;
+    let anchored = anchor
+        .current()
+        .map_err(|_| RestoreRejection::AnchorUnavailable)?;
+
+    let record = storage
+        .get(STORAGE_EPOCH_KEY)
+        .map_err(|_| RestoreRejection::EpochRecordCorrupt)?;
+
+    let Some(blob) = record else {
+        // Distinguishing these two is the point of the type. A pristine anchor
+        // with no local state is a device that was never set up; an advanced
+        // anchor with no local state means the crypto database was destroyed or
+        // withheld while the anchor survived, which is a security event.
+        return Err(if anchored == 0 {
+            RestoreRejection::NotInitialized
+        } else {
+            RestoreRejection::LocalStateMissing {
+                anchor_epoch: anchored,
+            }
+        });
+    };
+
     if blob.0.len() != 8 {
-        return Err(PrimitiveError::InvalidLength);
+        return Err(RestoreRejection::EpochRecordCorrupt);
     }
     let local = u64::from_le_bytes(
         blob.0
             .as_slice()
             .try_into()
-            .map_err(|_| PrimitiveError::InvalidLength)?,
+            .map_err(|_| RestoreRejection::EpochRecordCorrupt)?,
     );
-    let anchored = anchor.current()?;
 
     if local == anchored {
-        return build_pair(storage, anchor);
+        return build_pair(storage, anchor).map_err(|_| RestoreRejection::AnchorUnavailable);
     }
 
-    if local
-        == anchored
-            .checked_add(1)
-            .ok_or(PrimitiveError::LimitExceeded)?
-    {
-        match anchor.compare_and_increment(anchored) {
-            Ok(value) if value == local => return build_pair(storage, anchor),
-            Ok(_) => return Err(PrimitiveError::Internal),
-            Err(_) => {
-                if anchor.current()? == local {
-                    return build_pair(storage, anchor);
-                }
-                return Err(PrimitiveError::Internal);
+    if local == anchored.saturating_add(1) {
+        return match anchor.compare_and_increment(anchored) {
+            Ok(value) if value == local => {
+                build_pair(storage, anchor).map_err(|_| RestoreRejection::AnchorUnavailable)
             }
-        }
+            Ok(observed) => Err(RestoreRejection::AnchorReconciliationFailed {
+                expected_epoch: local,
+                observed_epoch: observed,
+            }),
+            Err(_) => {
+                // The CAS may have applied before the error surfaced. Re-read
+                // rather than assume either way.
+                let observed = anchor
+                    .current()
+                    .map_err(|_| RestoreRejection::AnchorUnavailable)?;
+                if observed == local {
+                    build_pair(storage, anchor).map_err(|_| RestoreRejection::AnchorUnavailable)
+                } else {
+                    Err(RestoreRejection::AnchorReconciliationFailed {
+                        expected_epoch: local,
+                        observed_epoch: observed,
+                    })
+                }
+            }
+        };
     }
 
-    // `local < anchored` is an older authentic snapshot (rollback).
-    // `local > anchored + 1` cannot be produced by one interrupted commit.
-    Err(PrimitiveError::Internal)
+    if local < anchored {
+        // Authentic but stale snapshot. Accepting it would replay message keys.
+        return Err(RestoreRejection::RollbackDetected {
+            local_epoch: local,
+            anchor_epoch: anchored,
+        });
+    }
+
+    Err(RestoreRejection::EpochGap {
+        local_epoch: local,
+        anchor_epoch: anchored,
+    })
 }
 
 fn build_pair<S>(
@@ -501,5 +643,166 @@ mod tests {
             .unwrap();
         storage.commit(tx).unwrap();
         assert!(coordinated_backends_for_restore(storage, anchor).is_err());
+    }
+}
+
+/// Critical-state restore invariants (item 1, review 2026-08-28).
+///
+/// These tests exist to pin one property: **a refused restore has no path back
+/// into a usable engine except an explicit, deliberate re-initialization by the
+/// application.** Regression here is a rollback vulnerability, not a test
+/// failure.
+#[cfg(test)]
+mod restore_fail_closed_tests {
+    use super::*;
+    use crate::storage::{MemoryStorage, StateBlob};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Anchor(AtomicU64);
+
+    impl Anchor {
+        fn at(n: u64) -> Arc<Self> {
+            Arc::new(Self(AtomicU64::new(n)))
+        }
+    }
+
+    impl RollbackAnchor for Anchor {
+        fn current(&self) -> Result<u64, PrimitiveError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+        fn compare_and_increment(&self, expected: u64) -> Result<u64, PrimitiveError> {
+            self.0
+                .compare_exchange(expected, expected + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .map(|_| expected + 1)
+                .map_err(|_| PrimitiveError::Internal)
+        }
+    }
+
+    fn storage_at(epoch: u64) -> MemoryStorage {
+        let mut s = MemoryStorage::default();
+        let tx = s.begin().unwrap();
+        s.put(
+            tx,
+            STORAGE_EPOCH_KEY,
+            &StateBlob(epoch.to_le_bytes().to_vec()),
+        )
+        .unwrap();
+        s.commit(tx).unwrap();
+        s
+    }
+
+    #[test]
+    fn stale_snapshot_is_named_as_rollback_not_opaque_internal() {
+        let err = coordinated_backends_for_restore(storage_at(3), Anchor::at(7))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RestoreRejection::RollbackDetected {
+                local_epoch: 3,
+                anchor_epoch: 7
+            }
+        );
+        assert!(err.is_security_event());
+    }
+
+    #[test]
+    fn rollback_cannot_be_escaped_by_initializing_instead() {
+        // The whole point of failing closed: the application must not be able to
+        // route around a detected rollback by taking the other entry point.
+        let anchor = Anchor::at(7);
+        assert!(coordinated_backends_for_restore(storage_at(3), anchor.clone()).is_err());
+        assert!(coordinated_backends_for_initialize(storage_at(3), anchor.clone()).is_err());
+        // Nor by wiping local state first and initializing over a used anchor.
+        assert!(coordinated_backends_for_initialize(MemoryStorage::default(), anchor).is_err());
+    }
+
+    #[test]
+    fn wiped_local_state_with_used_anchor_is_a_security_event() {
+        let err = coordinated_backends_for_restore(MemoryStorage::default(), Anchor::at(7))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err, RestoreRejection::LocalStateMissing { anchor_epoch: 7 });
+        assert!(err.is_security_event());
+    }
+
+    #[test]
+    fn fresh_device_is_the_only_non_security_rejection() {
+        let err = coordinated_backends_for_restore(MemoryStorage::default(), Anchor::at(0))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err, RestoreRejection::NotInitialized);
+        assert!(!err.is_security_event());
+        // ...and it is genuinely recoverable via the documented entry point.
+        assert!(
+            coordinated_backends_for_initialize(MemoryStorage::default(), Anchor::at(0)).is_ok()
+        );
+    }
+
+    #[test]
+    fn impossible_epoch_gap_is_distinguished_from_rollback() {
+        let err = coordinated_backends_for_restore(storage_at(20), Anchor::at(7))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RestoreRejection::EpochGap {
+                local_epoch: 20,
+                anchor_epoch: 7
+            }
+        );
+    }
+
+    #[test]
+    fn corrupt_epoch_record_is_distinguished_from_missing_state() {
+        let mut s = MemoryStorage::default();
+        let tx = s.begin().unwrap();
+        s.put(tx, STORAGE_EPOCH_KEY, &StateBlob(vec![1, 2, 3]))
+            .unwrap();
+        s.commit(tx).unwrap();
+        assert_eq!(
+            coordinated_backends_for_restore(s, Anchor::at(7))
+                .map(|_| ())
+                .unwrap_err(),
+            RestoreRejection::EpochRecordCorrupt
+        );
+    }
+
+    #[test]
+    fn interrupted_commit_still_reconciles_exactly_once() {
+        let anchor = Anchor::at(6);
+        assert!(coordinated_backends_for_restore(storage_at(7), anchor.clone()).is_ok());
+        assert_eq!(anchor.current().unwrap(), 7, "anchor advanced exactly once");
+    }
+
+    #[test]
+    fn clean_restore_does_not_move_the_anchor() {
+        let anchor = Anchor::at(7);
+        assert!(coordinated_backends_for_restore(storage_at(7), anchor.clone()).is_ok());
+        assert_eq!(anchor.current().unwrap(), 7);
+    }
+
+    #[test]
+    fn every_rejection_except_not_initialized_is_a_security_event() {
+        for r in [
+            RestoreRejection::RollbackDetected {
+                local_epoch: 1,
+                anchor_epoch: 2,
+            },
+            RestoreRejection::EpochGap {
+                local_epoch: 9,
+                anchor_epoch: 2,
+            },
+            RestoreRejection::LocalStateMissing { anchor_epoch: 2 },
+            RestoreRejection::EpochRecordCorrupt,
+            RestoreRejection::AnchorUnavailable,
+            RestoreRejection::AnchorReconciliationFailed {
+                expected_epoch: 3,
+                observed_epoch: 5,
+            },
+        ] {
+            assert!(r.is_security_event(), "{r:?} must be a security event");
+        }
+        assert!(!RestoreRejection::NotInitialized.is_security_event());
     }
 }

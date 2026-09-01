@@ -39,14 +39,11 @@ getrandom = "0.2.12"
 thiserror = "1.0.57"
 hex = "0.4.3"
 
+jni = { version = "0.21", optional = true }
+
 [dev-dependencies]
 proptest = "1.4"
 hex-literal = "0.4.1"
-
-[lints.rust]
-unused_mut = "allow"
-unused_assignments = "allow"
-unused_variables = "allow"
 
 [lints.clippy]
 single_match = "allow"
@@ -59,6 +56,9 @@ module_inception = "allow"
 default = ["std"]
 std = []
 ffi = []
+# Android JNI layer. Pulls in the `jni` crate, so it is opt-in and never part of
+# a default or iOS build. iOS/desktop bind the C ABI directly and do not need it.
+android = ["ffi", "dep:jni"]
 # Experimental profiles — compiled only when requested; never auto-selected.
 hybrid = []
 header-encrypt = []

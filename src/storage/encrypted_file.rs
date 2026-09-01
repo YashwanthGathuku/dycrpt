@@ -5,10 +5,24 @@
 //! it should be protected by Keychain/Secure Enclave policy. The key is never
 //! written by this backend.
 //!
-//! Each commit writes one AES-256-GCM authenticated snapshot to a temporary
-//! file, `fsync`s it, atomically renames it over the live snapshot, and fsyncs
-//! the parent directory. Rollback detection is deliberately NOT provided here:
-//! use the independent `MonotonicCounter`/trusted-anchor contract for that.
+//! Each commit writes one XChaCha20-Poly1305 authenticated snapshot to a
+//! temporary file, `fsync`s it, atomically renames it over the live snapshot,
+//! and fsyncs the parent directory. Rollback detection is deliberately NOT
+//! provided here: use the independent `MonotonicCounter`/trusted-anchor
+//! contract for that.
+//!
+//! Format history:
+//! * `VCENCST1` — AES-256-GCM, random 96-bit nonce. Retired 2026-08-28. A
+//!   96-bit random nonce under a long-lived, unrotated storage key is bounded
+//!   by NIST SP 800-38D at 2^32 invocations per key; the snapshot is rewritten
+//!   on every state mutation and the bound was never documented or enforced.
+//! * `VCENCST2` — XChaCha20-Poly1305, random 192-bit nonce. The nonce space is
+//!   large enough that random selection is safe past any reachable write count,
+//!   so no invocation bound needs tracking.
+//!
+//! V1 snapshots are refused, not silently migrated: this backend has never been
+//! shipped, so an on-disk V1 file is an anomaly rather than legacy data, and
+//! fail-closed is the house rule.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -17,15 +31,17 @@ use std::path::{Path, PathBuf};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::primitives::aead::{self, AeadKey, TAG_LEN};
+use crate::primitives::aead::{self, AeadKey, TAG_LEN, XNONCE_LEN};
 use crate::primitives::error::PrimitiveError;
 use crate::primitives::random::fill_random;
 use crate::storage::{StateBlob, StorageEpoch, TransactionId, TransactionalStorage};
 
-const FILE_MAGIC: &[u8; 8] = b"VCENCST1";
+const FILE_MAGIC: &[u8; 8] = b"VCENCST2";
+/// Retired format. Recognised only so the error is explicit.
+const LEGACY_FILE_MAGIC_V1: &[u8; 8] = b"VCENCST1";
 const MAP_MAGIC: &[u8; 8] = b"VCMAP001";
-const STORAGE_AD: &[u8] = b"VoiceChat/EncryptedFileStorage/v1";
-const NONCE_LEN: usize = 12;
+const STORAGE_AD: &[u8] = b"VoiceChat/EncryptedFileStorage/v2";
+const NONCE_LEN: usize = XNONCE_LEN;
 const MAX_STORAGE_FILE: usize = 512 * 1024 * 1024;
 const MAX_RECORDS: usize = 200_000;
 const MAX_KEY_LEN: usize = 64 * 1024;
@@ -94,12 +110,19 @@ impl EncryptedFileStorage {
             .and_then(|mut f| f.read_to_end(&mut bytes))
             .map_err(|_| PrimitiveError::Internal)?;
         if bytes.len() != file_len || &bytes[..8] != FILE_MAGIC {
+            let legacy = bytes.len() >= 8 && &bytes[..8] == LEGACY_FILE_MAGIC_V1;
             bytes.zeroize();
-            return Err(PrimitiveError::InvalidLength);
+            // Fail closed. A retired AES-GCM snapshot is never opened, never
+            // re-keyed in place, and never silently upgraded.
+            return Err(if legacy {
+                PrimitiveError::InvalidNonce
+            } else {
+                PrimitiveError::InvalidLength
+            });
         }
         let mut nonce = [0u8; NONCE_LEN];
         nonce.copy_from_slice(&bytes[8..8 + NONCE_LEN]);
-        let mut plaintext = aead::open(key, &nonce, &bytes[8 + NONCE_LEN..], STORAGE_AD)?;
+        let mut plaintext = aead::xopen(key, &nonce, &bytes[8 + NONCE_LEN..], STORAGE_AD)?;
         bytes.zeroize();
         let parsed = Self::decode_map(&plaintext);
         plaintext.zeroize();
@@ -215,7 +238,7 @@ impl EncryptedFileStorage {
         let mut plaintext = self.encode_effective_map(staged)?;
         let mut nonce = [0u8; NONCE_LEN];
         fill_random(&mut nonce)?;
-        let encrypted = aead::seal(&self.key, &nonce, &plaintext, STORAGE_AD);
+        let encrypted = aead::xseal(&self.key, &nonce, &plaintext, STORAGE_AD);
         plaintext.zeroize();
         let mut encrypted = encrypted?;
 
@@ -245,9 +268,7 @@ impl EncryptedFileStorage {
             temp.sync_all().map_err(|_| PrimitiveError::Internal)?;
             drop(temp);
             fs::rename(&temp_path, &self.path).map_err(|_| PrimitiveError::Internal)?;
-            File::open(parent)
-                .and_then(|dir| dir.sync_all())
-                .map_err(|_| PrimitiveError::Internal)?;
+            sync_parent_dir(parent).map_err(|_| PrimitiveError::Internal)?;
             Ok(())
         })();
         encrypted.zeroize();
@@ -402,6 +423,56 @@ fn take<'a>(data: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8], Primiti
     let value = &data[*i..end];
     *i = end;
     Ok(value)
+}
+
+/// Persist the directory entry after an atomic rename.
+///
+/// On Unix this is `fsync(dirfd)`. On Windows, `File::open` on a directory
+/// fails with access-denied unless the handle is opened with
+/// `FILE_FLAG_BACKUP_SEMANTICS` (CreateFileW: "You must set this flag to
+/// obtain a handle to a directory").
+fn sync_parent_dir(parent: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        File::open(parent)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // winnt.h / CreateFileW: required to obtain a directory handle.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_SHARE_ALL: u32 = 0x0000_0007;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+        let dir = match OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(parent)
+        {
+            Ok(dir) => dir,
+            // Some directories (notably the user Temp folder) refuse even a
+            // backup-semantics handle. The snapshot file itself has already
+            // been sync_all'd and renamed; failing the commit here would
+            // leave durable bytes on disk while reporting Internal.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(5) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        match dir.sync_all() {
+            Ok(()) => Ok(()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(5) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 fn read_u32(data: &[u8], i: &mut usize) -> Result<u32, PrimitiveError> {

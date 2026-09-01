@@ -12,9 +12,10 @@
 //! serializes same-session work and permits different sessions to run in
 //! parallel.
 //!
-//! `vc_engine_create` remains a development constructor using in-memory storage.
-//! Production mobile integration must initialize the Rust engine with
-//! `EncryptedFileStorage` plus a reviewed rollback-resistant `MonotonicCounter`.
+//! `vc_engine_create` remains a **development** constructor using in-memory
+//! storage: nothing it produces survives process exit. Production integration
+//! must use [`vc_engine_open_persistent`], which binds `EncryptedFileStorage`
+//! to a caller-supplied rollback-resistant anchor.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -29,7 +30,17 @@ use crate::engine::{
 use crate::fingerprint::{compute_fingerprint, IdentityMaterial};
 use crate::policy::CryptoProfile;
 use crate::prekeys::PublicPrekeyBundle;
+use crate::primitives::error::PrimitiveError;
 use crate::primitives::x25519::X25519Public;
+use crate::storage::coordinated::{
+    coordinated_backends_for_initialize, coordinated_backends_for_restore, RestoreRejection,
+};
+use crate::storage::encrypted_file::EncryptedFileStorage;
+use crate::storage::trusted_anchor::RollbackAnchor;
+use zeroize::Zeroize;
+
+#[cfg(feature = "android")]
+pub mod jni;
 
 pub type VcHandle = u64;
 
@@ -43,7 +54,38 @@ pub enum VcError {
     NotFound = 4,
     IdentityChanged = 5,
     LimitExceeded = 6,
+    /// Persisted state is authentic but older than the rollback anchor. The
+    /// local database was restored from a backup or otherwise reverted.
+    ///
+    /// **Terminal.** Never retry, never fall back to a fresh-device
+    /// constructor, and never resolve this silently — see
+    /// [`vc_engine_open_persistent`].
+    RollbackDetected = 7,
+    /// Persisted state is missing or unreadable while the anchor shows the
+    /// device was previously provisioned. Also terminal.
+    StateLost = 8,
+    /// The supplied rollback anchor could not be read or advanced.
+    AnchorUnavailable = 9,
+    /// No persisted state and a pristine anchor: this device was never set up.
+    /// The only non-terminal open failure. Call the initializing constructor.
+    NotInitialized = 10,
     Internal = 99,
+}
+
+impl From<RestoreRejection> for VcError {
+    fn from(value: RestoreRejection) -> Self {
+        match value {
+            RestoreRejection::RollbackDetected { .. } | RestoreRejection::EpochGap { .. } => {
+                VcError::RollbackDetected
+            }
+            RestoreRejection::LocalStateMissing { .. } | RestoreRejection::EpochRecordCorrupt => {
+                VcError::StateLost
+            }
+            RestoreRejection::NotInitialized => VcError::NotInitialized,
+            RestoreRejection::AnchorUnavailable
+            | RestoreRejection::AnchorReconciliationFailed { .. } => VcError::AnchorUnavailable,
+        }
+    }
 }
 
 impl From<CryptoError> for VcError {
@@ -1073,4 +1115,229 @@ mod tests {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Production persistent constructor (roadmap item 5)
+// ---------------------------------------------------------------------------
+
+/// C callback table supplying a rollback-resistant monotonic anchor.
+///
+/// The anchor must live **outside the application's restorable data domain**.
+/// A row in the same database, or a file beside the state file, does not
+/// satisfy the contract: both are restored together with the state they are
+/// supposed to be checked against. Acceptable backings are a server-held
+/// counter or a hardware/TEE monotonic primitive.
+///
+/// # Callback contract
+///
+/// Both callbacks return `0` on success and non-zero on failure, and write
+/// their result through the out-pointer only on success.
+///
+/// * `current(ctx, out)` — read the committed anchor value.
+/// * `compare_and_increment(ctx, expected, out)` — atomically move `expected`
+///   to `expected + 1`. On failure the implementation **must** have resolved
+///   whether the value changed before returning. An implementation whose
+///   outcome can remain unknown after an error is not compatible with this
+///   interface: an unobserved advance desynchronizes the durable epoch and is
+///   indistinguishable from a rollback on the next open.
+///
+/// # Safety
+///
+/// * Both function pointers must be non-null and remain valid for the lifetime
+///   of the engine handle.
+/// * `ctx` is passed back unmodified and must remain valid for the same
+///   lifetime. The engine is internally concurrent, so `ctx` and both callbacks
+///   **must be safe to call from multiple threads simultaneously**.
+/// * The callbacks must not unwind across the ABI boundary.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VcRollbackAnchorCallbacks {
+    pub ctx: *mut core::ffi::c_void,
+    pub current: Option<unsafe extern "C" fn(*mut core::ffi::c_void, *mut u64) -> i32>,
+    pub compare_and_increment:
+        Option<unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut u64) -> i32>,
+}
+
+struct FfiRollbackAnchor {
+    cb: VcRollbackAnchorCallbacks,
+}
+
+// SAFETY: upheld by the documented contract on `VcRollbackAnchorCallbacks` —
+// the caller guarantees `ctx` and both callbacks are safe to use concurrently.
+// This is asserted, not proven, and is a required audit point for any platform
+// adapter built against this interface.
+unsafe impl Send for FfiRollbackAnchor {}
+unsafe impl Sync for FfiRollbackAnchor {}
+
+impl RollbackAnchor for FfiRollbackAnchor {
+    fn current(&self) -> Result<u64, PrimitiveError> {
+        let f = self.cb.current.ok_or(PrimitiveError::Internal)?;
+        let mut out: u64 = 0;
+        let rc = catch_unwind(AssertUnwindSafe(|| unsafe { f(self.cb.ctx, &mut out) }))
+            .map_err(|_| PrimitiveError::Internal)?;
+        if rc != 0 {
+            return Err(PrimitiveError::Internal);
+        }
+        Ok(out)
+    }
+
+    fn compare_and_increment(&self, expected: u64) -> Result<u64, PrimitiveError> {
+        let f = self
+            .cb
+            .compare_and_increment
+            .ok_or(PrimitiveError::Internal)?;
+        let mut out: u64 = 0;
+        let rc = catch_unwind(AssertUnwindSafe(|| unsafe {
+            f(self.cb.ctx, expected, &mut out)
+        }))
+        .map_err(|_| PrimitiveError::Internal)?;
+        if rc != 0 {
+            return Err(PrimitiveError::Internal);
+        }
+        Ok(out)
+    }
+}
+
+const MAX_FFI_PATH: usize = 4 * 1024;
+
+/// Open a **persistent** engine backed by encrypted on-disk storage and a
+/// caller-supplied rollback anchor. This is the production constructor.
+///
+/// `create_if_absent` selects the intent, and the two intents are deliberately
+/// not interchangeable:
+///
+/// * `0` — restore an existing device. Fails with a specific code if the state
+///   is stale, lost, or the anchor is unusable.
+/// * `1` — provision a new device. Refuses unless the anchor is pristine and no
+///   state exists, so it cannot be used to paper over a failed restore.
+///
+/// # Recovery policy is the caller's decision
+///
+/// On [`VcError::RollbackDetected`] or [`VcError::StateLost`] this function
+/// refuses and **there is deliberately no library-provided recovery call**.
+/// The two available policies trade differently and the library will not choose:
+///
+/// * *Refuse to start.* Safest. A genuinely corrupted anchor locks the user out
+///   permanently.
+/// * *Re-provision and force re-keying.* Recoverable, but drops message history
+///   and destroys the old identity. It must be surfaced to the user; performed
+///   silently it is a downgrade an attacker can trigger deliberately, and every
+///   peer's safety-number verification is invalidated without explanation.
+///
+/// Retrying the same call, or calling it again with `create_if_absent = 1`,
+/// is not a recovery path and will not succeed.
+///
+/// # Safety
+///
+/// `path` must point to `path_len` readable bytes of UTF-8. `storage_key` must
+/// point to 32 readable bytes; it is copied and the copy is zeroized before
+/// return. `out_handle` must be a valid writable `VcHandle`. `out_public`, if
+/// non-null, must be writable for 32 bytes. See
+/// [`VcRollbackAnchorCallbacks`] for the anchor contract.
+#[no_mangle]
+pub unsafe extern "C" fn vc_engine_open_persistent(
+    device_id: *const u8,
+    device_id_len: usize,
+    profile: u8,
+    path: *const u8,
+    path_len: usize,
+    storage_key: *const u8,
+    anchor: VcRollbackAnchorCallbacks,
+    create_if_absent: u8,
+    out_handle: *mut VcHandle,
+    out_public: *mut u8,
+) -> i32 {
+    ffi_guard(|| {
+        if out_handle.is_null() || storage_key.is_null() {
+            return VcError::InvalidArgument as i32;
+        }
+        if anchor.current.is_none() || anchor.compare_and_increment.is_none() {
+            return VcError::InvalidArgument as i32;
+        }
+        let profile = match CryptoProfile::from_u8(profile) {
+            Ok(p) => p,
+            Err(_) => return VcError::InvalidArgument as i32,
+        };
+        let dev_id = match read_owned(device_id, device_id_len, MAX_FFI_DEVICE_ID) {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => return VcError::InvalidArgument as i32,
+            Err(e) => return e as i32,
+        };
+        let path_bytes = match read_owned(path, path_len, MAX_FFI_PATH) {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => return VcError::InvalidArgument as i32,
+            Err(e) => return e as i32,
+        };
+        let path_str = match String::from_utf8(path_bytes) {
+            Ok(v) => v,
+            Err(_) => return VcError::InvalidArgument as i32,
+        };
+
+        let mut key = [0u8; 32];
+        unsafe { std::ptr::copy_nonoverlapping(storage_key, key.as_mut_ptr(), 32) };
+        let storage = EncryptedFileStorage::open(&path_str, key);
+        key.zeroize();
+        let storage = match storage {
+            Ok(v) => v,
+            Err(_) => return VcError::Internal as i32,
+        };
+
+        let anchor_impl: Arc<dyn RollbackAnchor> = Arc::new(FfiRollbackAnchor { cb: anchor });
+
+        let engine = if create_if_absent == 1 {
+            let (st, mc) = match coordinated_backends_for_initialize(storage, anchor_impl) {
+                Ok(v) => v,
+                // Refuses whenever the anchor is non-pristine or state exists,
+                // which is what makes this unusable as a rollback escape hatch.
+                Err(_) => return VcError::StateError as i32,
+            };
+            VoiceChatCryptoEngine::initialize_device_with_backends(
+                DeviceConfig {
+                    device_id: dev_id,
+                    profile,
+                },
+                st,
+                mc,
+            )
+        } else {
+            let (st, mc) = match coordinated_backends_for_restore(storage, anchor_impl) {
+                Ok(v) => v,
+                Err(rejection) => return VcError::from(rejection) as i32,
+            };
+            VoiceChatCryptoEngine::restore_device_with_backends(
+                DeviceConfig {
+                    device_id: dev_id,
+                    profile,
+                },
+                st,
+                mc,
+            )
+        };
+
+        let engine = match engine {
+            Ok(v) => v,
+            Err(e) => return VcError::from(e) as i32,
+        };
+
+        let pk = engine.local_identity_public();
+        let shared = Arc::new(EngineSlot::new(engine));
+        let handle = {
+            let mut reg = match registry().lock() {
+                Ok(v) => v,
+                Err(_) => return VcError::Internal as i32,
+            };
+            let handle = match reg.alloc() {
+                Ok(v) => v,
+                Err(e) => return e as i32,
+            };
+            reg.engines.insert(handle, shared);
+            handle
+        };
+        if !out_public.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(pk.as_ptr(), out_public, 32) };
+        }
+        unsafe { *out_handle = handle };
+        VcError::Ok as i32
+    })
 }

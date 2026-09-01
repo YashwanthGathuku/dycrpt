@@ -64,6 +64,13 @@ impl CryptoProfile {
 }
 
 pub fn available_profiles() -> Vec<CryptoProfile> {
+    // `mut` is required whenever either experimental profile feature is on, and
+    // unused otherwise. Narrow and justified, rather than the crate-wide
+    // `unused_mut = "allow"` this replaced (review 2026-08-28).
+    #[cfg_attr(
+        not(any(feature = "header-encrypt", feature = "hybrid")),
+        allow(unused_mut)
+    )]
     let mut v = PROFILE_PREFERENCE.to_vec();
     #[cfg(feature = "header-encrypt")]
     {

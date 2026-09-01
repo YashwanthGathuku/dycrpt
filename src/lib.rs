@@ -50,7 +50,7 @@ pub use primitives::kdf::LABELS;
 pub use session::SessionManager;
 pub use storage::coordinated::{
     coordinated_backends_for_initialize, coordinated_backends_for_restore, AnchoredStorage,
-    PreparedMonotonicCounter,
+    PreparedMonotonicCounter, RestoreRejection,
 };
 pub use storage::encrypted_file::EncryptedFileStorage;
 pub use storage::trusted_anchor::{AnchoredMonotonicCounter, RollbackAnchor};

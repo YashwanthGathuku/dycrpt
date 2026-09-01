@@ -1,3 +1,9 @@
+# Deliberately its own workspace root. Without this table cargo resolves the
+# parent workspace and refuses to build, which made every fuzz gate in CI
+# unrunnable (`cargo build --manifest-path fuzz/Cargo.toml` exits non-zero
+# before compiling anything). Found during review 2026-08-28.
+[workspace]
+
 [package]
 name = "voicechat_crypto-fuzz"
 version = "0.0.0"

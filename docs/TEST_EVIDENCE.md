@@ -204,3 +204,42 @@ Total passing tests in that unfiltered invocation: **140 + 8 + 2 + 2 + 7 + 19 + 
 - Ciphertext / wire compatibility with libsignal
 - `cargo-fuzz` / `libfuzzer-sys` **on this Windows GNU host** (optional feature; `host_runner` **does** build and ran 20_000 iters)
 - Parent VoiceChat app (not in this workspace)
+
+## Assurance run — 2026-08-28 (review branch `hardening/f1-f4-review-fixes-2026-08-28`)
+
+Toolchain: rustc 1.85.0 (per `rust-toolchain.toml`), x86_64-unknown-linux-gnu.
+
+| Gate | Command | Result |
+|---|---|---|
+| Format | `cargo fmt --all -- --check` | clean |
+| Lint (default) | `cargo clippy --all-targets -- -D warnings` | 0 |
+| Lint (all features) | `cargo clippy --all-targets --all-features -- -D warnings` | 0 |
+| Lint (release bin) | `cargo build --release --bin ct_timing` | 0 warnings |
+| Tests | `cargo test --tests --all-features -- --skip ten_thousand` | 318 passed, 0 failed |
+| 10k handshakes | `cargo test --release --all-features ten_thousand` | 1 passed, 11.66 s |
+| Parity | `cargo run -p crypto-parity --bin crypto-parity` | P0=0 core=100.0 ops=100.0 vc=100.0 |
+| Fuzz (CI) | `cargo run --manifest-path fuzz/Cargo.toml --bin host_runner -- 100000` | ok; corpus_accepts=9 mutated_accepts=27073 random_accepts=12599 |
+| Fuzz (long) | `host_runner 5000000` | ok, 38 s; mutated_accepts=1361211 random_accepts=627561 |
+| Timing | `ct_timing --samples 500000` | samples=500000 welch_t=0.7675 max_abs_t=10 passed=true |
+
+Patch series verified by `git am` onto a clean checkout of
+`hardening/p0-audit-fixes-2026-08-22`: applies without conflict, 318 tests pass.
+
+### Gate caveats recorded for the auditor
+
+1. **`ct_timing` argument form.** It parses `--samples N`. A positional argument
+   is silently ignored and the 250,000 default is used. A CI line reading
+   `ct_timing 500000` measures half the intended sample count and still reports
+   `passed: true`.
+2. **`ct_timing` probe coverage.** One probe only: `x25519-secret-class`. It does
+   not cover AEAD tag comparison, wire decoders, skipped-message-key lookup, or
+   XEdDSA scalar decoding. A green timing gate is evidence about X25519 secret
+   handling and nothing else.
+3. **`host_runner` is not a coverage-guided fuzzer.** It is a structure-aware
+   mutational walk with no instrumentation feedback. The `libfuzzer` targets in
+   `fuzz/fuzz_targets/` remain the real fuzzing surface and still require
+   `cargo-fuzz` on nightly; CI builds them but does not run them.
+4. **Prior fuzz history is void.** Before this branch, `fuzz/Cargo.toml` lacked a
+   `[workspace]` table, so every CI fuzz invocation exited non-zero at manifest
+   resolution before compiling. Any earlier green fuzz run in this repository's
+   history should be treated as no evidence at all.

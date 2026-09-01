@@ -134,13 +134,13 @@ fn restore_rejects_different_device_configuration() {
 fn malformed_reload_is_atomic_and_poisons_engine() {
     let storage = SharedStorage::default();
     let counter = SharedCounter::default();
-    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+    let alice = VoiceChatCryptoEngine::initialize_device_with_backends(
         config(b"atomic-alice"),
         Box::new(storage.clone()),
         Box::new(counter),
     )
     .unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"atomic-bob")).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(config(b"atomic-bob")).unwrap();
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let (sid, _) = alice
         .establish_outbound_session(&bundle, b"atomic", b"first", b"ad")
@@ -168,13 +168,13 @@ fn malformed_reload_is_atomic_and_poisons_engine() {
 fn duplicate_persisted_session_tags_are_rejected_on_reload() {
     let storage = SharedStorage::default();
     let counter = SharedCounter::default();
-    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+    let alice = VoiceChatCryptoEngine::initialize_device_with_backends(
         config(b"tag-alice"),
         Box::new(storage.clone()),
         Box::new(counter),
     )
     .unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"tag-bob")).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(config(b"tag-bob")).unwrap();
 
     let bundle1 = bob.generate_public_prekey_bundle(3).unwrap();
     let (sid1, init1) = alice
@@ -222,13 +222,13 @@ fn duplicate_persisted_session_tags_are_rejected_on_reload() {
 fn poison_reload_preserves_live_sessions(key: &[u8], corrupt: &[u8], device: &[u8]) {
     let storage = SharedStorage::default();
     let counter = SharedCounter::default();
-    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+    let alice = VoiceChatCryptoEngine::initialize_device_with_backends(
         config(device),
         Box::new(storage.clone()),
         Box::new(counter),
     )
     .unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"reload-bob")).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(config(b"reload-bob")).unwrap();
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let (sid, _) = alice
         .establish_outbound_session(&bundle, b"reload", b"first", b"ad")
@@ -263,13 +263,13 @@ fn corrupt_replay_reload_leaves_live_sessions_unchanged() {
 fn malformed_persisted_session_does_not_remove_valid_sessions() {
     let storage = SharedStorage::default();
     let counter = SharedCounter::default();
-    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+    let alice = VoiceChatCryptoEngine::initialize_device_with_backends(
         config(b"sess-alice"),
         Box::new(storage.clone()),
         Box::new(counter),
     )
     .unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"sess-bob")).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(config(b"sess-bob")).unwrap();
 
     let bundle1 = bob.generate_public_prekey_bundle(3).unwrap();
     let (sid1, init1) = alice
@@ -319,13 +319,13 @@ fn malformed_persisted_session_does_not_remove_valid_sessions() {
 fn corrupt_session_magic_fails_without_dropping_live_sessions() {
     let storage = SharedStorage::default();
     let counter = SharedCounter::default();
-    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+    let alice = VoiceChatCryptoEngine::initialize_device_with_backends(
         config(b"magic-alice"),
         Box::new(storage.clone()),
         Box::new(counter),
     )
     .unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"magic-bob")).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(config(b"magic-bob")).unwrap();
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let (sid, _) = alice
         .establish_outbound_session(&bundle, b"magic", b"first", b"ad")
@@ -347,13 +347,13 @@ fn corrupt_session_magic_fails_without_dropping_live_sessions() {
 fn successful_reload_replaces_live_sessions_from_storage() {
     let storage = SharedStorage::default();
     let counter = SharedCounter::default();
-    let mut alice = VoiceChatCryptoEngine::initialize_device_with_backends(
+    let alice = VoiceChatCryptoEngine::initialize_device_with_backends(
         config(b"ok-alice"),
         Box::new(storage.clone()),
         Box::new(counter),
     )
     .unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(config(b"ok-bob")).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(config(b"ok-bob")).unwrap();
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let (sid, init) = alice
         .establish_outbound_session(&bundle, b"ok", b"first", b"ad")

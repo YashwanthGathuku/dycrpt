@@ -21,7 +21,7 @@ fn pair() -> (DoubleRatchetState, DoubleRatchetState) {
 
 #[test]
 fn encrypt_not_released_if_commit_aborted() {
-    let (mut alice, _bob) = pair();
+    let (alice, _bob) = pair();
     let mut store = MemoryStorage::default();
     let mut trial = alice.clone_for_trial();
     let (_h, ct) = trial.encrypt(b"secret", b"ad").unwrap();
@@ -38,7 +38,7 @@ fn encrypt_not_released_if_commit_aborted() {
 
 #[test]
 fn decrypt_crash_before_commit_keeps_old_blob() {
-    let (mut alice, mut bob) = pair();
+    let (mut alice, bob) = pair();
     let (h, ct) = alice.encrypt(b"m", b"ad").unwrap();
     let mut store = MemoryStorage::default();
     let tx = store.begin().unwrap();

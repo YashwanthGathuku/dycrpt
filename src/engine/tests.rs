@@ -43,7 +43,7 @@ fn linked_pair() -> (
 
 #[test]
 fn outbound_encrypt_decrypt_roundtrip() {
-    let (mut alice, mut bob, sid_a, sid_b) = linked_pair();
+    let (alice, bob, sid_a, sid_b) = linked_pair();
     let sealed = alice.encrypt(&sid_a, b"hello", b"ad").unwrap();
     assert_eq!(bob.decrypt(&sid_b, &sealed, b"ad").unwrap(), b"hello");
     let reply = bob.encrypt(&sid_b, b"hi-alice", b"ad").unwrap();
@@ -52,15 +52,15 @@ fn outbound_encrypt_decrypt_roundtrip() {
 
 #[test]
 fn wrong_conversation_ad_fails() {
-    let (mut alice, mut bob, sid_a, sid_b) = linked_pair();
+    let (alice, bob, sid_a, sid_b) = linked_pair();
     let sealed = alice.encrypt(&sid_a, b"hello", b"ad").unwrap();
     assert!(bob.decrypt(&sid_b, &sealed, b"other-ad").is_err());
 }
 
 #[test]
 fn voice_profile_forbidden_in_ad() {
-    let mut eng = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut remote = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let eng = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let remote = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"r".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -77,8 +77,8 @@ fn voice_profile_forbidden_in_ad() {
 
 #[test]
 fn voice_payload_ok_without_profile_metadata() {
-    let mut eng = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut remote = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let eng = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let remote = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"r".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -119,8 +119,8 @@ fn fingerprint_symmetric_via_engine() {
 
 #[test]
 fn initiation_packet_encode_decode_roundtrip() {
-    let mut alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -142,7 +142,7 @@ fn initiation_packet_encode_decode_roundtrip() {
 
 #[test]
 fn delete_session_removes_and_stays_deleted() {
-    let (mut alice, _bob, sid_a, _sid_b) = linked_pair();
+    let (alice, _bob, sid_a, _sid_b) = linked_pair();
     alice.delete_session(&sid_a).unwrap();
     assert!(!alice.has_session(&sid_a));
     alice.simulate_crash_reload().unwrap();
@@ -151,8 +151,8 @@ fn delete_session_removes_and_stays_deleted() {
 
 #[test]
 fn replay_rejected() {
-    let mut eng = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut remote = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let eng = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let remote = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"r".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -171,8 +171,8 @@ fn replay_rejected() {
 
 #[test]
 fn initiation_replay_without_one_time_prekeys_is_rejected() {
-    let mut alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -230,8 +230,8 @@ fn modified_initiation_reusing_live_session_tag_is_not_replay() {
 
 #[test]
 fn handshake_opk_and_session_atomic_across_reload() {
-    let mut alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -257,8 +257,8 @@ fn handshake_opk_and_session_atomic_across_reload() {
 
 #[test]
 fn delayed_initiation_survives_signed_and_last_resort_rotation() {
-    let mut alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -281,8 +281,8 @@ fn delayed_initiation_survives_signed_and_last_resort_rotation() {
 
 #[test]
 fn stable_peer_binding_blocks_identity_replacement() {
-    let mut alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob-device".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -304,7 +304,7 @@ fn stable_peer_binding_blocks_identity_replacement() {
         .acknowledge_peer_identity(peer, &bob.local_identity_public(), Some(b"bob-device"), 123)
         .unwrap();
 
-    let mut impostor = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let impostor = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob-device".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -327,7 +327,7 @@ fn stable_peer_binding_blocks_identity_replacement() {
 
 #[test]
 fn peer_binding_survives_crash_reload() {
-    let mut alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
     let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob".to_vec(),
         profile: CryptoProfile::ClassicalV1,
@@ -348,8 +348,8 @@ fn peer_binding_survives_crash_reload() {
 
 #[test]
 fn trust_not_implied_by_session_until_ack() {
-    let mut alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -374,7 +374,7 @@ fn trust_not_implied_by_session_until_ack() {
 
 #[test]
 fn delete_all_sessions_preserves_device_state() {
-    let (mut alice, _bob, sid_a, _sid_b) = linked_pair();
+    let (alice, _bob, sid_a, _sid_b) = linked_pair();
     let identity_before = alice.local_identity_public();
     alice.delete_all_sessions().unwrap();
     assert!(!alice.has_session(&sid_a));
@@ -385,8 +385,8 @@ fn delete_all_sessions_preserves_device_state() {
 
 #[test]
 fn crash_reload_rejects_reused_one_time_prekey() {
-    let mut alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let alice = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"device-2".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
@@ -398,7 +398,7 @@ fn crash_reload_rejects_reused_one_time_prekey() {
     let (_, pt) = bob.process_inbound_session(&init, b"c1", b"ad").unwrap();
     assert_eq!(pt, b"A0");
     bob.simulate_crash_reload().unwrap();
-    let mut alice2 = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
+    let alice2 = VoiceChatCryptoEngine::initialize_device(cfg()).unwrap();
     let (_, init2) = alice2
         .establish_outbound_session(&bundle, b"c2", b"A1", b"ad")
         .unwrap();
@@ -407,7 +407,7 @@ fn crash_reload_rejects_reused_one_time_prekey() {
 
 #[test]
 fn crash_reload_classical_continues() {
-    let (mut alice, mut bob, sid_a, sid_b) = linked_pair();
+    let (alice, bob, sid_a, sid_b) = linked_pair();
     let s = alice.encrypt(&sid_a, b"pre", b"ad").unwrap();
     assert_eq!(bob.decrypt(&sid_b, &s, b"ad").unwrap(), b"pre");
     alice.simulate_crash_reload().unwrap();
@@ -485,7 +485,7 @@ impl TransactionalStorage for FailSecondCommitStorage {
 
 #[test]
 fn uncertain_storage_commit_poisons_engine() {
-    let mut engine = VoiceChatCryptoEngine::initialize_device_with_backends(
+    let engine = VoiceChatCryptoEngine::initialize_device_with_backends(
         cfg(),
         Box::new(FailSecondCommitStorage::new()),
         Box::new(MemoryCounter::default()),
@@ -527,14 +527,14 @@ fn linked_with(
 #[cfg(feature = "hybrid")]
 #[test]
 fn hybrid_engine_roundtrip_and_no_classical_mix() {
-    let (mut alice, mut bob, sid_a, sid_b) = linked_with(CryptoProfile::HybridPqV1);
+    let (alice, bob, sid_a, sid_b) = linked_with(CryptoProfile::HybridPqV1);
     let sealed = alice.encrypt(&sid_a, b"hybrid", b"ad").unwrap();
     assert!(sealed.header.len() > 40);
     assert_eq!(bob.decrypt(&sid_b, &sealed, b"ad").unwrap(), b"hybrid");
     let reply = bob.encrypt(&sid_b, b"ok", b"ad").unwrap();
     assert_eq!(alice.decrypt(&sid_a, &reply, b"ad").unwrap(), b"ok");
 
-    let (mut c_alice, mut c_bob, c_sid_a, c_sid_b) = linked_with(CryptoProfile::ClassicalV1);
+    let (c_alice, c_bob, c_sid_a, c_sid_b) = linked_with(CryptoProfile::ClassicalV1);
     let classical = c_alice.encrypt(&c_sid_a, b"class", b"ad").unwrap();
     assert!(bob.decrypt(&sid_b, &classical, b"ad").is_err());
     assert!(c_bob.decrypt(&c_sid_b, &sealed, b"ad").is_err());
@@ -543,7 +543,7 @@ fn hybrid_engine_roundtrip_and_no_classical_mix() {
 #[cfg(feature = "header-encrypt")]
 #[test]
 fn header_encrypt_engine_roundtrip_and_reload() {
-    let (mut alice, mut bob, sid_a, sid_b) = linked_with(CryptoProfile::ClassicalHeV1);
+    let (alice, bob, sid_a, sid_b) = linked_with(CryptoProfile::ClassicalHeV1);
     let sealed = alice.encrypt(&sid_a, b"hidden-hdr", b"ad").unwrap();
     assert_eq!(bob.decrypt(&sid_b, &sealed, b"ad").unwrap(), b"hidden-hdr");
     alice.simulate_crash_reload().unwrap();
@@ -555,7 +555,7 @@ fn header_encrypt_engine_roundtrip_and_reload() {
 #[cfg(feature = "hybrid")]
 #[test]
 fn crash_reload_hybrid_continues() {
-    let (mut alice, mut bob, sid_a, sid_b) = linked_with(CryptoProfile::HybridPqV1);
+    let (alice, bob, sid_a, sid_b) = linked_with(CryptoProfile::HybridPqV1);
     let s = alice.encrypt(&sid_a, b"hy-pre", b"ad").unwrap();
     assert_eq!(bob.decrypt(&sid_b, &s, b"ad").unwrap(), b"hy-pre");
     alice.simulate_crash_reload().unwrap();

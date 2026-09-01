@@ -18,8 +18,8 @@ fn pair() -> (
     voicechat_crypto::SessionId,
     InitiationPacket,
 ) {
-    let mut alice = engine(b"alice-v2");
-    let mut bob = engine(b"bob-v2");
+    let alice = engine(b"alice-v2");
+    let bob = engine(b"bob-v2");
     let bundle = bob.generate_public_prekey_bundle(2).unwrap();
     let (sid_a, init) = alice
         .establish_outbound_session(&bundle, b"conv-v2", b"first", b"ad")
@@ -33,7 +33,7 @@ fn pair() -> (
 
 #[test]
 fn v2_wire_roundtrip_binds_version_profile_and_tag() {
-    let (mut alice, mut bob, sid_a, sid_b, init) = pair();
+    let (alice, bob, sid_a, sid_b, init) = pair();
     assert_eq!(init.protocol_version, PROTOCOL_VERSION);
     assert_eq!(init.first_message.protocol_version, PROTOCOL_VERSION);
     assert_eq!(init.profile, CryptoProfile::ClassicalV1);
@@ -46,7 +46,7 @@ fn v2_wire_roundtrip_binds_version_profile_and_tag() {
 
 #[test]
 fn session_tag_relabel_fails_before_ratchet_and_original_still_decrypts() {
-    let (mut alice, mut bob, sid_a, sid_b, _init) = pair();
+    let (alice, bob, sid_a, sid_b, _init) = pair();
     let sealed = alice.encrypt(&sid_a, b"tag-bound", b"ad").unwrap();
     let mut relabeled = sealed.clone();
     relabeled.session_tag.0[0] ^= 0x80;
@@ -60,7 +60,7 @@ fn session_tag_relabel_fails_before_ratchet_and_original_still_decrypts() {
 
 #[test]
 fn protocol_relabel_fails_before_ratchet_and_original_still_decrypts() {
-    let (mut alice, mut bob, sid_a, sid_b, _init) = pair();
+    let (alice, bob, sid_a, sid_b, _init) = pair();
     let sealed = alice.encrypt(&sid_a, b"version-bound", b"ad").unwrap();
     let mut relabeled = sealed.clone();
     relabeled.protocol_version = PROTOCOL_VERSION - 1;
@@ -77,8 +77,8 @@ fn protocol_relabel_fails_before_ratchet_and_original_still_decrypts() {
 
 #[test]
 fn zero_session_tag_is_rejected_before_handshake_state_changes() {
-    let mut alice = engine(b"alice-zero-tag");
-    let mut bob = engine(b"bob-zero-tag");
+    let alice = engine(b"alice-zero-tag");
+    let bob = engine(b"bob-zero-tag");
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let (_, original) = alice
         .establish_outbound_session(&bundle, b"zero-tag", b"hello", b"ad")
@@ -99,9 +99,9 @@ fn zero_session_tag_is_rejected_before_handshake_state_changes() {
 
 #[test]
 fn live_session_tag_collision_is_rejected_without_consuming_new_opk() {
-    let (_alice1, mut bob, _sid_a1, _sid_b1, first_init) = pair();
+    let (_alice1, bob, _sid_a1, _sid_b1, first_init) = pair();
 
-    let mut alice2 = engine(b"alice-second");
+    let alice2 = engine(b"alice-second");
     let bundle2 = bob.generate_public_prekey_bundle(3).unwrap();
     let (_, original2) = alice2
         .establish_outbound_session(&bundle2, b"second-conv", b"second", b"ad")
@@ -129,8 +129,8 @@ fn live_session_tag_collision_is_rejected_without_consuming_new_opk() {
 
 #[test]
 fn oversized_remote_device_is_rejected_before_outbound_session_creation() {
-    let mut alice = engine(b"alice-device-bound");
-    let mut bob = engine(b"bob-device-bound");
+    let alice = engine(b"alice-device-bound");
+    let bob = engine(b"bob-device-bound");
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let oversized = vec![7u8; 4097];
     assert_eq!(
@@ -160,8 +160,8 @@ fn oversized_remote_device_is_rejected_before_outbound_session_creation() {
 
 #[test]
 fn oversized_peer_id_is_rejected_before_outbound_session_creation() {
-    let mut alice = engine(b"alice-peer-bound");
-    let mut bob = engine(b"bob-peer-bound");
+    let alice = engine(b"alice-peer-bound");
+    let bob = engine(b"bob-peer-bound");
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let oversized_peer = vec![3u8; 4097];
     assert_eq!(
@@ -189,8 +189,8 @@ fn oversized_peer_id_is_rejected_before_outbound_session_creation() {
 
 #[test]
 fn sealed_decoder_rejects_zero_network_tag() {
-    let mut alice = engine(b"alice-sealed-zero");
-    let mut bob = engine(b"bob-sealed-zero");
+    let alice = engine(b"alice-sealed-zero");
+    let bob = engine(b"bob-sealed-zero");
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let (sid, _) = alice
         .establish_outbound_session(&bundle, b"conv", b"first", b"ad")
@@ -202,8 +202,8 @@ fn sealed_decoder_rejects_zero_network_tag() {
 
 #[test]
 fn pending_initiation_survives_crash_byte_for_byte() {
-    let mut alice = engine(b"alice-pending");
-    let mut bob = engine(b"bob-pending");
+    let alice = engine(b"alice-pending");
+    let bob = engine(b"bob-pending");
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let (sid_a, packet) = alice
         .establish_outbound_session(&bundle, b"pending", b"first", b"ad")
@@ -226,8 +226,8 @@ fn pending_initiation_survives_crash_byte_for_byte() {
 
 #[test]
 fn explicit_pending_ack_is_durable() {
-    let mut alice = engine(b"alice-ack");
-    let mut bob = engine(b"bob-ack");
+    let alice = engine(b"alice-ack");
+    let bob = engine(b"bob-ack");
     let bundle = bob.generate_public_prekey_bundle(1).unwrap();
     let (sid, _) = alice
         .establish_outbound_session(&bundle, b"ack", b"first", b"ad")
