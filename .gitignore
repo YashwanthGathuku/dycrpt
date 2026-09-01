@@ -1,5 +1,6 @@
 /target
 **/target/
+mutants.out/
 .venv/
 formal/tla/states/
 states/

@@ -1,0 +1,15 @@
+# cargo-mutants configuration.
+#
+# Mutation testing reruns the whole suite once per injected fault, so a single
+# slow test dominates the total. Measured 2026-08-28: the debug-mode lib suite
+# takes 539s, of which ~533s is the `ten_thousand` randomized handshake gate
+# (11.7s in release, ~90x slower in debug). Excluding it takes a mutant cycle
+# from ~10 minutes to ~1 minute.
+#
+# The gate is NOT disabled — it still runs in release via its own CI step. It is
+# only skipped inside mutation runs, where its cost buys nothing: it exercises
+# the same code paths the fast tests already cover, just more of them.
+additional_cargo_test_args = ["--", "--skip", "ten_thousand"]
+
+# Files with no meaningful behaviour to mutate.
+exclude_globs = ["src/testing/**", "src/bin/**", "src/ffi/jni.rs"]
