@@ -16,8 +16,8 @@ fn engine(id: &[u8], profile: CryptoProfile) -> VoiceChatCryptoEngine {
 
 #[test]
 fn adapter_full_lifecycle_text_and_voice() {
-    let mut alice = engine(b"alice-phone", CryptoProfile::ClassicalV1);
-    let mut bob = engine(b"bob-phone", CryptoProfile::ClassicalV1);
+    let alice = engine(b"alice-phone", CryptoProfile::ClassicalV1);
+    let bob = engine(b"bob-phone", CryptoProfile::ClassicalV1);
     let bundle = bob.generate_public_prekey_bundle(4).unwrap();
     let (sid_a, init) = alice
         .establish_outbound_session(&bundle, b"thread-1", b"hello", b"type=text")
@@ -62,8 +62,8 @@ fn adapter_full_lifecycle_text_and_voice() {
 #[cfg(feature = "hybrid")]
 #[test]
 fn adapter_hybrid_profile_is_not_classical() {
-    let mut alice = engine(b"a", CryptoProfile::HybridPqV1);
-    let mut bob = engine(b"b", CryptoProfile::HybridPqV1);
+    let alice = engine(b"a", CryptoProfile::HybridPqV1);
+    let bob = engine(b"b", CryptoProfile::HybridPqV1);
     let bundle = bob.generate_public_prekey_bundle(2).unwrap();
     let (sid_a, init) = alice
         .establish_outbound_session(&bundle, b"h", b"pq", b"ad")
@@ -77,8 +77,8 @@ fn adapter_hybrid_profile_is_not_classical() {
 
 #[test]
 fn adapter_replenish_prekeys_and_delete_all() {
-    let mut alice = engine(b"a", CryptoProfile::ClassicalV1);
-    let mut bob = engine(b"b", CryptoProfile::ClassicalV1);
+    let alice = engine(b"a", CryptoProfile::ClassicalV1);
+    let bob = engine(b"b", CryptoProfile::ClassicalV1);
     let _ = bob.replenish_prekeys(2).unwrap();
     let bundle = bob.generate_public_prekey_bundle(2).unwrap();
     let (sid, _init) = alice

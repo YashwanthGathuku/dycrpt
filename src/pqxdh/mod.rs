@@ -11,7 +11,7 @@ use crate::primitives::error::PrimitiveError;
 use crate::primitives::kdf::pqxdh_kdf;
 use crate::primitives::kem::{MlKemCiphertext, MlKemPublic, MlKemSecret};
 use crate::primitives::x25519::{X25519Public, X25519Secret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Result of a successful PQXDH run (both sides obtain the same SK).
 #[derive(Zeroize)]
@@ -28,7 +28,6 @@ impl Drop for PqxdhSharedSecret {
     }
 }
 
-/// Alice (initiator) side of PQXDH.
 pub struct AliceInitiation {
     pub ephemeral_public: X25519Public,
     pub shared: PqxdhSharedSecret,
@@ -37,18 +36,11 @@ pub struct AliceInitiation {
     pub used_pq_prekey_id: PqPrekeyId,
 }
 
-/// Perform Alice’s side of PQXDH against a validated public bundle.
+/// Perform Alice's side of PQXDH against a validated public bundle.
 ///
-/// Spec §3.3:
-/// 1. Verify signatures (caller must have already called `bundle.validate`).
-/// 2. Generate EKA.
-/// 3. (CT, SS) = PQKEM-ENC(PQPKB)
-/// 4. DH1 = DH(IKA, SPKB)
-/// 5. DH2 = DH(EKA, IKB)
-/// 6. DH3 = DH(EKA, SPKB)
-/// 7. Optional DH4 = DH(EKA, OPKB)
-/// 8. SK = KDF(DH1 || DH2 || DH3 [|| DH4] || SS)
-/// 9. AD = EncodeEC(IKA) || EncodeEC(IKB) || EncodeKEM(PQPKB)
+/// Every X25519 term uses contributory-behavior validation: a nonzero low-order
+/// peer input that yields an all-zero shared secret is rejected before it can be
+/// included in the PQXDH KDF.
 pub fn alice_initiate(
     alice_ik: &IdentityKeyPair,
     bob_bundle: &PublicPrekeyBundle,
@@ -57,46 +49,38 @@ pub fn alice_initiate(
 
     let eka = X25519Secret::generate()?;
     let pq_pk = MlKemPublic::from_bytes(&bob_bundle.pq_prekey_public)?;
-    let (mut ss, kem_ct) = pq_pk.encapsulate()?;
+    let (ss_raw, kem_ct) = pq_pk.encapsulate()?;
+    let ss = Zeroizing::new(ss_raw);
 
-    let dh1 = alice_ik.secret.diffie_hellman(&bob_bundle.signed_prekey);
-    let dh2 = eka.diffie_hellman(&bob_bundle.identity_key);
-    let dh3 = eka.diffie_hellman(&bob_bundle.signed_prekey);
+    let dh1 = Zeroizing::new(
+        alice_ik
+            .secret
+            .diffie_hellman_checked(&bob_bundle.signed_prekey)?,
+    );
+    let dh2 = Zeroizing::new(eka.diffie_hellman_checked(&bob_bundle.identity_key)?);
+    let dh3 = Zeroizing::new(eka.diffie_hellman_checked(&bob_bundle.signed_prekey)?);
 
-    let mut km = Vec::with_capacity(32 * 5);
-    km.extend_from_slice(&dh1);
-    km.extend_from_slice(&dh2);
-    km.extend_from_slice(&dh3);
+    let mut km = Zeroizing::new(Vec::with_capacity(32 * 5));
+    km.extend_from_slice(&*dh1);
+    km.extend_from_slice(&*dh2);
+    km.extend_from_slice(&*dh3);
 
     let used_ec_opk_id = if let Some((id, opk_pub)) = &bob_bundle.one_time_ec {
-        let dh4 = eka.diffie_hellman(opk_pub);
-        km.extend_from_slice(&dh4);
+        let dh4 = Zeroizing::new(eka.diffie_hellman_checked(opk_pub)?);
+        km.extend_from_slice(&*dh4);
         Some(*id)
     } else {
         None
     };
-
-    km.extend_from_slice(&ss);
+    km.extend_from_slice(&*ss);
 
     let sk = pqxdh_kdf(&km)?;
-
     let mut ad = Vec::new();
     ad.extend_from_slice(&encode_ec(&alice_ik.public()));
     ad.extend_from_slice(&encode_ec(&bob_bundle.identity_key));
     ad.extend_from_slice(&encode_kem(&pq_pk));
 
     let ephemeral_public = eka.public_key();
-    drop(eka);
-
-    let mut dh1z = dh1;
-    let mut dh2z = dh2;
-    let mut dh3z = dh3;
-    dh1z.zeroize();
-    dh2z.zeroize();
-    dh3z.zeroize();
-    km.zeroize();
-    ss.zeroize();
-
     Ok(AliceInitiation {
         ephemeral_public,
         shared: PqxdhSharedSecret { sk, ad },
@@ -106,7 +90,6 @@ pub fn alice_initiate(
     })
 }
 
-/// Bob’s private material needed to process an initiation.
 pub struct BobPrivateMaterial<'a> {
     pub identity: &'a IdentityKeyPair,
     pub signed_prekey: &'a SignedPrekey,
@@ -116,7 +99,7 @@ pub struct BobPrivateMaterial<'a> {
     pub pq_prekey_id: PqPrekeyId,
 }
 
-/// Process Alice’s initiation message (Bob side). Spec §3.4.
+/// Process Alice's initiation message (Bob side). Spec §3.4.
 pub fn bob_process(
     bob: &BobPrivateMaterial<'_>,
     alice_ik: &X25519Public,
@@ -125,44 +108,32 @@ pub fn bob_process(
     used_ec_opk_id: Option<EcPrekeyId>,
 ) -> Result<PqxdhSharedSecret, PrimitiveError> {
     let ct = MlKemCiphertext::from_bytes(kem_ct)?;
-    let mut ss = bob.pq_secret.decapsulate(&ct)?;
+    let ss = Zeroizing::new(bob.pq_secret.decapsulate(&ct)?);
 
-    let dh1 = bob.signed_prekey.secret.diffie_hellman(alice_ik);
-    let dh2 = bob.identity.secret.diffie_hellman(alice_ek);
-    let dh3 = bob.signed_prekey.secret.diffie_hellman(alice_ek);
+    let dh1 = Zeroizing::new(bob.signed_prekey.secret.diffie_hellman_checked(alice_ik)?);
+    let dh2 = Zeroizing::new(bob.identity.secret.diffie_hellman_checked(alice_ek)?);
+    let dh3 = Zeroizing::new(bob.signed_prekey.secret.diffie_hellman_checked(alice_ek)?);
 
-    let mut km = Vec::with_capacity(32 * 5);
-    km.extend_from_slice(&dh1);
-    km.extend_from_slice(&dh2);
-    km.extend_from_slice(&dh3);
+    let mut km = Zeroizing::new(Vec::with_capacity(32 * 5));
+    km.extend_from_slice(&*dh1);
+    km.extend_from_slice(&*dh2);
+    km.extend_from_slice(&*dh3);
 
     if let Some(id) = used_ec_opk_id {
         let opk = bob.one_time_ec.ok_or(PrimitiveError::InvalidSecretKey)?;
         if opk.id != id {
             return Err(PrimitiveError::InvalidSecretKey);
         }
-        let dh4 = opk.secret.diffie_hellman(alice_ek);
-        km.extend_from_slice(&dh4);
+        let dh4 = Zeroizing::new(opk.secret.diffie_hellman_checked(alice_ek)?);
+        km.extend_from_slice(&*dh4);
     }
-
-    km.extend_from_slice(&ss);
+    km.extend_from_slice(&*ss);
 
     let sk = pqxdh_kdf(&km)?;
-
     let mut ad = Vec::new();
     ad.extend_from_slice(&encode_ec(alice_ik));
     ad.extend_from_slice(&encode_ec(&bob.identity.public()));
     ad.extend_from_slice(&encode_kem(bob.pq_public));
-
-    let mut dh1z = dh1;
-    let mut dh2z = dh2;
-    let mut dh3z = dh3;
-    dh1z.zeroize();
-    dh2z.zeroize();
-    dh3z.zeroize();
-    km.zeroize();
-    ss.zeroize();
-
     Ok(PqxdhSharedSecret { sk, ad })
 }
 
@@ -256,6 +227,37 @@ mod tests {
     }
 
     #[test]
+    fn bob_rejects_noncontributory_alice_identity() {
+        let alice_ik = IdentityKeyPair::generate().unwrap();
+        let bob_ik = IdentityKeyPair::generate().unwrap();
+        let store = PrekeyStore::new(&bob_ik).unwrap();
+        let bundle = store.public_bundle(&bob_ik).unwrap();
+        let alice = alice_initiate(&alice_ik, &bundle).unwrap();
+        let pq_public = store.last_resort_pq.public().unwrap();
+        let bob_mat = BobPrivateMaterial {
+            identity: &bob_ik,
+            signed_prekey: &store.signed,
+            one_time_ec: None,
+            pq_secret: &store.last_resort_pq.secret,
+            pq_public: &pq_public,
+            pq_prekey_id: bundle.pq_prekey_id,
+        };
+        let mut low_order = [0u8; 32];
+        low_order[0] = 1;
+        let low_order = X25519Public::from_bytes(low_order).unwrap();
+        assert!(matches!(
+            bob_process(
+                &bob_mat,
+                &low_order,
+                &alice.ephemeral_public,
+                &alice.kem_ciphertext,
+                None,
+            ),
+            Err(PrimitiveError::InvalidPublicKey)
+        ));
+    }
+
+    #[test]
     fn modified_signed_prekey_sig_fails() {
         let bob_ik = IdentityKeyPair::generate().unwrap();
         let store = PrekeyStore::new(&bob_ik).unwrap();
@@ -276,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_kem_ciphertext_rejected() {
+    fn malformed_kem_ciphertext_rejected_or_changes_secret() {
         let alice_ik = IdentityKeyPair::generate().unwrap();
         let bob_ik = IdentityKeyPair::generate().unwrap();
         let store = PrekeyStore::new(&bob_ik).unwrap();
@@ -292,19 +294,16 @@ mod tests {
             pq_prekey_id: bundle.pq_prekey_id,
         };
         let mut bad = alice.kem_ciphertext.clone();
-        if let Some(b) = bad.first_mut() {
-            *b ^= 0xff;
+        if let Some(byte) = bad.first_mut() {
+            *byte ^= 0xff;
         }
-        let res = bob_process(
+        match bob_process(
             &bob_mat,
             &alice_ik.public(),
             &alice.ephemeral_public,
             &bad,
             None,
-        );
-        // Implicit rejection: decaps succeeds but SK differs, so we check SK mismatch
-        // by comparing to Alice. Alternatively length-invalid CT is rejected.
-        match res {
+        ) {
             Ok(shared) => assert_ne!(shared.sk, alice.shared.sk),
             Err(_) => {}
         }
@@ -344,10 +343,7 @@ mod tests {
         let bob_ik = IdentityKeyPair::generate().unwrap();
         let mut store = PrekeyStore::new(&bob_ik).unwrap();
         store.replenish(&bob_ik, 1, 0).unwrap();
-        let id = {
-            let bundle = store.public_bundle(&bob_ik).unwrap();
-            bundle.one_time_ec.unwrap().0
-        };
+        let id = store.public_bundle(&bob_ik).unwrap().one_time_ec.unwrap().0;
         store.consume_ec(id).unwrap();
         assert!(store.consume_ec(id).is_err());
     }

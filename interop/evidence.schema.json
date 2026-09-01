@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dycrpt.invalid/schemas/interop-evidence-v1.json",
+  "title": "dycrpt physical-device interoperability evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "dycrpt_commit", "direction", "physical_devices", "profile",
+    "protocol_version", "endpoint_a", "endpoint_b", "cases",
+    "private_key_material_logged"
+  ],
+  "properties": {
+    "schema": {"const": "dycrpt-physical-interop-v1"},
+    "dycrpt_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "direction": {
+      "enum": ["android-android", "ios-ios", "android-ios", "ios-android"]
+    },
+    "physical_devices": {"const": true},
+    "profile": {"const": "ClassicalV1"},
+    "protocol_version": {"const": 2},
+    "private_key_material_logged": {"const": false},
+    "endpoint_a": {"$ref": "#/$defs/endpoint"},
+    "endpoint_b": {"$ref": "#/$defs/endpoint"},
+    "cases": {
+      "type": "array",
+      "minItems": 12,
+      "items": {"$ref": "#/$defs/case"}
+    }
+  },
+  "$defs": {
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "device", "os", "app_build", "native_sha256"],
+      "properties": {
+        "platform": {"enum": ["android", "ios"]},
+        "device": {"type": "string", "minLength": 1, "maxLength": 256},
+        "os": {"type": "string", "minLength": 1, "maxLength": 128},
+        "app_build": {"type": "string", "minLength": 1, "maxLength": 128},
+        "native_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "pass", "artifacts"],
+      "properties": {
+        "id": {
+          "enum": [
+            "pqxdh-first", "bidirectional-ratchet", "network-reordering",
+            "duplicate-ciphertext", "tamper-recovery", "crash-after-commit",
+            "crash-before-commit", "initiation-retry", "identity-replacement",
+            "prekey-rotation", "opk-concurrency", "storage-rollback"
+          ]
+        },
+        "pass": {"const": true},
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

@@ -13,3 +13,7 @@ voicechat_crypto = { path = "..", default-features = false, features = ["std"] }
 [[bin]]
 name = "crypto-parity"
 path = "src/main.rs"
+
+[[bin]]
+name = "external-oracle"
+path = "src/bin/external_oracle.rs"

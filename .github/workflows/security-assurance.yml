@@ -1,0 +1,215 @@
+name: security-assurance
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.85.0
+          rustc --version --verbose
+          cargo --version
+
+      - name: Install pinned assurance tooling
+        run: |
+          cargo install cargo-deny --version 0.18.9 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo install cargo-auditable --version 0.7.5 --locked
+
+      - name: Enforce dependency licenses advisories and sources
+        run: cargo deny check
+
+      - name: Independent RustSec lockfile audit
+        run: cargo audit -D warnings
+
+      - name: Build auditable production FFI artifacts
+        run: cargo auditable build --locked --release --features ffi
+
+      - name: Generate reproducible CycloneDX SBOM and provenance predicate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assurance
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          sha256sum Cargo.lock > release-assurance/cargo-lock-before.txt
+          # Dependencies are already fetched by the locked production build.
+          # Offline mode prevents SBOM generation from resolving anything new.
+          CARGO_NET_OFFLINE=true cargo cyclonedx \
+            --format json --spec-version 1.5 --all-features --override-filename dycrpt-sbom
+          sha256sum Cargo.lock > release-assurance/cargo-lock-after.txt
+          cmp release-assurance/cargo-lock-before.txt release-assurance/cargo-lock-after.txt
+
+          SBOM="$(find . -maxdepth 2 -type f -name 'dycrpt-sbom*.cdx.json' -print -quit)"
+          test -n "$SBOM"
+          cp "$SBOM" release-assurance/dycrpt-sbom.cdx.json
+          cp Cargo.lock release-assurance/Cargo.lock
+          cargo tree --locked --workspace --all-features > release-assurance/cargo-tree.txt
+          cargo metadata --locked --format-version 1 > release-assurance/cargo-metadata.json
+          git rev-parse HEAD > release-assurance/commit.txt
+          rustc --version --verbose > release-assurance/rustc.txt
+          cargo --version > release-assurance/cargo.txt
+          find target/release -maxdepth 1 -type f \
+            \( -name 'libvoicechat_crypto.so' -o -name 'libvoicechat_crypto.a' -o -name 'voicechat_crypto.dll' \) \
+            -print0 | sort -z | xargs -0 -r sha256sum > release-assurance/artifact-sha256.txt
+          test -s release-assurance/artifact-sha256.txt
+
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          commit=subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+          if commit != os.environ['GITHUB_SHA']:
+              raise SystemExit('candidate SHA mismatch')
+          subjects=[]
+          for line in pathlib.Path('release-assurance/artifact-sha256.txt').read_text().splitlines():
+              digest, path=line.split(None,1)
+              subjects.append({'name':path.strip(),'digest':{'sha256':digest}})
+          provenance={
+              '_type':'https://in-toto.io/Statement/v1',
+              'subject':subjects,
+              'predicateType':'https://slsa.dev/provenance/v1',
+              'predicate':{
+                  'buildDefinition':{
+                      'buildType':'https://github.com/YashwanthGathuku/dycrpt/.github/workflows/security-assurance.yml',
+                      'externalParameters':{'commit':commit,'ref':os.environ.get('GITHUB_REF','')},
+                      'internalParameters':{'rust':'1.85.0','locked':True,'features':['ffi']},
+                      'resolvedDependencies':[{'uri':'git+https://github.com/'+os.environ['GITHUB_REPOSITORY']+'@'+commit}]
+                  },
+                  'runDetails':{
+                      'builder':{'id':'https://github.com/actions/runner'},
+                      'metadata':{
+                          'invocationId':'https://github.com/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'+os.environ['GITHUB_RUN_ID']+'/attempts/'+os.environ['GITHUB_RUN_ATTEMPT']
+                      }
+                  }
+              }
+          }
+          pathlib.Path('release-assurance/provenance.json').write_text(
+              json.dumps(provenance,sort_keys=True,indent=2)+'\n', encoding='utf-8')
+          PY
+
+          sha256sum release-assurance/dycrpt-sbom.cdx.json \
+            release-assurance/Cargo.lock \
+            release-assurance/cargo-tree.txt \
+            release-assurance/cargo-metadata.json \
+            release-assurance/provenance.json \
+            > release-assurance/evidence-sha256.txt
+
+      - name: Keyless-sign and verify provenance, SBOM, and artifact manifest
+        uses: sigstore/gh-action-sigstore-python@f832326173235dcb00dd5d92cd3f353de3188e6c # v3.1.0
+        with:
+          inputs: |
+            release-assurance/provenance.json
+            release-assurance/dycrpt-sbom.cdx.json
+            release-assurance/artifact-sha256.txt
+          verify: true
+          verify-cert-identity: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/security-assurance.yml@${{ github.ref }}
+          verify-oidc-issuer: https://token.actions.githubusercontent.com
+          upload-signing-artifacts: false
+          release-signing-artifacts: false
+
+      - name: Record successful supply-chain assurance
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundles="$(find release-assurance -type f -name '*.sigstore.json' | wc -l)"
+          test "$bundles" -ge 3
+          python3 - <<'PY'
+          import json, os, pathlib
+          evidence={
+              'schema':'dycrpt-supply-chain-v1',
+              'commit':os.environ['GITHUB_SHA'],
+              'rust':'1.85.0',
+              'cargo_deny':'0.18.9',
+              'cargo_audit':'0.22.2',
+              'cargo_cyclonedx':'0.5.9',
+              'cargo_auditable':'0.7.5',
+              'deny_policy_passed':True,
+              'rustsec_passed':True,
+              'sbom_format':'CycloneDX-1.5-json',
+              'sbom_generated':True,
+              'lockfile_unchanged':True,
+              'auditable_binary_built':True,
+              'provenance_predicate':'SLSA-v1',
+              'sigstore_keyless':True,
+              'sigstore_rekor_inclusion_verified':True,
+              'signed_objects':3,
+              'passed':True,
+          }
+          pathlib.Path('release-assurance/summary.json').write_text(
+              json.dumps(evidence,sort_keys=True,indent=2)+'\n',encoding='utf-8')
+          PY
+
+      - name: Upload immutable assurance bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: supply-chain-${{ github.sha }}
+          path: release-assurance/
+          if-no-files-found: error
+          retention-days: 90
+
+  # Optional second provenance layer where the repository plan supports GitHub
+  # artifact attestations. Sigstore above is the always-on provenance gate.
+  attest-release:
+    if: github.event_name == 'push' && vars.ENABLE_GITHUB_ATTESTATIONS == 'true'
+    needs: supply-chain
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust and SBOM tooling
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Rebuild exact production subject and SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          cargo build --locked --release --features ffi
+          CARGO_NET_OFFLINE=true cargo cyclonedx \
+            --format json --spec-version 1.5 --all-features --override-filename dycrpt-sbom
+          SBOM="$(find . -maxdepth 2 -type f -name 'dycrpt-sbom*.cdx.json' -print -quit)"
+          test -n "$SBOM"
+          cp "$SBOM" dycrpt-sbom.cdx.json
+          test -f target/release/libvoicechat_crypto.so
+
+      - name: Attest SLSA build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: target/release/libvoicechat_crypto.so
+
+      - name: Attest CycloneDX SBOM to the production artifact
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: target/release/libvoicechat_crypto.so
+          sbom-path: dycrpt-sbom.cdx.json

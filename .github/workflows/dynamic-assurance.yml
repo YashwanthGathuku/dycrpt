@@ -1,0 +1,196 @@
+name: dynamic-assurance
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per libFuzzer target
+        required: false
+        default: '1800'
+  schedule:
+    - cron: '17 4 * * 0'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY: nightly-2026-08-20
+
+jobs:
+  miri-ffi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned Miri nightly
+        run: |
+          rustup toolchain install "$NIGHTLY" --profile minimal --component miri
+          cargo +"$NIGHTLY" miri setup
+      - name: Interpret unsafe FFI boundary under multiple Miri schedules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for seed in 0 1 2 3 4 5 6 7; do
+            echo "Miri seed=$seed"
+            MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-seed=$seed" \
+              cargo +"$NIGHTLY" miri test --locked --features ffi 'ffi::tests::'
+          done
+      - name: Record Miri evidence
+        run: |
+          mkdir -p miri-evidence
+          python3 - <<'PY'
+          import json, os
+          evidence={'schema':'dycrpt-miri-v1','commit':os.environ['GITHUB_SHA'],
+                    'nightly':os.environ['NIGHTLY'],'strict_provenance':True,
+                    'scheduler_seeds':8,'ffi_scope':True,'passed':True}
+          with open('miri-evidence/summary.json','w') as f:
+              json.dump(evidence,f,sort_keys=True,indent=2); f.write('\n')
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: miri-${{ github.sha }}
+          path: miri-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  address-sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned sanitizer nightly
+        run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
+      - name: Run full feature matrix under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address -Cdebuginfo=1
+          RUSTDOCFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1:check_initialization_order=1
+        run: |
+          cargo +"$NIGHTLY" test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            --locked --workspace --all-targets --all-features -- --skip ten_thousand
+      - name: Record ASan evidence
+        run: |
+          mkdir -p asan-evidence
+          python3 - <<'PY'
+          import json, os
+          evidence={'schema':'dycrpt-asan-v1','commit':os.environ['GITHUB_SHA'],
+                    'nightly':os.environ['NIGHTLY'],'target':'x86_64-unknown-linux-gnu',
+                    'build_std':True,'all_targets':True,'all_features':True,
+                    'leak_detection':True,'passed':True}
+          with open('asan-evidence/summary.json','w') as f:
+              json.dump(evidence,f,sort_keys=True,indent=2); f.write('\n')
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: asan-${{ github.sha }}
+          path: asan-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  thread-sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned sanitizer nightly
+        run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
+      - name: Run engine concurrency suite under ThreadSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=thread -Cdebuginfo=1
+          RUSTDOCFLAGS: -Zsanitizer=thread
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:history_size=7
+        run: |
+          cargo +"$NIGHTLY" test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            --locked --test p02_concurrency --features 'ffi header-encrypt'
+      - name: Record TSan evidence
+        run: |
+          mkdir -p tsan-evidence
+          python3 - <<'PY'
+          import json, os
+          evidence={'schema':'dycrpt-tsan-v1','commit':os.environ['GITHUB_SHA'],
+                    'nightly':os.environ['NIGHTLY'],'target':'x86_64-unknown-linux-gnu',
+                    'build_std':True,'suite':'p02_concurrency',
+                    'same_session_serialization':True,'different_session_parallelism':True,
+                    'passed':True}
+          with open('tsan-evidence/summary.json','w') as f:
+              json.dump(evidence,f,sort_keys=True,indent=2); f.write('\n')
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tsan-${{ github.sha }}
+          path: tsan-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  libfuzzer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 130
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned fuzzing toolchain
+        run: |
+          rustup toolchain install "$NIGHTLY" --profile minimal
+          cargo +"$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
+      - name: Run coverage-guided parser campaigns with ASan
+        shell: bash
+        env:
+          REQUESTED_FUZZ_SECONDS: ${{ inputs.fuzz_seconds }}
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz-evidence
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            seconds=120
+          elif [[ -n "${REQUESTED_FUZZ_SECONDS:-}" ]]; then
+            seconds="${REQUESTED_FUZZ_SECONDS}"
+          else
+            seconds=1800
+          fi
+          test "$seconds" -ge 60
+          echo "$seconds" > fuzz-evidence/seconds-per-target.txt
+          for target in envelope_parse header_decode triple_header_decode engine_wire prekey_bundle state_decoders; do
+            echo "fuzz target=$target seconds=$seconds"
+            cargo +"$NIGHTLY" fuzz run "$target" -- \
+              -max_total_time="$seconds" -timeout=10 -rss_limit_mb=4096 -print_final_stats=1
+          done
+      - name: Record fuzz evidence
+        run: |
+          python3 - <<'PY'
+          import json, os
+          seconds=int(open('fuzz-evidence/seconds-per-target.txt').read().strip())
+          targets=['envelope_parse','header_decode','triple_header_decode','engine_wire','prekey_bundle','state_decoders']
+          evidence={'schema':'dycrpt-libfuzzer-v1','commit':os.environ['GITHUB_SHA'],
+                    'nightly':os.environ['NIGHTLY'],'cargo_fuzz':'0.13.2',
+                    'targets':targets,'seconds_per_target':seconds,
+                    'asan_default':True,'crashes':0,'timeouts':0,'passed':True,
+                    'release_scale':seconds >= 1800}
+          with open('fuzz-evidence/summary.json','w') as f:
+              json.dump(evidence,f,sort_keys=True,indent=2); f.write('\n')
+          PY
+      - name: Upload successful fuzz evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: libfuzzer-${{ github.sha }}
+          path: fuzz-evidence/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload crash corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fuzz-crashes-${{ github.sha }}
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
+          if-no-files-found: warn
+          retention-days: 30

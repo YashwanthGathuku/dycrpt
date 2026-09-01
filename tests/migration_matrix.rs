@@ -26,8 +26,8 @@ fn linked() -> (
     voicechat_crypto::SessionId,
     voicechat_crypto::SessionId,
 ) {
-    let mut a = alice();
-    let mut b = bob();
+    let a = alice();
+    let b = bob();
     let bundle = b.generate_public_prekey_bundle(4).unwrap();
     let (sid_a, init) = a
         .establish_outbound_session(&bundle, b"conv", b"A0", b"ad")
@@ -46,7 +46,7 @@ fn matrix_initial_session() {
 
 #[test]
 fn matrix_sequential_messages() {
-    let (mut a, mut b, sid_a, sid_b) = linked();
+    let (a, b, sid_a, sid_b) = linked();
     for i in 0..8u8 {
         let s = a.encrypt(&sid_a, &[i], b"ad").unwrap();
         assert_eq!(b.decrypt(&sid_b, &s, b"ad").unwrap(), vec![i]);
@@ -55,7 +55,7 @@ fn matrix_sequential_messages() {
 
 #[test]
 fn matrix_bidirectional_ratchet() {
-    let (mut a, mut b, sid_a, sid_b) = linked();
+    let (a, b, sid_a, sid_b) = linked();
     let s = a.encrypt(&sid_a, b"A", b"ad").unwrap();
     assert_eq!(b.decrypt(&sid_b, &s, b"ad").unwrap(), b"A");
     let s = b.encrypt(&sid_b, b"B", b"ad").unwrap();
@@ -64,7 +64,7 @@ fn matrix_bidirectional_ratchet() {
 
 #[test]
 fn matrix_out_of_order() {
-    let (mut a, mut b, sid_a, sid_b) = linked();
+    let (a, b, sid_a, sid_b) = linked();
     let s1 = a.encrypt(&sid_a, b"1", b"ad").unwrap();
     let s2 = a.encrypt(&sid_a, b"2", b"ad").unwrap();
     let s3 = a.encrypt(&sid_a, b"3", b"ad").unwrap();
@@ -75,7 +75,7 @@ fn matrix_out_of_order() {
 
 #[test]
 fn matrix_dropped_messages() {
-    let (mut a, mut b, sid_a, sid_b) = linked();
+    let (a, b, sid_a, sid_b) = linked();
     let _dropped = a.encrypt(&sid_a, b"lost", b"ad").unwrap();
     let s = a.encrypt(&sid_a, b"kept", b"ad").unwrap();
     assert_eq!(b.decrypt(&sid_b, &s, b"ad").unwrap(), b"kept");
@@ -83,7 +83,7 @@ fn matrix_dropped_messages() {
 
 #[test]
 fn matrix_tamper_rejection() {
-    let (mut a, mut b, sid_a, sid_b) = linked();
+    let (a, b, sid_a, sid_b) = linked();
     let mut s = a.encrypt(&sid_a, b"m", b"ad").unwrap();
     if let Some(x) = s.ciphertext.last_mut() {
         *x ^= 0xff;
@@ -93,7 +93,7 @@ fn matrix_tamper_rejection() {
 
 #[test]
 fn matrix_replay_rejection() {
-    let (mut a, mut b, sid_a, sid_b) = linked();
+    let (a, b, sid_a, sid_b) = linked();
     let s = a.encrypt(&sid_a, b"m", b"ad").unwrap();
     assert_eq!(b.decrypt(&sid_b, &s, b"ad").unwrap(), b"m");
     assert!(b.decrypt(&sid_b, &s, b"ad").is_err());
@@ -101,7 +101,7 @@ fn matrix_replay_rejection() {
 
 #[test]
 fn matrix_restart_persistence() {
-    let (mut a, mut b, sid_a, sid_b) = linked();
+    let (a, b, sid_a, sid_b) = linked();
     let s = a.encrypt(&sid_a, b"before", b"ad").unwrap();
     assert_eq!(b.decrypt(&sid_b, &s, b"ad").unwrap(), b"before");
     a.simulate_crash_reload().unwrap();
@@ -112,10 +112,10 @@ fn matrix_restart_persistence() {
 
 #[test]
 fn matrix_prekey_depletion() {
-    let mut b = bob();
+    let b = bob();
     let bundle = b.generate_public_prekey_bundle(1).unwrap();
-    let mut a1 = alice();
-    let mut a2 = alice();
+    let a1 = alice();
+    let a2 = alice();
     let (_s1, init1) = a1
         .establish_outbound_session(&bundle, b"c1", b"A0", b"ad")
         .unwrap();
@@ -144,7 +144,7 @@ fn matrix_identity_and_fingerprint() {
 
 #[test]
 fn matrix_wrong_session() {
-    let (mut a, mut b, sid_a, sid_b) = linked();
+    let (a, b, sid_a, sid_b) = linked();
     let s = a.encrypt(&sid_a, b"x", b"ad").unwrap();
     a.delete_session(&sid_a).unwrap();
     assert!(!a.has_session(&sid_a));
@@ -155,7 +155,7 @@ fn matrix_wrong_session() {
 
 #[test]
 fn matrix_large_voice_payload() {
-    let (mut a, mut b, sid_a, sid_b) = linked();
+    let (a, b, sid_a, sid_b) = linked();
     let payload = vec![7u8; 64 * 1024];
     let s = a
         .encrypt_voice_payload(&sid_a, &payload, b"ok-meta")
@@ -165,7 +165,7 @@ fn matrix_large_voice_payload() {
 
 #[test]
 fn matrix_voice_profile_forbidden() {
-    let (mut a, _b, sid_a, _sid_b) = linked();
+    let (a, _b, sid_a, _sid_b) = linked();
     assert!(a
         .encrypt_voice_payload(&sid_a, b"audio", b"voice_profile=x")
         .is_err());
@@ -205,12 +205,12 @@ fn matrix_downgrade_attempt_stronger() {
 #[cfg(feature = "hybrid")]
 #[test]
 fn matrix_hybrid_session_and_bidirectional() {
-    let mut a = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let a = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"alice-h".to_vec(),
         profile: CryptoProfile::HybridPqV1,
     })
     .unwrap();
-    let mut b = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let b = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob-h".to_vec(),
         profile: CryptoProfile::HybridPqV1,
     })
@@ -230,12 +230,12 @@ fn matrix_hybrid_session_and_bidirectional() {
 #[cfg(feature = "header-encrypt")]
 #[test]
 fn matrix_header_encrypt_session() {
-    let mut a = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let a = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"alice-he".to_vec(),
         profile: CryptoProfile::ClassicalHeV1,
     })
     .unwrap();
-    let mut b = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let b = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"bob-he".to_vec(),
         profile: CryptoProfile::ClassicalHeV1,
     })

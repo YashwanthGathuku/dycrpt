@@ -17,8 +17,8 @@ fn device(id: &[u8]) -> VoiceChatCryptoEngine {
 
 #[test]
 fn p0_alice_bob_pqxdh_ratchet_restart_tamper_replay() {
-    let mut alice = device(b"alice");
-    let mut bob = device(b"bob");
+    let alice = device(b"alice");
+    let bob = device(b"bob");
     let bundle = bob.generate_public_prekey_bundle(3).unwrap();
 
     let (sid_a, packet) = alice

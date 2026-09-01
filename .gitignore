@@ -1,5 +1,8 @@
 /target
 **/target/
+mutants.out/
+mutants-ratchet.out/
+.venv/
 formal/tla/states/
 states/
 *.exe
