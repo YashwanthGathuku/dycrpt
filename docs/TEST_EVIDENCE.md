@@ -299,3 +299,28 @@ cargo mutants --file 'src/primitives/**' --file 'src/ratchet/**' -- --lib
 ```
 
 Budget hours, not minutes: each mutant rebuilds the crate. Run it on a machine you can leave.
+
+## Mutation testing — Double Ratchet, 2026-09-01
+
+Command (this machine: GNU 1.85 + gcc linker, `cargo-mutants` 26.0.0, `-j 2`):
+
+```text
+cargo mutants -f src/ratchet/mod.rs -j 2 -o mutants-ratchet.out -- --lib
+```
+
+```text
+Found 89 mutants to test
+ok       Unmutated baseline in 69s build + 8s test
+89 mutants tested in 17m: 14 missed, 59 caught, 16 unviable
+```
+
+Score: **59 / (59 + 14) = 80.8%**. Below the v1 ≥ 85% bar for `src/ratchet/`.
+
+Fourteen survivors, all on wipe/count/rejection/unused-API paths — same shape as F1 and the XEdDSA 90.2% run. Full classification and the killing-test list: `docs/MUTATION_TESTING.md`.
+
+XEdDSA unit tests after the four killing tests, this session:
+
+```text
+cargo +1.85.0-x86_64-pc-windows-gnu test --offline --lib -- xeddsa::
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 200 filtered out; finished in 3.76s
+```
