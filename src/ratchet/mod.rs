@@ -631,6 +631,241 @@ mod tests {
         X25519Public::from_bytes(bytes).unwrap()
     }
 
+    /// Two-party pair with an explicit `max_skip`, for the skip-bound tests.
+    fn pair(max_skip: u32) -> (DoubleRatchetState, DoubleRatchetState) {
+        let sk = fresh_sk();
+        let bob_dh = X25519Secret::generate().unwrap();
+        let bob_pub = bob_dh.public_key();
+        let alice = DoubleRatchetState::init_alice(&sk, &bob_pub, max_skip).unwrap();
+        let bob = DoubleRatchetState::init_bob(&sk, bob_dh, max_skip);
+        (alice, bob)
+    }
+
+    // ---------------------------------------------------------------
+    // Mutation-testing survivors, src/ratchet/mod.rs, 2026-08-28.
+    //
+    // Baseline 59 caught / 14 missed / 16 unviable = 80.8%, below the v1
+    // bar of 85%. Every survivor was on a path the suite never observed:
+    // wiping, counting, or an independent rejection bound. The tests below
+    // kill twelve of the fourteen; the remaining two are `Drop` impls whose
+    // only effect is zeroizing memory that is about to be freed, which
+    // cannot be observed without reading freed memory. Those are excluded
+    // in `.cargo/mutants.toml` with a justification rather than "killed"
+    // by a test that would be undefined behaviour.
+    // ---------------------------------------------------------------
+
+    /// Kills: `SkippedKeys::zeroize -> ()`.
+    ///
+    /// Nothing called `zeroize` outside `Drop`, so a no-op wipe was
+    /// invisible. Asserting it clears the store makes the wipe observable
+    /// without depending on `Drop`.
+    #[test]
+    fn skipped_keys_zeroize_clears_the_store() {
+        let mut store = SkippedKeys::default();
+        store.insert_unique(([1u8; 32], 0), [0xAA; 32]).unwrap();
+        store.insert_unique(([1u8; 32], 1), [0xBB; 32]).unwrap();
+        assert_eq!(store.len(), 2);
+
+        store.zeroize();
+
+        assert_eq!(store.len(), 0, "zeroize must empty the store");
+        assert!(store.iter().next().is_none());
+        assert!(store.remove(&([1u8; 32], 0)).is_none());
+    }
+
+    /// Kills five at once: the outer skip bound `limit < until` mutated to
+    /// `==` or `<=`, plus `SkippedKeys::len -> 0/1` and
+    /// `skipped_count -> 0/1`.
+    ///
+    /// `limit == nr + max_skip`, so skipping *exactly* `max_skip` messages
+    /// is legal and must succeed. Both bound mutants reject it. The exact
+    /// count assertion is what kills the accessor mutants — the previous
+    /// test only checked `skipped_count() <= 5`, which 0 and 1 also satisfy.
+    #[test]
+    fn skipping_exactly_max_skip_is_allowed_and_counted_exactly() {
+        const MAX_SKIP: u32 = 6;
+        let (mut alice, mut bob) = pair(MAX_SKIP);
+
+        let mut sent = Vec::new();
+        for i in 0..=MAX_SKIP {
+            sent.push(alice.encrypt(&[i as u8], b"ad").unwrap());
+        }
+
+        // Deliver only the last one: forces skipping exactly MAX_SKIP keys,
+        // i.e. until == limit. Legal, and the boundary the mutants break.
+        let (header, ct) = &sent[MAX_SKIP as usize];
+        assert_eq!(
+            bob.decrypt(header, ct, b"ad").unwrap(),
+            vec![MAX_SKIP as u8]
+        );
+        assert_eq!(
+            bob.skipped_count(),
+            MAX_SKIP as usize,
+            "exactly max_skip keys must be retained, not 0, not 1"
+        );
+
+        // Every skipped message must still open, from the store.
+        for (i, (h, c)) in sent.iter().enumerate().take(MAX_SKIP as usize) {
+            assert_eq!(bob.decrypt(h, c, b"ad").unwrap(), vec![i as u8]);
+        }
+        assert_eq!(bob.skipped_count(), 0, "store drains as keys are consumed");
+    }
+
+    /// One past the bound must still be refused, so the test above cannot be
+    /// satisfied by simply removing the check.
+    #[test]
+    fn skipping_one_past_max_skip_is_refused() {
+        const MAX_SKIP: u32 = 4;
+        let (mut alice, mut bob) = pair(MAX_SKIP);
+        let mut sent = Vec::new();
+        for i in 0..=(MAX_SKIP + 1) {
+            sent.push(alice.encrypt(&[i as u8], b"ad").unwrap());
+        }
+        let (header, ct) = &sent[(MAX_SKIP + 1) as usize];
+        assert!(matches!(
+            bob.decrypt(header, ct, b"ad"),
+            Err(PrimitiveError::LimitExceeded)
+        ));
+        assert_eq!(bob.skipped_count(), 0, "refusal must not retain keys");
+    }
+
+    /// Kills: `SkippedKeys::iter -> empty()`.
+    ///
+    /// `iter` is used only by `serialize`. An empty iterator silently drops
+    /// every skipped key from the serialized state, which no round-trip test
+    /// noticed because none of them skipped a message first.
+    #[test]
+    fn serialize_round_trip_preserves_skipped_keys() {
+        const MAX_SKIP: u32 = 5;
+        let (mut alice, mut bob) = pair(MAX_SKIP);
+        let m0 = alice.encrypt(b"zero", b"ad").unwrap();
+        let m1 = alice.encrypt(b"one", b"ad").unwrap();
+        let m2 = alice.encrypt(b"two", b"ad").unwrap();
+
+        assert_eq!(bob.decrypt(&m2.0, &m2.1, b"ad").unwrap(), b"two");
+        assert_eq!(bob.skipped_count(), 2);
+
+        let blob = bob.serialize();
+        let mut restored = DoubleRatchetState::deserialize(&blob, MAX_SKIP).unwrap();
+        assert_eq!(
+            restored.skipped_count(),
+            2,
+            "skipped keys must survive serialization"
+        );
+
+        // The real proof: the restored state can still open both skipped
+        // messages, so the keys themselves round-tripped, not just a count.
+        assert_eq!(restored.decrypt(&m0.0, &m0.1, b"ad").unwrap(), b"zero");
+        assert_eq!(restored.decrypt(&m1.0, &m1.1, b"ad").unwrap(), b"one");
+    }
+
+    /// Kills: `deserialize`'s `count > max_skip` mutated to `==` or `>=`.
+    ///
+    /// A state holding exactly `max_skip` skipped keys is legal and must
+    /// deserialize. Both mutants reject it.
+    #[test]
+    fn deserialize_accepts_count_equal_to_max_skip() {
+        const MAX_SKIP: u32 = 3;
+        let (mut alice, mut bob) = pair(MAX_SKIP);
+        let mut sent = Vec::new();
+        for i in 0..=MAX_SKIP {
+            sent.push(alice.encrypt(&[i as u8], b"ad").unwrap());
+        }
+        let (h, c) = &sent[MAX_SKIP as usize];
+        bob.decrypt(h, c, b"ad").unwrap();
+        assert_eq!(bob.skipped_count(), MAX_SKIP as usize);
+
+        let blob = bob.serialize();
+        let restored = DoubleRatchetState::deserialize(&blob, MAX_SKIP)
+            .expect("count == max_skip is within the ceiling and must deserialize");
+        assert_eq!(restored.skipped_count(), MAX_SKIP as usize);
+    }
+
+    /// The other side of the ceiling: a declared count above `max_skip` must
+    /// be refused.
+    ///
+    /// Note the check ordering, which is why this needs a crafted blob rather
+    /// than a round trip. `deserialize` validates `stored_max != max_skip`
+    /// *before* it reads the count, so loading an honest blob under a smaller
+    /// ceiling fails as `InvalidLength` at the max_skip field and never
+    /// reaches the count check at all. The `count > max_skip` bound therefore
+    /// only ever guards a **tampered state file** — which is exactly why it had
+    /// no coverage, and exactly why it matters.
+    #[test]
+    fn deserialize_rejects_declared_count_above_max_skip() {
+        const MAX_SKIP: u32 = 4;
+        let (mut alice, mut bob) = pair(MAX_SKIP);
+        let mut sent = Vec::new();
+        for i in 0..=MAX_SKIP {
+            sent.push(alice.encrypt(&[i as u8], b"ad").unwrap());
+        }
+        let (h, c) = &sent[MAX_SKIP as usize];
+        bob.decrypt(h, c, b"ad").unwrap();
+        assert_eq!(bob.skipped_count(), MAX_SKIP as usize);
+
+        let blob = bob.serialize();
+        // Each skipped entry is 32 (pk) + 4 (n) + 32 (mk) = 68 bytes, and the
+        // count u32 sits immediately before them.
+        let count = MAX_SKIP as usize;
+        let count_off = blob.len() - 4 - count * 68;
+        assert_eq!(
+            u32::from_le_bytes(blob[count_off..count_off + 4].try_into().unwrap()),
+            MAX_SKIP,
+            "located the count field"
+        );
+
+        // Keep stored_max == max_skip so the earlier check passes, and inflate
+        // only the declared count.
+        let mut tampered = blob.clone();
+        tampered[count_off..count_off + 4].copy_from_slice(&(MAX_SKIP + 1).to_le_bytes());
+        assert!(matches!(
+            DoubleRatchetState::deserialize(&tampered, MAX_SKIP),
+            Err(PrimitiveError::LimitExceeded)
+        ));
+
+        // And a wildly inflated count must be refused at the ceiling, not by
+        // arithmetic overflow in the `count * 68` size computation.
+        let mut huge = blob.clone();
+        huge[count_off..count_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            DoubleRatchetState::deserialize(&huge, MAX_SKIP),
+            Err(PrimitiveError::LimitExceeded)
+        ));
+    }
+
+    /// Kills: `receive_message_key -> Ok([0; 32])` and `-> Ok([1; 32])`.
+    ///
+    /// This is the Triple Ratchet export; `encrypt`/`decrypt` never call it,
+    /// so the default suite never observed its output at all. A constant
+    /// return would have passed everything.
+    #[test]
+    fn receive_message_key_derives_distinct_real_keys() {
+        let (mut alice, mut bob) = pair(DEFAULT_MAX_SKIP);
+        let (h0, _c0) = alice.encrypt(b"zero", b"ad").unwrap();
+        let (h1, _c1) = alice.encrypt(b"one", b"ad").unwrap();
+
+        let mk0 = bob.receive_message_key(&h0).unwrap();
+        let mk1 = bob.receive_message_key(&h1).unwrap();
+
+        assert_ne!(mk0, mk1, "consecutive message keys must differ");
+        assert_ne!(mk0, [0u8; 32], "message key must not be a constant");
+        assert_ne!(mk0, [1u8; 32], "message key must not be a constant");
+        assert_ne!(mk1, [0u8; 32]);
+        assert_ne!(mk1, [1u8; 32]);
+
+        // Strongest assertion available: the exported key is the same one the
+        // AEAD layer would use, so it actually opens Alice's ciphertext.
+        let (mut fresh_alice, mut fresh_bob) = pair(DEFAULT_MAX_SKIP);
+        let (h, c) = fresh_alice.encrypt(b"payload", b"ad").unwrap();
+        let mk = fresh_bob.receive_message_key(&h).unwrap();
+        let (key, nonce) = aead_from_mk(&mk).unwrap();
+        let ad = concat_ad(b"ad", &h);
+        assert_eq!(
+            crate::primitives::aead::open(&key, &nonce, &c, &ad).unwrap(),
+            b"payload"
+        );
+    }
+
     #[test]
     fn alice_init_rejects_noncontributory_peer_dh() {
         assert!(matches!(

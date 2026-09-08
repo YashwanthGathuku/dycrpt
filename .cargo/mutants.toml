@@ -13,3 +13,23 @@ additional_cargo_test_args = ["--", "--skip", "ten_thousand"]
 
 # Files with no meaningful behaviour to mutate.
 exclude_globs = ["src/testing/**", "src/bin/**", "src/ffi/jni.rs"]
+
+# `Drop` impls whose sole effect is zeroizing memory that is about to be freed.
+#
+# Mutating these to `()` is a real (if minor) regression — key material would
+# not be wiped on drop — but it cannot be observed by any sound test: verifying
+# it requires reading freed memory, which is undefined behaviour. Writing a UB
+# test into a cryptography library to raise a score would be worse than the
+# thing it measures.
+#
+# These are excluded rather than "killed". The behaviour they delegate to IS
+# tested: `skipped_keys_zeroize_clears_the_store` asserts `SkippedKeys::zeroize`
+# actually empties the store, so the only untested claim left is the one-line
+# delegation from `drop` to `zeroize`.
+#
+# Reviewed 2026-08-28. Revisit if a drop-observability harness (tracking
+# allocator, or a sentinel type) is ever added.
+exclude_re = [
+    "impl Drop for SkippedKeys",
+    "impl Drop for SkippedMutationJournal",
+]

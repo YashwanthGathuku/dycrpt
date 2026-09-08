@@ -241,3 +241,53 @@ cargo mutants -f src/ratchet/mod.rs -j 2 -- --lib
 ```
 
 Raw outcome files from this run: `mutants-ratchet.out/mutants.out/{caught,missed,unviable}.txt`.
+
+## Double Ratchet survivors killed — 2026-08-28 (review)
+
+| Run | Caught | Missed | Unviable | Score |
+|---|---|---|---|---|
+| Baseline (`ecb52df`) | 59 | 14 | 16 | 80.8% |
+| After killing tests | **71** | **0** | 16 | **100%** |
+
+Two mutants moved out of scope rather than being killed (89 → 87 total): the
+`Drop` impls for `SkippedKeys` and `SkippedMutationJournal`. Their only effect
+is zeroizing memory that is about to be freed, and observing that requires
+reading freed memory — undefined behaviour. They are excluded in
+`.cargo/mutants.toml` with a written rationale. The behaviour they delegate to
+is tested directly: `skipped_keys_zeroize_clears_the_store` asserts
+`SkippedKeys::zeroize` actually empties the store, leaving only the one-line
+`drop` → `zeroize` delegation unverified.
+
+### Two findings that came out of writing the tests
+
+**1. The outer skip bound is not redundant.** The baseline notes read
+`if limit < until` as shadowed by the inner `len >= max_skip` loop check. It
+isn't. `limit == nr + max_skip`, so `until == limit` — skipping *exactly*
+`max_skip` messages — is legal and must succeed. Both mutants (`<` → `==`,
+`<` → `<=`) reject that legal case. Nothing had tested the boundary from the
+accepting side, only from the rejecting side, so both survived.
+
+**2. The deserialize count ceiling is unreachable by any honest round trip.**
+`deserialize` validates `stored_max != max_skip` *before* it reads the count.
+Loading an honest blob under a smaller ceiling therefore fails as
+`InvalidLength` at the max_skip field and never reaches `count > max_skip` at
+all. That bound only ever guards a **tampered state file**, which is precisely
+why it had no coverage and why it matters. Killing it required crafting a blob
+with `stored_max == max_skip` and an inflated count field.
+
+### The pattern, restated
+
+Every one of the fourteen survivors was on a path the suite never *observed*:
+wiping, counting, or an independent rejection bound. The existing tests
+asserted what `encrypt`/`decrypt` accept and returned. None asserted what the
+state must refuse, how much it must retain, or that a wipe wiped.
+
+That is the same shape as F1 in `xeddsa.rs`, which was also a missing
+rejection, and as the four survivors killed there — all of which were on
+rejecting paths too. Two files, two independent runs, one consistent gap.
+
+### Still unmeasured
+
+The other ~835 mutants under `src/ratchet/**` (hybrid and header-encrypt
+profiles, `spqr/`, `braid/`, `triple/`), plus `src/pqxdh/`, `src/replay/` and
+`src/storage/`. The v1 exit criterion is ≥ 85% across all of them.
