@@ -61,7 +61,7 @@ A public GitHub repo is not proof. Proof is:
 
 | Artifact | Status now |
 |---|---|
-| LICENSE + LICENSE-APACHE | **Missing** |
+| LICENSE + LICENSE-APACHE | Present (`LICENSE` MIT, `LICENSE-APACHE` Apache-2.0) |
 | README that does not sound like a libsignal port | Weak (“Signal-family”) |
 | `cargo test` + mutation scores you can cite | Partial (3 files) |
 | Known-answer vectors (Wycheproof / RFCs) | Almost none |
@@ -69,7 +69,7 @@ A public GitHub repo is not proof. Proof is:
 | Independent audit | Never |
 | crates.io (or equivalent) package | `publish = false` |
 
-Until LICENSE files, KATs, and one hardware loop exist, “open source so everyone can use it” is a git remote, not a product.
+Until KATs and one hardware loop exist, “open source so everyone can use it” is a git remote, not a product. License files are in the tree; they do not flip `PRODUCTION_READY`.
 
 ---
 
@@ -79,13 +79,13 @@ This is the only queue. Do not start groups, sealed sender, or “AI ratchet” 
 
 ### Step 0 — Speech and license (1 day) — **do first, before public**
 
-1. Add `LICENSE` (MIT) and `LICENSE-APACHE`.
-2. Rewrite the **top of README**: public-domain specs, MIT/Apache, not affiliated with Signal, not a libsignal port, not Signal-network compatible.
+1. Add `LICENSE` (MIT) and `LICENSE-APACHE`. **Done** (2026-09-08).
+2. Rewrite the **top of README**: public-domain specs, MIT/Apache, not affiliated with Signal, not a libsignal port, not Signal-network compatible. **Done**.
 3. Keep `LIBSIGNAL_COMPARISON.md` in `docs/` for maintainers. Do not link it from the README hero.
-4. Write `docs/V1_SCOPE.md` (ClassicalV1 + storage + one FFI; everything else gated).
+4. Write `docs/V1_SCOPE.md` (ClassicalV1 + storage + one FFI; everything else gated). **Done**.
 5. Then, and only then, make the GitHub repo public if you want. Public ≠ v1.0. Public is “here is the lab, here is what is not claimed.”
 
-**Done when:** `ls LICENSE LICENSE-APACHE` works; README has the allowed sentence; no “replicated libsignal” anywhere in tracked files.
+**Done when:** `LICENSE` and `LICENSE-APACHE` exist; README has the allowed sentence; no “replicated libsignal” anywhere in tracked files. Remaining Step 0 choice: whether to make the GitHub repo public.
 
 ### Step 1 — Proof that tests can fail (ongoing)
 

@@ -52,4 +52,6 @@ MSRV 1.85. Windows GNU hosts need `rust-lld` (see `rust-toolchain.toml`).
 
 ## Policy
 
+[`docs/V1_SCOPE.md`](docs/V1_SCOPE.md) — v1 freeze: 1:1 `ClassicalV1`, persistent storage, one FFI. Hybrid / header-encrypt / sesame stay gated.
+
 [`docs/FINAL_SECURITY_RULE.md`](docs/FINAL_SECURITY_RULE.md) — security wins over convenience. Do not invent algorithms, replace PQXDH, reuse keys, or expose secrets through FFI.

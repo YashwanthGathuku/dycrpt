@@ -36,7 +36,7 @@ Evidence:
 
 Clean-room from **public specs** (PQXDH, Double Ratchet Rev 4, XEdDSA, FIPS 203) is the correct path for a permissive VoiceChat engine. Byte-for-byte Signal network interop is **not** claimed and is not required for VoiceChat.
 
-**Gap even on the license story:** `Cargo.toml` says MIT OR Apache-2.0, but there are **no `LICENSE` / `LICENSE-APACHE` files in the tree**. That is a v1 Gate 1 item. Add the actual files before any public tag.
+**License files:** `Cargo.toml` says MIT OR Apache-2.0. `LICENSE` (MIT) and `LICENSE-APACHE` (Apache-2.0) are in the tree. Scope freeze: `docs/V1_SCOPE.md`.
 
 ---
 
