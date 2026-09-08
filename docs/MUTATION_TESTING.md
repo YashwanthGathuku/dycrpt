@@ -291,3 +291,65 @@ rejecting paths too. Two files, two independent runs, one consistent gap.
 The other ~835 mutants under `src/ratchet/**` (hybrid and header-encrypt
 profiles, `spqr/`, `braid/`, `triple/`), plus `src/pqxdh/`, `src/replay/` and
 `src/storage/`. The v1 exit criterion is ≥ 85% across all of them.
+
+## src/storage/coordinated.rs — 2026-08-28 (review)
+
+### Scoping matters here, and it did not before
+
+A `--lib`-only run is correct for `primitives/` and `ratchet/`, whose coverage
+is in-module. It is **wrong for `src/storage/`**: that area has 27 lib tests but
+47 integration tests (`storage_hardening` 8, `ffi_persistent` 9,
+`crash_hardening` 8, `migration_matrix` 19, `p02_concurrency` 3). Running
+`--lib` alone would have hidden most real coverage and reported survivors the
+integration suite already kills. Correct invocation, recorded in
+`.cargo/mutants.toml`:
+
+```
+cargo mutants --file 'src/storage/**' -- --features ffi --lib \
+    --test storage_hardening --test ffi_persistent --test crash_hardening \
+    --test migration_matrix --test p02_concurrency
+```
+
+That scope is 265 tests in ~8s once built.
+
+### Survivors (8 at cutoff, 65 mutants total)
+
+| Site | Mutation | Consequence |
+|---|---|---|
+| `Coordination::finalize` | guard `observed == target` → `true` | **Most serious.** Any `Ok(_)` from the anchor accepted as a successful advance; pending epoch cleared. Durable epoch and anchor diverge permanently — next open is a false rollback lockout, or a rollback that is no longer detectable. |
+| `PreparedMonotonicCounter::current` | → `Ok(1)` | Counter stops tracking the anchor |
+| `AnchoredStorage::begin` | `\|\|` → `&&` | Second `begin` on an open transaction succeeds; two transactions race one epoch |
+| `AnchoredStorage::put` | `\|\|` → `&&` | A correctly sized second epoch write accepted; one transaction stages two epochs |
+| `AnchoredStorage::delete` | → `Ok(())` | All delete guards bypassed |
+| `AnchoredStorage::delete` | `\|\|` → `&&` | Epoch key deletable on the active transaction |
+| `AnchoredStorage::delete` | `!=` → `==` | Guard inverted: foreign transactions allowed, active one refused |
+| `AnchoredStorage::delete` | `==` → `!=` | Epoch key deletable, normal keys refused |
+
+All eight are killed by the seven tests in `mod coordination_mutation_kills`.
+
+### Note on the `finalize` survivor
+
+This one is worth reading closely. The guard it removes is the only thing
+enforcing the rule already written into the anchor contract in
+`ffi/include/voicechat_crypto.h` and `VoiceChatRollbackAnchor`: an increment
+whose outcome does not match what was asked for must not be acknowledged. The
+contract was documented for platform implementors; nothing tested that the
+library itself enforced it. `LyingAnchor` — an anchor that returns `Ok` with a
+value it did not actually reach — now does.
+
+### Pattern, third confirmation
+
+`xeddsa.rs`: 4 survivors, all on rejecting paths.
+`ratchet/mod.rs`: 14 survivors, all on wiping, counting, or independent bounds.
+`storage/coordinated.rs`: 8 survivors, six of them on independent conditions in
+compound `||` guards, plus one accepting-path case (`!=` → `==`) and one
+constant return.
+
+Three files, three independent runs, one gap: the suite asserts what the happy
+path returns and rarely that a compound condition rejects on *each* of its
+limbs independently, or that the last legal case is still accepted.
+
+### Not yet measured
+
+`encrypted_file.rs`, `monotonic.rs`, `trusted_anchor.rs`, `storage/mod.rs`, plus
+`src/pqxdh/` and `src/replay/`.

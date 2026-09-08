@@ -11,6 +11,19 @@
 # the same code paths the fast tests already cover, just more of them.
 additional_cargo_test_args = ["--", "--skip", "ten_thousand"]
 
+# NOTE on test scope. A `--lib`-only mutation run is right for modules whose
+# coverage is in-module (primitives, ratchet). It is WRONG for src/storage:
+# that area has 27 lib tests but 47 integration tests (storage_hardening,
+# ffi_persistent, crash_hardening, migration_matrix, p02_concurrency), so
+# `--lib` hides most of its real coverage and reports survivors that the
+# integration suite already kills. Scope storage runs explicitly:
+#
+#   cargo mutants --file 'src/storage/**' -- --features ffi --lib \
+#       --test storage_hardening --test ffi_persistent --test crash_hardening \
+#       --test migration_matrix --test p02_concurrency
+#
+# Measured 2026-08-28: that scope is 265 tests in ~8s once built.
+
 # Files with no meaningful behaviour to mutate.
 exclude_globs = ["src/testing/**", "src/bin/**", "src/ffi/jni.rs"]
 

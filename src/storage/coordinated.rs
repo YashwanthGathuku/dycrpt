@@ -806,3 +806,216 @@ mod restore_fail_closed_tests {
         assert!(!RestoreRejection::NotInitialized.is_security_event());
     }
 }
+
+/// Kills the survivors from the `src/storage/coordinated.rs` mutation run
+/// (2026-08-28). Same gap as `xeddsa.rs` and `ratchet/mod.rs`: the suite
+/// asserted what the happy path returns and almost nothing about independent
+/// rejection conditions or the accepting side of a boundary.
+#[cfg(test)]
+mod coordination_mutation_kills {
+    use super::*;
+    use crate::storage::{MemoryStorage, StateBlob};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct FixedAnchor(AtomicU64);
+
+    impl RollbackAnchor for FixedAnchor {
+        fn current(&self) -> Result<u64, PrimitiveError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+        fn compare_and_increment(&self, expected: u64) -> Result<u64, PrimitiveError> {
+            self.0
+                .compare_exchange(expected, expected + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .map(|_| expected + 1)
+                .map_err(|_| PrimitiveError::Internal)
+        }
+    }
+
+    /// An anchor that reports success while landing somewhere other than the
+    /// value it was asked for. Models a buggy server counter or a hardware
+    /// primitive whose response does not match what it actually committed.
+    struct LyingAnchor {
+        value: AtomicU64,
+        report: u64,
+    }
+
+    impl RollbackAnchor for LyingAnchor {
+        fn current(&self) -> Result<u64, PrimitiveError> {
+            Ok(self.value.load(Ordering::SeqCst))
+        }
+        fn compare_and_increment(&self, _expected: u64) -> Result<u64, PrimitiveError> {
+            // Reports Ok, but the value it claims is not expected + 1.
+            Ok(self.report)
+        }
+    }
+
+    /// Kills: `replace match guard observed == target with true` in
+    /// `Coordination::finalize`.
+    ///
+    /// Without the guard, any `Ok(_)` from the anchor is accepted as a
+    /// successful advance and the pending epoch is cleared. The durable epoch
+    /// and the anchor then disagree permanently, which on the next open is
+    /// either a false rollback lockout or, worse, a rollback that is no longer
+    /// detectable. This is the exact failure the anchor contract warns about.
+    #[test]
+    fn finalize_rejects_an_anchor_that_reports_the_wrong_value() {
+        let anchor = Arc::new(LyingAnchor {
+            value: AtomicU64::new(0),
+            report: 99, // not target (1)
+        });
+        let coord = Coordination::new(anchor);
+        let target = coord.prepare_next().unwrap();
+        assert_eq!(target, 1);
+
+        assert!(
+            matches!(coord.finalize(target), Err(PrimitiveError::Internal)),
+            "an anchor landing away from the target must not be acknowledged"
+        );
+        assert_eq!(
+            coord.pending().unwrap(),
+            Some(target),
+            "a refused finalize must leave the epoch pending, not clear it"
+        );
+    }
+
+    /// The accepting side of the same guard, so the test above cannot be
+    /// satisfied by refusing everything.
+    #[test]
+    fn finalize_accepts_an_anchor_that_lands_on_target() {
+        let anchor = Arc::new(FixedAnchor(AtomicU64::new(0)));
+        let coord = Coordination::new(anchor.clone());
+        let target = coord.prepare_next().unwrap();
+        coord.finalize(target).unwrap();
+        assert_eq!(anchor.current().unwrap(), target);
+        assert_eq!(coord.pending().unwrap(), None, "pending clears on success");
+    }
+
+    /// Kills: `PreparedMonotonicCounter::current -> Ok(1)`.
+    ///
+    /// Nothing asserted that `current()` reflects the real anchor, so a
+    /// constant would have passed. Uses a value that is neither 0 nor 1.
+    #[test]
+    fn prepared_counter_current_reflects_the_real_anchor() {
+        let anchor = Arc::new(FixedAnchor(AtomicU64::new(7)));
+        let counter = PreparedMonotonicCounter {
+            coordination: Arc::new(Coordination::new(anchor.clone())),
+        };
+        assert_eq!(counter.current().unwrap(), 7);
+        anchor.0.store(12, Ordering::SeqCst);
+        assert_eq!(counter.current().unwrap(), 12, "must track the anchor");
+    }
+
+    fn anchored(anchor_at: u64) -> (AnchoredStorage<MemoryStorage>, Arc<Coordination>) {
+        let coordination = Arc::new(Coordination::new(Arc::new(FixedAnchor(AtomicU64::new(
+            anchor_at,
+        )))));
+        (
+            AnchoredStorage::new(MemoryStorage::default(), coordination.clone()),
+            coordination,
+        )
+    }
+
+    /// Kills: `replace || with &&` in `begin`.
+    ///
+    /// `active_tx.is_some() || staged_epoch.is_some()` must reject when
+    /// *either* holds. With `&&`, a second `begin` on an already-open
+    /// transaction succeeds, and two transactions race the same epoch.
+    #[test]
+    fn begin_rejects_a_second_transaction_while_one_is_open() {
+        let (mut storage, coordination) = anchored(0);
+        coordination.prepare_next().unwrap();
+        let _tx = storage.begin().expect("first begin succeeds");
+        // active_tx is Some, staged_epoch is still None: only one side of the
+        // condition holds, which is what distinguishes || from &&.
+        assert!(
+            matches!(storage.begin(), Err(PrimitiveError::Internal)),
+            "a second begin must be refused"
+        );
+    }
+
+    /// Kills: `replace || with &&` in `put`.
+    ///
+    /// `value.0.len() != 8 || staged_epoch.is_some()` must reject when either
+    /// holds. With `&&`, a correctly sized second epoch write is accepted and
+    /// one transaction stages two epochs.
+    #[test]
+    fn put_rejects_a_second_epoch_write_in_one_transaction() {
+        let (mut storage, coordination) = anchored(0);
+        let epoch = coordination.prepare_next().unwrap();
+        let tx = storage.begin().unwrap();
+        storage
+            .put(
+                tx,
+                STORAGE_EPOCH_KEY,
+                &StateBlob(epoch.to_le_bytes().to_vec()),
+            )
+            .expect("first epoch write is legal");
+        // Correct length, but staged_epoch is now Some: only the second half of
+        // the condition holds.
+        assert!(
+            matches!(
+                storage.put(
+                    tx,
+                    STORAGE_EPOCH_KEY,
+                    &StateBlob(epoch.to_le_bytes().to_vec())
+                ),
+                Err(PrimitiveError::InvalidLength)
+            ),
+            "a second epoch write must be refused"
+        );
+    }
+
+    /// The other half of the same condition: wrong length with no staged epoch.
+    #[test]
+    fn put_rejects_a_wrong_length_epoch_value() {
+        let (mut storage, coordination) = anchored(0);
+        coordination.prepare_next().unwrap();
+        let tx = storage.begin().unwrap();
+        assert!(matches!(
+            storage.put(tx, STORAGE_EPOCH_KEY, &StateBlob(vec![0u8; 7])),
+            Err(PrimitiveError::InvalidLength)
+        ));
+    }
+
+    /// Kills three at once in `delete`: `-> Ok(())`, `|| -> &&`, and `!= -> ==`.
+    ///
+    /// `active_tx != Some(tx) || key == STORAGE_EPOCH_KEY` must reject when
+    /// either holds, and must accept a normal key on the active transaction.
+    /// Nothing tested any of the three outcomes.
+    #[test]
+    fn delete_enforces_both_conditions_independently() {
+        let (mut storage, coordination) = anchored(0);
+        coordination.prepare_next().unwrap();
+        let tx = storage.begin().unwrap();
+
+        // Right transaction, forbidden key. Only the second half holds, which
+        // is what `&&` would let through, and `-> Ok(())` would too.
+        assert!(
+            matches!(
+                storage.delete(tx, STORAGE_EPOCH_KEY),
+                Err(PrimitiveError::Internal)
+            ),
+            "the epoch key must never be deletable"
+        );
+
+        // Wrong transaction, allowed key. Only the first half holds.
+        let foreign = TransactionId(tx.0.wrapping_add(1));
+        assert!(
+            matches!(
+                storage.delete(foreign, b"other"),
+                Err(PrimitiveError::Internal)
+            ),
+            "a foreign transaction id must be refused"
+        );
+
+        // Right transaction, allowed key: must SUCCEED. This is what kills
+        // `-> Ok(())` being indistinguishable, and `!= -> ==`, which would
+        // invert exactly this case.
+        storage
+            .put(tx, b"other", &StateBlob(vec![1, 2, 3]))
+            .unwrap();
+        storage
+            .delete(tx, b"other")
+            .expect("a normal key on the active transaction must delete");
+    }
+}
