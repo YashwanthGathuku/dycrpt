@@ -101,7 +101,7 @@ mod core_properties {
         let bob_dh = X25519Secret::generate().unwrap();
         let mut alice =
             DoubleRatchetState::init_alice(&sk(3), &bob_dh.public_key(), DEFAULT_MAX_SKIP).unwrap();
-        let mut bob = DoubleRatchetState::init_bob(&sk(3), bob_dh, DEFAULT_MAX_SKIP);
+        let bob = DoubleRatchetState::init_bob(&sk(3), bob_dh, DEFAULT_MAX_SKIP);
         let (h, ct) = alice.encrypt(b"x", b"ad").unwrap();
 
         // Different SK → different session

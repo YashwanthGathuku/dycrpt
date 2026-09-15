@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dycrpt.invalid/schemas/audit-evidence-v1.json",
+  "title": "dycrpt independent cryptography audit evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "audited_commit", "reviewer", "independent", "report_sha256",
+    "signature_sha256", "classical_v1_suitable", "residual_risk_statement", "findings"
+  ],
+  "properties": {
+    "schema": {"const": "dycrpt-independent-audit-v1"},
+    "audited_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "reviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "organization", "contact", "qualifications"],
+      "properties": {
+        "name": {"type": "string", "minLength": 2, "maxLength": 256},
+        "organization": {"type": "string", "minLength": 1, "maxLength": 256},
+        "contact": {"type": "string", "minLength": 3, "maxLength": 512},
+        "qualifications": {"type": "string", "minLength": 20, "maxLength": 4096}
+      }
+    },
+    "independent": {"const": true},
+    "report_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "signature_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "classical_v1_suitable": {"const": true},
+    "residual_risk_statement": {"type": "string", "minLength": 20, "maxLength": 8192},
+    "findings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/finding"}
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "severity", "status", "title", "disposition", "verified_commit"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "severity": {"enum": ["critical", "high", "medium", "low", "informational"]},
+        "status": {"enum": ["fixed", "accepted", "not-applicable"]},
+        "title": {"type": "string", "minLength": 1, "maxLength": 512},
+        "disposition": {"type": "string", "minLength": 10, "maxLength": 4096},
+        "verified_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    }
+  }
+}

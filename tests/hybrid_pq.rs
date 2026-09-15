@@ -24,8 +24,11 @@ fn alternating_and_burst_and_reorder() {
     // Deliver last then first (reorder / skip)
     let (h, ct, i) = held.pop().unwrap();
     assert_eq!(b.decrypt(&h, &ct, b"ad").unwrap(), vec![i]);
+    // The out-of-order message must actually decrypt via the skipped-message-key
+    // store. The result was previously discarded, which left the skip path
+    // unasserted and made `i0` dead (review 2026-08-28).
     let (h0, ct0, i0) = held.remove(0);
-    let _ = b.decrypt(&h0, &ct0, b"ad");
+    assert_eq!(b.decrypt(&h0, &ct0, b"ad").unwrap(), vec![i0]);
 
     for _ in 0..4 {
         let (h, ct) = b.encrypt(b"burst", b"ad").unwrap();
@@ -85,12 +88,12 @@ fn tamper_fails() {
 fn engine_hybrid_does_not_accept_classical_ciphertext() {
     use voicechat_crypto::{CryptoEngineApi, CryptoProfile, DeviceConfig, VoiceChatCryptoEngine};
 
-    let mut ha = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let ha = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"ha".to_vec(),
         profile: CryptoProfile::HybridPqV1,
     })
     .unwrap();
-    let mut hb = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let hb = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"hb".to_vec(),
         profile: CryptoProfile::HybridPqV1,
     })
@@ -102,12 +105,12 @@ fn engine_hybrid_does_not_accept_classical_ciphertext() {
     let (sid_hb, pt_h) = hb.process_inbound_session(&init_h, b"hx", b"ad").unwrap();
     assert_eq!(pt_h, b"H0");
 
-    let mut ca = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let ca = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"ca".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })
     .unwrap();
-    let mut cb = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let cb = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: b"cb".to_vec(),
         profile: CryptoProfile::ClassicalV1,
     })

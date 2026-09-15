@@ -38,7 +38,6 @@ fn one_hundred_conversations_random_drops_reorder_dup_corrupt_restart() {
         let mut inbox_b: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
         let mut inbox_a: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
         let mut delivered = 0usize;
-        let mut bob_can_send = false;
 
         // Alice must send first (DR init leaves Bob without a sending chain).
         {
@@ -46,14 +45,16 @@ fn one_hundred_conversations_random_drops_reorder_dup_corrupt_restart() {
             let header = voicechat_crypto::ratchet::Header::decode(&h.encode()).unwrap();
             assert_eq!(bob.decrypt(&header, &ct, b"ad").unwrap(), b"hello-0");
             delivered += 1;
-            bob_can_send = true;
         }
 
         for i in 0..n_msg {
             let body = format!("c{c}-m{i}").into_bytes();
             let roll = next(&mut rng) % 100;
 
-            if !bob_can_send || roll < 55 {
+            // Alice's mandatory opening message above always gives Bob a sending
+            // chain, so no "can Bob send yet" guard is reachable here. The old
+            // flag was dead on every path (review 2026-08-28).
+            if roll < 55 {
                 let (h, ct) = alice.encrypt(&body, b"ad").unwrap();
                 let pkt = (h.encode(), ct, body);
                 if roll < 5 {

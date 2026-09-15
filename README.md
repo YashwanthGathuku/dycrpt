@@ -1,10 +1,14 @@
 # voicechat-crypto
 
-Clean-room Rust crypto engine for VoiceChat. Implements **public** Signal-family specifications only (PQXDH, Double Ratchet Rev 4, XEdDSA, ML-KEM Braid as SCKA). No libsignal. No AGPL/GPL runtime deps.
+Clean-room Rust engine for 1:1 encrypted sessions. It implements the **public-domain** PQXDH, Double Ratchet, and XEdDSA specifications and FIPS 203 ML-KEM, under MIT OR Apache-2.0. No AGPL/GPL runtime dependencies.
+
+**Not affiliated with Signal. Not a port of libsignal. Not compatible with the Signal network.** Those specifications are public; libsignal (AGPL-3.0) was not used as a source.
+
+Built so apps, devices, and **agent runtimes** can embed E2E without taking AGPL into the binary. Default profile is ClassicalV1. Hybrid PQ is experimental and opt-in.
 
 **This crate is not production-ready.** Internal tests and engineering gates are not a substitute for an independent cryptography review. See [`docs/PRODUCTION.md`](docs/PRODUCTION.md) and [`docs/AUDIT_SCOPE.md`](docs/AUDIT_SCOPE.md).
 
-**Continue work:** [`docs/HANDOFF.md`](docs/HANDOFF.md) then [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md).
+**Continue work:** [`docs/PUBLIC_LAUNCH.md`](docs/PUBLIC_LAUNCH.md) (what to say and what to do next), then [`docs/HANDOFF.md`](docs/HANDOFF.md) and [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md).
 
 ## Profiles
 
@@ -47,5 +51,7 @@ cargo test --all-targets --all-features -- --skip ten_thousand
 MSRV 1.85. Windows GNU hosts need `rust-lld` (see `rust-toolchain.toml`).
 
 ## Policy
+
+[`docs/V1_SCOPE.md`](docs/V1_SCOPE.md) — v1 freeze: 1:1 `ClassicalV1`, persistent storage, one FFI. Hybrid / header-encrypt / sesame stay gated.
 
 [`docs/FINAL_SECURITY_RULE.md`](docs/FINAL_SECURITY_RULE.md) — security wins over convenience. Do not invent algorithms, replace PQXDH, reuse keys, or expose secrets through FFI.

@@ -20,12 +20,12 @@ fn pair(
     voicechat_crypto::SessionId,
     voicechat_crypto::SessionId,
 ) {
-    let mut alice = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let alice = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: vec![tag, 1],
         profile,
     })
     .unwrap();
-    let mut bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
+    let bob = VoiceChatCryptoEngine::initialize_device(DeviceConfig {
         device_id: vec![tag, 2],
         profile,
     })
@@ -50,7 +50,7 @@ fn run_profile(profile: CryptoProfile) {
     };
 
     for c in 0..n_conv {
-        let (mut alice, mut bob, sid_a, sid_b) = pair(profile, c as u8);
+        let (alice, bob, sid_a, sid_b) = pair(profile, c as u8);
         let mut inbox_b = Vec::new();
         let mut inbox_a = Vec::new();
         let mut delivered = 1usize;

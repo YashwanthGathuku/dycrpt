@@ -188,8 +188,8 @@ fn modified_kem_no_shared() -> Result<(), String> {
 }
 
 fn wrong_prekey_id() -> Result<(), String> {
-    let mut alice = engine_named(b"a")?;
-    let mut bob = engine_named(b"b")?;
+    let alice = engine_named(b"a")?;
+    let bob = engine_named(b"b")?;
     let bundle = bob
         .generate_public_prekey_bundle(1)
         .map_err(|e| format!("{e:?}"))?;
@@ -225,8 +225,8 @@ fn concurrent_opk_consume() -> Result<(), String> {
 }
 
 fn stale_bundle() -> Result<(), String> {
-    let mut alice = engine_named(b"a")?;
-    let mut bob = engine_named(b"b")?;
+    let alice = engine_named(b"a")?;
+    let bob = engine_named(b"b")?;
     let old = bob
         .generate_public_prekey_bundle(1)
         .map_err(|e| format!("{e:?}"))?;
@@ -487,8 +487,8 @@ fn engine_drop_later() -> Result<(), String> {
 }
 
 fn p0_crash_no_opk_resurrect() -> Result<(), String> {
-    let mut a = engine_named(b"a")?;
-    let mut b = engine_named(b"b")?;
+    let a = engine_named(b"a")?;
+    let b = engine_named(b"b")?;
     let bundle = b
         .generate_public_prekey_bundle(1)
         .map_err(|e| format!("{e:?}"))?;
@@ -554,7 +554,7 @@ fn replay_survives_reload() -> Result<(), String> {
 }
 
 fn prekey_replenish() -> Result<(), String> {
-    let mut e = engine()?;
+    let e = engine()?;
     e.generate_public_prekey_bundle(3)
         .map_err(|e| format!("{e:?}"))?;
     e.replenish_prekeys(3).map_err(|e| format!("{e:?}"))?;
@@ -562,8 +562,8 @@ fn prekey_replenish() -> Result<(), String> {
 }
 
 fn prekey_exhaust_then_last_resort() -> Result<(), String> {
-    let mut a = engine_named(b"a")?;
-    let mut b = engine_named(b"b")?;
+    let a = engine_named(b"a")?;
+    let b = engine_named(b"b")?;
     let bundle = b
         .generate_public_prekey_bundle(0)
         .map_err(|e| format!("{e:?}"))?;

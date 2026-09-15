@@ -415,21 +415,21 @@ fn pke_encrypt_ct1(
             // Â^T[i][j] = SampleNTT(XOF(ρ, i, j)).
             let a_ji = sample_ntt(rho, i as u8, j as u8);
             let prod = multiply_ntts(&a_ji, r_j);
-            for t in 0..N {
-                acc[t] = fq_add(acc[t], prod[t]);
+            for (acc_t, prod_t) in acc.iter_mut().zip(prod.iter()) {
+                *acc_t = fq_add(*acc_t, *prod_t);
             }
         }
         ntt_inv(&mut acc);
-        for t in 0..N {
-            u[i][t] = fq_add(acc[t], e1[i][t]);
+        for (u_t, (acc_t, e_t)) in u[i].iter_mut().zip(acc.iter().zip(e1[i].iter())) {
+            *u_t = fq_add(*acc_t, *e_t);
         }
     }
     let _ = m;
     let mut packed = [0u8; CT1_LEN];
     for i in 0..K {
         let mut c = [0u16; N];
-        for t in 0..N {
-            c[t] = compress(u[i][t], DU);
+        for (c_t, u_t) in c.iter_mut().zip(u[i].iter()) {
+            *c_t = compress(*u_t, DU);
         }
         let enc = byte_encode_d(&c, DU);
         packed[i * 320..(i + 1) * 320].copy_from_slice(&enc);

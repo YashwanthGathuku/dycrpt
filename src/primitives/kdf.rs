@@ -94,9 +94,20 @@ pub fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
 
 /// SHA-256 digest.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
+    sha256_parts(&[data])
+}
+
+/// SHA-256 over multiple byte slices without first concatenating them.
+///
+/// This is useful for transcript/replay hashing where one component may be a
+/// large ciphertext. It avoids a second attacker-sized allocation while being
+/// exactly equivalent to hashing the concatenation of `parts` in order.
+pub fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
     use sha2::Digest;
     let mut hasher = Sha256::new();
-    hasher.update(data);
+    for part in parts {
+        hasher.update(part);
+    }
     hasher.finalize().into()
 }
 
@@ -184,5 +195,17 @@ mod tests {
             mac,
             hex!("f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
         );
+    }
+
+    #[test]
+    fn sha256_parts_matches_concatenation() {
+        let a = b"protocol";
+        let b = b"session-tag";
+        let c = vec![0x5au8; 4096];
+        let mut joined = Vec::new();
+        joined.extend_from_slice(a);
+        joined.extend_from_slice(b);
+        joined.extend_from_slice(&c);
+        assert_eq!(sha256_parts(&[a, b, &c]), sha256(&joined));
     }
 }

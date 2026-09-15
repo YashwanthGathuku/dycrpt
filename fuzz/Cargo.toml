@@ -1,3 +1,9 @@
+# Deliberately its own workspace root. Without this table cargo resolves the
+# parent workspace and refuses to build, which made every fuzz gate in CI
+# unrunnable (`cargo build --manifest-path fuzz/Cargo.toml` exits non-zero
+# before compiling anything). Found during review 2026-08-28.
+[workspace]
+
 [package]
 name = "voicechat_crypto-fuzz"
 version = "0.0.0"
@@ -8,7 +14,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-voicechat_crypto = { path = "..", features = ["std", "hybrid"] }
+voicechat_crypto = { path = "..", features = ["std", "hybrid", "header-encrypt", "sesame"] }
 libfuzzer-sys = { version = "0.4", optional = true }
 
 [features]
@@ -36,5 +42,23 @@ required-features = ["libfuzzer"]
 [[bin]]
 name = "triple_header_decode"
 path = "fuzz_targets/triple_header_decode.rs"
+doc = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "engine_wire"
+path = "fuzz_targets/engine_wire.rs"
+doc = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "prekey_bundle"
+path = "fuzz_targets/prekey_bundle.rs"
+doc = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "state_decoders"
+path = "fuzz_targets/state_decoders.rs"
 doc = false
 required-features = ["libfuzzer"]

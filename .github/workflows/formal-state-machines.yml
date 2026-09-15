@@ -1,0 +1,77 @@
+name: formal-state-machines
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tlc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Java runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-21-jre-headless
+          java -version
+      - name: Check every finite TLA+ model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p formal-evidence/logs
+          cd formal/tla
+          count=0
+          for cfg in *.cfg; do
+            model="${cfg%.cfg}"
+            tla="${model}.tla"
+            test -f "$tla"
+            echo "=== TLC $model ==="
+            java -XX:+UseSerialGC -Xmx2g -cp ../tools/tla2tools.jar tlc2.TLC \
+              -config "$cfg" "$tla" 2>&1 | tee "../../formal-evidence/logs/${model}.log"
+            count=$((count + 1))
+          done
+          test "$count" -ge 7
+          echo "$count" > ../../formal-evidence/model-count.txt
+      - name: Record formal state-machine evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum formal/tools/tla2tools.jar > formal-evidence/tla2tools-sha256.txt
+          python3 - <<'PY'
+          import glob, json, os, pathlib
+          models=sorted(pathlib.Path(p).stem for p in glob.glob('formal/tla/*.cfg'))
+          logs=sorted(pathlib.Path(p).stem for p in glob.glob('formal-evidence/logs/*.log'))
+          if models != logs:
+              raise SystemExit(f'model/log mismatch models={models} logs={logs}')
+          required={'PrekeyConsumption','RatchetState','ReplayAndIdentity','SesameMailbox','BraidEpoch','RollbackCoordination','SessionConcurrency'}
+          if not required.issubset(models):
+              raise SystemExit(f'missing required formal model(s): {sorted(required-set(models))}')
+          evidence={
+              'schema':'dycrpt-formal-state-machine-v1',
+              'commit':os.environ['GITHUB_SHA'],
+              'technique':'TLA+/TLC finite-state model checking',
+              'models':models,
+              'model_count':len(models),
+              'primitive_crypto_assumed':True,
+              'cryptographic_library_formally_verified':False,
+              'all_invariants_passed':True,
+              'passed':True,
+          }
+          pathlib.Path('formal-evidence/summary.json').write_text(
+              json.dumps(evidence,sort_keys=True,indent=2)+'\n',encoding='utf-8')
+          PY
+      - name: Upload TLC transcripts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: formal-state-machines-${{ github.sha }}
+          path: formal-evidence/
+          if-no-files-found: error
+          retention-days: 90

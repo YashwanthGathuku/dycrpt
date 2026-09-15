@@ -1,0 +1,61 @@
+# Release-blocking cargo-deny policy for dycrpt.
+# Unknown registries/git sources and unapproved licenses are denied. Keep every
+# exception narrow, versioned and justified in review; never add blanket ignores.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-linux-android",
+    "aarch64-apple-ios",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "all"
+unused-ignored-advisory = "deny"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+exceptions = []
+
+[bans]
+# Duplicate transitive versions are reviewed but are not automatically a
+# vulnerability. Wildcard dependency versions are forbidden.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Do not silently introduce alternate TLS/native-crypto stacks into this
+# cryptographic core. A future need must receive an explicit reviewed exception.
+deny = [
+    { crate = "openssl", reason = "unreviewed native crypto/TLS dependency" },
+    { crate = "openssl-sys", reason = "unreviewed native crypto/TLS dependency" },
+    { crate = "native-tls", reason = "network TLS stack does not belong in crypto core" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+]
+allow-git = []
