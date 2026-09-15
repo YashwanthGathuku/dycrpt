@@ -339,6 +339,79 @@ mod tests {
     }
 
     #[test]
+    fn shared_secret_zeroize_clears_sk_and_ad() {
+        let mut shared = PqxdhSharedSecret {
+            sk: [0xAA; 32],
+            ad: vec![0xBB; 8],
+        };
+        Zeroize::zeroize(&mut shared);
+        assert_eq!(shared.sk, [0u8; 32], "zeroize must wipe the shared key");
+        assert!(
+            shared.ad.is_empty(),
+            "zeroize must wipe and clear associated data"
+        );
+    }
+
+    #[test]
+    fn bob_rejects_mismatched_one_time_ec_id() {
+        let alice_ik = IdentityKeyPair::generate().unwrap();
+        let bob_ik = IdentityKeyPair::generate().unwrap();
+        let mut store = PrekeyStore::new(&bob_ik).unwrap();
+        store.replenish(&bob_ik, 1, 0).unwrap();
+        let bundle = store.public_bundle(&bob_ik).unwrap();
+        let alice = alice_initiate(&alice_ik, &bundle).unwrap();
+        let used = alice.used_ec_opk_id.expect("alice used the one-time EC prekey");
+        let opk = store.consume_ec(used).unwrap();
+        let pq_public = store.last_resort_pq.public().unwrap();
+        let bob_mat = BobPrivateMaterial {
+            identity: &bob_ik,
+            signed_prekey: &store.signed,
+            one_time_ec: Some(&opk),
+            pq_secret: &store.last_resort_pq.secret,
+            pq_public: &pq_public,
+            pq_prekey_id: bundle.pq_prekey_id,
+        };
+        assert!(matches!(
+            bob_process(
+                &bob_mat,
+                &alice_ik.public(),
+                &alice.ephemeral_public,
+                &alice.kem_ciphertext,
+                Some(used.wrapping_add(1)),
+            ),
+            Err(PrimitiveError::InvalidSecretKey)
+        ));
+    }
+
+    #[test]
+    fn bob_rejects_claimed_opk_when_none_present() {
+        let alice_ik = IdentityKeyPair::generate().unwrap();
+        let bob_ik = IdentityKeyPair::generate().unwrap();
+        let store = PrekeyStore::new(&bob_ik).unwrap();
+        let bundle = store.public_bundle(&bob_ik).unwrap();
+        let alice = alice_initiate(&alice_ik, &bundle).unwrap();
+        let pq_public = store.last_resort_pq.public().unwrap();
+        let bob_mat = BobPrivateMaterial {
+            identity: &bob_ik,
+            signed_prekey: &store.signed,
+            one_time_ec: None,
+            pq_secret: &store.last_resort_pq.secret,
+            pq_public: &pq_public,
+            pq_prekey_id: bundle.pq_prekey_id,
+        };
+        assert!(matches!(
+            bob_process(
+                &bob_mat,
+                &alice_ik.public(),
+                &alice.ephemeral_public,
+                &alice.kem_ciphertext,
+                Some(1),
+            ),
+            Err(PrimitiveError::InvalidSecretKey)
+        ));
+    }
+
+    #[test]
     fn consumed_opk_cannot_be_consumed_twice() {
         let bob_ik = IdentityKeyPair::generate().unwrap();
         let mut store = PrekeyStore::new(&bob_ik).unwrap();

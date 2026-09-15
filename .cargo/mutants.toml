@@ -37,12 +37,14 @@ exclude_globs = ["src/testing/**", "src/bin/**", "src/ffi/jni.rs"]
 #
 # These are excluded rather than "killed". The behaviour they delegate to IS
 # tested: `skipped_keys_zeroize_clears_the_store` asserts `SkippedKeys::zeroize`
-# actually empties the store, so the only untested claim left is the one-line
-# delegation from `drop` to `zeroize`.
+# actually empties the store, and `shared_secret_zeroize_clears_sk_and_ad`
+# asserts `PqxdhSharedSecret::zeroize` clears the secret and AD. The only
+# untested claim left is the one-line delegation from `drop` to `zeroize`.
 #
 # Reviewed 2026-08-28. Revisit if a drop-observability harness (tracking
 # allocator, or a sentinel type) is ever added.
 exclude_re = [
     "impl Drop for SkippedKeys",
     "impl Drop for SkippedMutationJournal",
+    "impl Drop for PqxdhSharedSecret",
 ]

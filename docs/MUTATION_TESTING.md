@@ -7,7 +7,7 @@
 
 v1 exit criterion (from `docs/dycrpt-v1-scope-and-comparison.md` Gate 3): **≥ 85%** on `src/primitives/`, `src/ratchet/`, `src/pqxdh/`, `src/replay/`, and `src/storage/`. Every survivor is either killed with a new test or justified in `KNOWN_LIMITATIONS.md`.
 
-This file records two measured files. It is not a v1 Gate 3 pass.
+This file records measured files. It is not a v1 Gate 3 pass.
 
 ---
 
@@ -216,7 +216,9 @@ Same as F1 and as the XEdDSA 90.2% run:
 | File | Score | Survivor cluster |
 |---|---|---|
 | `src/primitives/xeddsa.rs` (after killing tests) | 100% (review re-run) | Were: input validation + domain separation |
-| `src/ratchet/mod.rs` (this session) | **80.8%** | Secret wipe, unused accessors, redundant skip bound, deserialize count ceiling, unused Triple key-export API |
+| `src/ratchet/mod.rs` (after killing tests) | 100% | Were: secret wipe, unused accessors, skip bound, deserialize count |
+| `src/pqxdh/mod.rs` (2026-09-08) | 100% | Drop excluded; OPK-id rejection tests added |
+| `src/replay/mod.rs` (2026-09-08, after killing tests) | 100% | Were: const bounds, independent component rejects, accessors, deserialize ceilings |
 
 Round-trip, tamper, and a handful of deserialize tests are all present and all passing. They do not pin the outer skip bound, the skipped-count ceiling, skipped-key cardinality after a real skip, or zeroization.
 
@@ -289,8 +291,83 @@ rejecting paths too. Two files, two independent runs, one consistent gap.
 ### Still unmeasured
 
 The other ~835 mutants under `src/ratchet/**` (hybrid and header-encrypt
-profiles, `spqr/`, `braid/`, `triple/`), plus `src/pqxdh/`, `src/replay/` and
-`src/storage/`. The v1 exit criterion is ≥ 85% across all of them.
+profiles, `spqr/`, `braid/`, `triple/`), remaining `src/primitives/` (except
+xeddsa), and `src/storage/` except the coordinated.rs kill pass. The v1 exit
+criterion is ≥ 85% across all of them.
+
+## `src/pqxdh/mod.rs` — 100% (2026-09-08)
+
+cargo-mutants sees almost no branching here: Alice/Bob are straight-line DH +
+KEM concatenations. Listed mutants: 4. After excluding the unobservable Drop
+(same rationale as `SkippedKeys`), 3 remain.
+
+Command:
+
+```text
+cargo mutants -f src/pqxdh/mod.rs -j 2 -o mutants-pqxdh.out -- --lib
+```
+
+| Run | Examined | Caught | Missed | Unviable | Score |
+|---|---|---|---|---|---|
+| Baseline (Drop still in scope) | 4 | 1 | 1 | 2 | 50% |
+| After Drop exclude + rejection tests | 3 | 1 | 0 | 2 | **100%** |
+
+The one caught mutant is `opk.id != id` flipped to `==` in `bob_process`. The
+happy-path OPK handshake already kills it (matching IDs would then reject).
+The two unviable mutants are `alice_initiate` / `bob_process` replaced with
+`Ok(Default::default())` — those types are not `Default`.
+
+The missed Drop was `impl Drop for PqxdhSharedSecret` emptied to `()`. Same
+class as the ratchet Drops: observing whether `sk`/`ad` are wiped after free
+is undefined behaviour. Excluded in `.cargo/mutants.toml`. The behaviour it
+delegates to is tested: `shared_secret_zeroize_clears_sk_and_ad`.
+
+Two rejection tests were still missing even though the `!=` mutant was already
+caught by the happy path:
+
+| Test | What it pins |
+|---|---|
+| `bob_rejects_mismatched_one_time_ec_id` | `bob_process` with a present OPK and the wrong id → `InvalidSecretKey` |
+| `bob_rejects_claimed_opk_when_none_present` | `used_ec_opk_id = Some(_)` but `one_time_ec = None` → `InvalidSecretKey` |
+
+This 100% is **not** “PQXDH is fully verified.” It is “the mutants cargo-mutants
+can inject in this file are all caught or unviable.” Spec KATs (Gate 2) and
+the DH-term membership still sit outside this tool.
+
+## `src/replay/mod.rs` — 100% (2026-09-08)
+
+Command:
+
+```text
+cargo mutants -f src/replay/mod.rs -j 2 -o mutants-replay.out -- --lib
+```
+
+| Run | Examined | Caught | Missed | Unviable | Score |
+|---|---|---|---|---|---|
+| Baseline | 76 | 49 | 26 | 1 | **65.3%** |
+| After killing tests | 76 | 75 | 0 | 1 | **100%** |
+
+Unviable: `deserialize -> Ok(Default::default())` (`ReplayCache` is not `Default`).
+
+The 26 survivors were the same shape as XEdDSA and the Double Ratchet: the
+suite accepted what a well-formed cache does, and did not pin independent
+rejection bounds, exact cardinalities, or the numeric max lengths.
+
+| Cluster | Mutants | Why they survived | Killing tests |
+|---|---|---|---|
+| Const `*` → `+` on `MAX_*_LEN` | 3 | Tests used the same identifier, so both sides moved together | `component_max_lengths_are_the_documented_constants` (literals 65536 / 4096 / 16384) |
+| `validate` `\|\|` → `&&` and `>` → `==`/`>=` | 7 | Only oversized `conversation_id` was tested; empty `message_id`, oversized sender, and exact-max lengths were not | `each_oversized_component_is_rejected_independently`, `exact_max_component_lengths_are_accepted_and_roundtrip` |
+| `len` / `is_empty` / `capacity` → 0/1/true/false | 6 | `respects_capacity` asserted `len <= 3`, which 0 and 1 also satisfy | `accessors_report_exact_cardinality_and_capacity` |
+| Deserialize magic `\|\|` → `&&`, `n > capacity` `==`/`>=`, `capacity > MAX` `>=` | 4 | Happy-path magic; no `n == capacity` or `capacity == MAX` accept case | `deserialize_rejects_wrong_magic_even_when_length_is_legal`, `deserialize_accepts_max_capacity_and_count_equal_to_capacity` |
+| Trailing bytes `\|\|` → `&&` | 1 | No extra-byte blob | `deserialize_rejects_trailing_bytes` |
+| `take_vec` remainder `+` → `-`, `n > max` `==`/`>=` | 5 | No truncated payload; exact-max field never deserialized | `deserialize_rejects_truncated_entry_payload`, `deserialize_empty_message_id_is_limit_exceeded_not_invalid_length`, exact-max roundtrip |
+
+`deserialize_empty_message_id_is_limit_exceeded_not_invalid_length` is the
+interesting one: an empty last field leaves `take_vec` with exactly four
+bytes remaining. Original code reads `n = 0` and then `validate` returns
+`LimitExceeded`. Mutating `i + 4 > len` to `>=` or `==` returns
+`InvalidLength` instead. `assert!(is_err())` would not have distinguished
+them.
 
 ## src/storage/coordinated.rs — 2026-08-28 (review)
 

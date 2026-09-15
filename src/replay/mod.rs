@@ -242,4 +242,152 @@ mod tests {
         };
         assert!(cache.check_and_insert(oversized).is_err());
     }
+
+    #[test]
+    fn component_max_lengths_are_the_documented_constants() {
+        // Literals so a `*` → `+` mutant on the const definitions cannot
+        // hide behind the same identifier in the test.
+        assert_eq!(MAX_CONVERSATION_ID_LEN, 65_536);
+        assert_eq!(MAX_SENDER_DEVICE_ID_LEN, 4_096);
+        assert_eq!(MAX_MESSAGE_ID_LEN, 16_384);
+        assert_eq!(MAX_REPLAY_CACHE_SIZE, 65_536);
+    }
+
+    #[test]
+    fn accessors_report_exact_cardinality_and_capacity() {
+        let mut cache = ReplayCache::new(4);
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.capacity(), 4);
+        assert!(!cache.check_and_insert(key(1)).unwrap());
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.check_and_insert(key(2)).unwrap());
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.capacity(), 4);
+    }
+
+    #[test]
+    fn each_oversized_component_is_rejected_independently() {
+        let mut cache = ReplayCache::new(4);
+        assert!(cache
+            .check_and_insert(ReplayKey {
+                conversation_id: vec![0; MAX_CONVERSATION_ID_LEN + 1],
+                sender_device_id: b"d".to_vec(),
+                message_id: vec![1],
+            })
+            .is_err());
+        assert!(cache
+            .check_and_insert(ReplayKey {
+                conversation_id: b"c".to_vec(),
+                sender_device_id: vec![0; MAX_SENDER_DEVICE_ID_LEN + 1],
+                message_id: vec![1],
+            })
+            .is_err());
+        assert!(cache
+            .check_and_insert(ReplayKey {
+                conversation_id: b"c".to_vec(),
+                sender_device_id: b"d".to_vec(),
+                message_id: vec![0; MAX_MESSAGE_ID_LEN + 1],
+            })
+            .is_err());
+        assert!(cache
+            .check_and_insert(ReplayKey {
+                conversation_id: b"c".to_vec(),
+                sender_device_id: b"d".to_vec(),
+                message_id: vec![],
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn exact_max_component_lengths_are_accepted_and_roundtrip() {
+        let mut cache = ReplayCache::new(2);
+        let k = ReplayKey {
+            conversation_id: vec![1; MAX_CONVERSATION_ID_LEN],
+            sender_device_id: vec![2; MAX_SENDER_DEVICE_ID_LEN],
+            message_id: vec![3; MAX_MESSAGE_ID_LEN],
+        };
+        assert!(!cache.check_and_insert(k.clone()).unwrap());
+        assert_eq!(cache.len(), 1);
+        let restored = ReplayCache::deserialize(&cache.serialize()).unwrap();
+        assert!(restored.contains(&k));
+        assert_eq!(restored.len(), 1);
+    }
+
+    #[test]
+    fn deserialize_accepts_max_capacity_and_count_equal_to_capacity() {
+        let mut blob = b"VCREPL01".to_vec();
+        blob.extend_from_slice(&(MAX_REPLAY_CACHE_SIZE as u32).to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        let empty = ReplayCache::deserialize(&blob).unwrap();
+        assert_eq!(empty.capacity(), MAX_REPLAY_CACHE_SIZE);
+        assert!(empty.is_empty());
+
+        let mut cache = ReplayCache::new(2);
+        assert!(!cache.check_and_insert(key(1)).unwrap());
+        assert!(!cache.check_and_insert(key(2)).unwrap());
+        assert_eq!(cache.len(), 2);
+        let restored = ReplayCache::deserialize(&cache.serialize()).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.capacity(), 2);
+        assert!(restored.contains(&key(1)));
+        assert!(restored.contains(&key(2)));
+    }
+
+    #[test]
+    fn deserialize_rejects_wrong_magic_even_when_length_is_legal() {
+        let mut blob = b"XXXXXXXX".to_vec();
+        blob.extend_from_slice(&8u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            ReplayCache::deserialize(&blob),
+            Err(PrimitiveError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn deserialize_rejects_short_header() {
+        assert!(matches!(
+            ReplayCache::deserialize(b"VCREPL01"),
+            Err(PrimitiveError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn deserialize_rejects_trailing_bytes() {
+        let mut cache = ReplayCache::new(4);
+        cache.check_and_insert(key(3)).unwrap();
+        let mut blob = cache.serialize();
+        blob.push(0);
+        assert!(matches!(
+            ReplayCache::deserialize(&blob),
+            Err(PrimitiveError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn deserialize_rejects_truncated_entry_payload() {
+        let mut blob = b"VCREPL01".to_vec();
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            ReplayCache::deserialize(&blob),
+            Err(PrimitiveError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn deserialize_empty_message_id_is_limit_exceeded_not_invalid_length() {
+        let mut blob = b"VCREPL01".to_vec();
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        put_vec(&mut blob, b"c");
+        put_vec(&mut blob, b"d");
+        put_vec(&mut blob, b"");
+        assert!(matches!(
+            ReplayCache::deserialize(&blob),
+            Err(PrimitiveError::LimitExceeded)
+        ));
+    }
 }
