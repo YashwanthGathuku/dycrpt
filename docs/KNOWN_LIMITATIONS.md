@@ -89,3 +89,19 @@ library can supply.
    first unlock after boot. Background push crypto will get
    `VC_ANCHOR_UNAVAILABLE`. That is transient and retryable and must not be
    handled as a rollback.
+
+## Mutation survivors left documented (2026-09-08)
+
+`src/storage/encrypted_file.rs` Gate 3. These mutants are not killed because a
+sound test is either undefined behaviour, requires a hundreds-of-megabytes
+fixture that mutation would rebuild per mutant, or needs an injected IO error.
+
+| Site | Mutant | Why not killed |
+|---|---|---|
+| `impl Drop for EncryptedFileStorage` | body → `()` | Wipe-on-drop. Observing it is UB. Excluded in `.cargo/mutants.toml`. |
+| `file_len > MAX_STORAGE_FILE` `>` → `==` / `>=` | exact 512 MiB snapshot | A 512 MiB file is not a reasonable fixture inside cargo-mutants. The `*` on the const **is** pinned to `536_870_912`. |
+| `put` / `append_record` `value.len() > MAX_VALUE_LEN` `>` → `==` / `>=` | exact 80 MiB value | Same cost argument. Header-only `decode_map` **does** pin this bound. |
+| `effective_record_count` `count > MAX_RECORDS` | 200_000 live keys | Header-only `decode_map` pins the count ceiling. Building 200k in-memory records per mutant is not worth it. |
+| `sync_parent_dir` (all mutants) | Windows directory fsync | Best-effort after the snapshot `sync_all` + rename. Excluded in `.cargo/mutants.toml`. |
+| `decode_map` `8 + 8 + 4` `+` → `-` | min plaintext length 20 | Any successful map is ≥ 20 bytes; 12–19 byte blobs fail as `InvalidLength` either way. |
+| `encode_effective_map` `emitted.len() != count \|\| out.len() > MAX` | defensive consistency | Unreachable when `effective_record_count` matches the encoder; the 512 MiB side is unfixtureable. |

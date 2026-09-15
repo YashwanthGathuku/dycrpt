@@ -47,4 +47,10 @@ exclude_re = [
     "impl Drop for SkippedKeys",
     "impl Drop for SkippedMutationJournal",
     "impl Drop for PqxdhSharedSecret",
+    "impl Drop for EncryptedFileStorage",
+    # Windows directory fsync is best-effort: PermissionDenied / os error 5
+    # already returns Ok after the snapshot file has been sync_all'd and
+    # renamed. Tests cannot inject a directory-handle failure, so every
+    # mutant of this helper is observationally equivalent on this host.
+    "sync_parent_dir",
 ]

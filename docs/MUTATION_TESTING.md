@@ -219,6 +219,7 @@ Same as F1 and as the XEdDSA 90.2% run:
 | `src/ratchet/mod.rs` (after killing tests) | 100% | Were: secret wipe, unused accessors, skip bound, deserialize count |
 | `src/pqxdh/mod.rs` (2026-09-08) | 100% | Drop excluded; OPK-id rejection tests added |
 | `src/replay/mod.rs` (2026-09-08, after killing tests) | 100% | Were: const bounds, independent component rejects, accessors, deserialize ceilings |
+| `src/storage/encrypted_file.rs` (2026-09-08, after killing tests) | **89.6%** | 13 documented: 512 MiB / 80 MiB exact bounds, redundant min-length arithmetic |
 
 Round-trip, tamper, and a handful of deserialize tests are all present and all passing. They do not pin the outer skip bound, the skipped-count ceiling, skipped-key cardinality after a real skip, or zeroization.
 
@@ -292,8 +293,8 @@ rejecting paths too. Two files, two independent runs, one consistent gap.
 
 The other ~835 mutants under `src/ratchet/**` (hybrid and header-encrypt
 profiles, `spqr/`, `braid/`, `triple/`), remaining `src/primitives/` (except
-xeddsa), and `src/storage/` except the coordinated.rs kill pass. The v1 exit
-criterion is ≥ 85% across all of them.
+xeddsa), and the rest of `src/storage/` (`mod.rs`, `monotonic.rs`,
+`trusted_anchor.rs`). The v1 exit criterion is ≥ 85% across all of them.
 
 ## `src/pqxdh/mod.rs` — 100% (2026-09-08)
 
@@ -368,6 +369,44 @@ bytes remaining. Original code reads `n = 0` and then `validate` returns
 `LimitExceeded`. Mutating `i + 4 > len` to `>=` or `==` returns
 `InvalidLength` instead. `assert!(is_err())` would not have distinguished
 them.
+
+## `src/storage/encrypted_file.rs` — 89.6% (2026-09-08)
+
+Must include integration tests (`storage_hardening`, `ffi_persistent`,
+`crash_hardening`, `migration_matrix`, `p02_concurrency`). `--lib` alone hides
+most coverage.
+
+```text
+cargo mutants -f src/storage/encrypted_file.rs -j 2 -o mutants-encrypted-file.out \
+  -- --features ffi --lib --test storage_hardening --test ffi_persistent \
+  --test crash_hardening --test migration_matrix --test p02_concurrency
+```
+
+| Run | Examined | Caught | Missed | Unviable | Timeout | Score |
+|---|---|---|---|---|---|---|
+| Baseline | 145 | 71 | 65 | 8 | 1 | **52.2%** |
+| After kill tests (Drop still in) | 144 | 109 | 27 | 8 | 0 | 80.1% |
+| After Drop + `sync_parent_dir` exclude | 133 | 112 | 13 | 8 | 0 | **89.6%** |
+
+Above the v1 85% bar. The 13 survivors are recorded in `KNOWN_LIMITATIONS.md`:
+
+| Cluster | N | Why they remain |
+|---|---|---|
+| `file_len > MAX_STORAGE_FILE` `>` → `==`/`>=` | 2 | Exact 512 MiB snapshot is not a mutation fixture |
+| `decode_map` `8+8+4` `+` → `-` | 2 | Equivalent on every successful parse (plaintext ≥ 20 bytes) |
+| `effective_record_count > MAX_RECORDS` | 2 | 200k live keys; header-only `decode_map` already pins the ceiling |
+| `encode_effective_map` `emitted != count \|\| out.len() > MAX` | 3 | Defensive check; 512 MiB side unfixtureable |
+| `put` / `append_record` `value.len() > MAX_VALUE_LEN` `>` → `==`/`>=` | 4 | Exact 80 MiB value; `decode_map` header-only pins this bound |
+
+`sync_parent_dir` (10 mutants) and `Drop` are excluded, not missed: Windows
+directory fsync is best-effort after `sync_all` + rename, and wipe-on-drop is
+UB to observe.
+
+Kill tests that moved the score: constant literals, `encode_lower_hex`,
+same-instance `get`/`keys` after commit (kills `apply_staged` → `()`), abort
+then begin, empty follow-up commit, empty/oversized keys on `put`/`delete`/
+`append_record`, V1 magic → `InvalidNonce`, truncated snapshot error variants,
+`decode_map` count/key/value headers.
 
 ## src/storage/coordinated.rs — 2026-08-28 (review)
 

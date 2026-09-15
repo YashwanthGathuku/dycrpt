@@ -551,4 +551,218 @@ mod tests {
         assert!(restored.get(b"k").unwrap().is_none());
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn storage_limits_are_the_documented_constants() {
+        assert_eq!(MAX_STORAGE_FILE, 536_870_912);
+        assert_eq!(MAX_RECORDS, 200_000);
+        assert_eq!(MAX_KEY_LEN, 65_536);
+        assert_eq!(MAX_VALUE_LEN, 83_886_080);
+        assert_eq!(NONCE_LEN, 24);
+        assert_eq!(FILE_MAGIC, b"VCENCST2");
+        assert_eq!(LEGACY_FILE_MAGIC_V1, b"VCENCST1");
+        assert_eq!(MAP_MAGIC, b"VCMAP001");
+    }
+
+    #[test]
+    fn encode_lower_hex_is_lowercase_and_zero_padded() {
+        assert_eq!(encode_lower_hex(&[0x00, 0xff, 0x1a]), "00ff1a");
+        assert_eq!(encode_lower_hex(&[]), "");
+        assert_ne!(encode_lower_hex(&[1, 2, 3]), "xyzzy");
+    }
+
+    #[test]
+    fn commit_is_visible_on_the_same_instance_and_keys_lists_it() {
+        let path = temp_path("same-instance");
+        let mut store = EncryptedFileStorage::open(&path, [4u8; 32]).unwrap();
+        let tx = store.begin().unwrap();
+        store
+            .put(tx, b"session", &StateBlob(b"secret-state".to_vec()))
+            .unwrap();
+        store.commit(tx).unwrap();
+        assert_eq!(
+            store.get(b"session").unwrap().unwrap().0,
+            b"secret-state"
+        );
+        assert_eq!(store.keys().unwrap(), vec![b"session".to_vec()]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn abort_clears_the_transaction_so_begin_can_run_again() {
+        let path = temp_path("abort-begin");
+        let mut store = EncryptedFileStorage::open(&path, [5u8; 32]).unwrap();
+        let tx = store.begin().unwrap();
+        store.put(tx, b"k", &StateBlob(b"v".to_vec())).unwrap();
+        store.abort(tx).unwrap();
+        let tx = store.begin().expect("abort must drop staged state");
+        store.abort(tx).unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_followup_commit_keeps_existing_records() {
+        let path = temp_path("empty-commit");
+        let key = [6u8; 32];
+        let mut store = EncryptedFileStorage::open(&path, key).unwrap();
+        let tx = store.begin().unwrap();
+        store.put(tx, b"keep", &StateBlob(b"yes".to_vec())).unwrap();
+        store.commit(tx).unwrap();
+        let tx = store.begin().unwrap();
+        store.commit(tx).unwrap();
+        drop(store);
+        let restored = EncryptedFileStorage::open(&path, key).unwrap();
+        assert_eq!(restored.get(b"keep").unwrap().unwrap().0, b"yes");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn put_and_delete_reject_empty_and_oversized_keys() {
+        let path = temp_path("key-bounds");
+        let mut store = EncryptedFileStorage::open(&path, [2u8; 32]).unwrap();
+        let tx = store.begin().unwrap();
+        assert!(store
+            .put(tx, b"", &StateBlob(b"v".to_vec()))
+            .is_err());
+        assert!(store
+            .put(tx, &vec![7u8; MAX_KEY_LEN + 1], &StateBlob(b"v".to_vec()))
+            .is_err());
+        assert!(store
+            .put(tx, &vec![7u8; MAX_KEY_LEN], &StateBlob(b"v".to_vec()))
+            .is_ok());
+        assert!(store.delete(tx, b"").is_err());
+        assert!(store.delete(tx, &vec![7u8; MAX_KEY_LEN + 1]).is_err());
+        assert!(store.delete(tx, &vec![7u8; MAX_KEY_LEN]).is_ok());
+        store.abort(tx).unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_rejects_legacy_v1_and_wrong_magic() {
+        let key = [1u8; 32];
+        let v1 = temp_path("legacy-v1");
+        let mut blob = b"VCENCST1".to_vec();
+        blob.extend_from_slice(&[0u8; 64]);
+        fs::write(&v1, &blob).unwrap();
+        assert!(matches!(
+            EncryptedFileStorage::open(&v1, key),
+            Err(PrimitiveError::InvalidNonce)
+        ));
+        let _ = fs::remove_file(&v1);
+
+        let bad = temp_path("bad-magic");
+        let mut blob = b"XXXXXXXX".to_vec();
+        blob.extend_from_slice(&[0u8; 64]);
+        fs::write(&bad, &blob).unwrap();
+        assert!(matches!(
+            EncryptedFileStorage::open(&bad, key),
+            Err(PrimitiveError::InvalidLength)
+        ));
+        let _ = fs::remove_file(&bad);
+    }
+
+    #[test]
+    fn open_rejects_truncated_snapshots_with_distinct_errors() {
+        let key = [1u8; 32];
+        let tiny = temp_path("tiny");
+        fs::write(&tiny, b"x").unwrap();
+        assert!(matches!(
+            EncryptedFileStorage::open(&tiny, key),
+            Err(PrimitiveError::InvalidLength)
+        ));
+        let _ = fs::remove_file(&tiny);
+
+        let prefix = temp_path("v2-prefix");
+        let mut blob = b"VCENCST2".to_vec();
+        blob.extend_from_slice(&[0u8; 12]);
+        fs::write(&prefix, &blob).unwrap();
+        assert!(EncryptedFileStorage::open(&prefix, key).is_err());
+        let _ = fs::remove_file(&prefix);
+
+        // Exactly MAGIC + NONCE + TAG. Original decrypts (and fails AEAD);
+        // `file_len == min` / `<=` mutants return InvalidLength without decrypt.
+        let min = temp_path("min-len");
+        let mut blob = b"VCENCST2".to_vec();
+        blob.extend_from_slice(&[0u8; NONCE_LEN + TAG_LEN]);
+        fs::write(&min, &blob).unwrap();
+        assert!(matches!(
+            EncryptedFileStorage::open(&min, key),
+            Err(PrimitiveError::AeadDecryptionFailed)
+        ));
+        let _ = fs::remove_file(&min);
+    }
+
+    fn map_header(count: u32) -> Vec<u8> {
+        let mut data = MAP_MAGIC.to_vec();
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&count.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn decode_map_rejects_short_wrong_magic_and_count_ceiling() {
+        assert!(matches!(
+            EncryptedFileStorage::decode_map(&[]),
+            Err(PrimitiveError::InvalidLength)
+        ));
+        let mut bad = *MAP_MAGIC;
+        bad[0] ^= 1;
+        let mut blob = bad.to_vec();
+        blob.extend_from_slice(&[0u8; 12]);
+        assert!(matches!(
+            EncryptedFileStorage::decode_map(&blob),
+            Err(PrimitiveError::InvalidLength)
+        ));
+        assert!(matches!(
+            EncryptedFileStorage::decode_map(&map_header(MAX_RECORDS as u32 + 1)),
+            Err(PrimitiveError::LimitExceeded)
+        ));
+        // count == MAX_RECORDS is legal; with no records the parser must fail
+        // as InvalidLength, not LimitExceeded (`>` mutated to `>=`).
+        assert!(matches!(
+            EncryptedFileStorage::decode_map(&map_header(MAX_RECORDS as u32)),
+            Err(PrimitiveError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn decode_map_rejects_empty_and_oversized_record_headers() {
+        fn record_header(key_len: u32, value_len: u32) -> Vec<u8> {
+            let mut data = map_header(1);
+            data.extend_from_slice(&key_len.to_le_bytes());
+            data.extend_from_slice(&value_len.to_le_bytes());
+            data
+        }
+        assert!(matches!(
+            EncryptedFileStorage::decode_map(&record_header(0, 1)),
+            Err(PrimitiveError::LimitExceeded)
+        ));
+        assert!(matches!(
+            EncryptedFileStorage::decode_map(&record_header(MAX_KEY_LEN as u32 + 1, 1)),
+            Err(PrimitiveError::LimitExceeded)
+        ));
+        assert!(matches!(
+            EncryptedFileStorage::decode_map(&record_header(1, MAX_VALUE_LEN as u32 + 1)),
+            Err(PrimitiveError::LimitExceeded)
+        ));
+        // Exact max lengths are legal; truncated payload is InvalidLength,
+        // which kills `>` → `>=` (those return LimitExceeded instead).
+        assert!(matches!(
+            EncryptedFileStorage::decode_map(&record_header(MAX_KEY_LEN as u32, 1)),
+            Err(PrimitiveError::InvalidLength)
+        ));
+        assert!(matches!(
+            EncryptedFileStorage::decode_map(&record_header(1, MAX_VALUE_LEN as u32)),
+            Err(PrimitiveError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn append_record_rejects_empty_and_oversized_keys() {
+        let mut out = Vec::new();
+        assert!(append_record(&mut out, b"", b"v").is_err());
+        assert!(append_record(&mut out, &vec![1u8; MAX_KEY_LEN + 1], b"v").is_err());
+        assert!(append_record(&mut out, &vec![1u8; MAX_KEY_LEN], b"v").is_ok());
+        assert_eq!(&out[..4], &(MAX_KEY_LEN as u32).to_le_bytes());
+    }
 }
