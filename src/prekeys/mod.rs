@@ -1,7 +1,9 @@
 //! Explicit prekey models for PQXDH.
 //!
-//! One-time prekeys are consumed atomically. Last-resort PQ prekeys are
-//! rotated by policy and are never treated as one-time.
+//! One-time prekeys are consumed exactly once. Signed EC and last-resort PQ
+//! prekeys are rotated by policy, while a small bounded set of previous private
+//! keys may be retained temporarily so delayed initiation messages can still be
+//! processed after the public bundle has rotated.
 
 use std::collections::HashMap;
 
@@ -16,6 +18,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub type EcPrekeyId = u32;
 /// Unique identifier for a PQ KEM prekey.
 pub type PqPrekeyId = u32;
+
+/// Hard parser/storage bound. Normal deployments should keep far fewer keys.
+const MAX_STORED_PREKEYS: usize = 100_000;
+/// Hard bound on previous signed/last-resort keys retained for delayed messages.
+pub const MAX_RETAINED_ROTATED_PREKEYS: usize = 8;
 
 /// Long-term identity key pair (X25519 + XEd25519).
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -242,7 +249,11 @@ impl PublicPrekeyBundle {
         let pq = take(&mut i, pq_len)?.to_vec();
         let mut pq_sig = [0u8; 64];
         pq_sig.copy_from_slice(take(&mut i, 64)?);
-        let is_one = take(&mut i, 1)?[0];
+        let is_one = match take(&mut i, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(PrimitiveError::InvalidLength),
+        };
         if i != data.len() {
             return Err(PrimitiveError::InvalidLength);
         }
@@ -255,20 +266,42 @@ impl PublicPrekeyBundle {
             pq_prekey_id: pq_id,
             pq_prekey_public: pq,
             pq_prekey_sig: pq_sig,
-            is_pq_one_time: is_one == 1,
+            is_pq_one_time: is_one,
         };
         bundle.validate()?;
         Ok(bundle)
     }
 }
 
-/// Device-local prekey store with atomic one-time consumption.
+/// Public inventory item that a server may allocate exactly once.
+#[derive(Clone)]
+pub struct PublicEcOneTimePrekey {
+    pub id: EcPrekeyId,
+    pub public: X25519Public,
+}
+
+/// Public inventory item that a server may allocate exactly once.
+#[derive(Clone)]
+pub struct PublicPqOneTimePrekey {
+    pub id: PqPrekeyId,
+    pub public: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+/// Device-local prekey store with atomic one-time consumption and bounded
+/// retention of recently rotated reusable prekeys.
 pub struct PrekeyStore {
     pub signed: SignedPrekey,
     pub last_resort_pq: LastResortPqPrekey,
+    previous_signed: HashMap<EcPrekeyId, SignedPrekey>,
+    previous_last_resort_pq: HashMap<PqPrekeyId, LastResortPqPrekey>,
     one_time_ec: HashMap<EcPrekeyId, OneTimeEcPrekey>,
     one_time_pq: HashMap<PqPrekeyId, OneTimePqPrekey>,
+    /// Shared EC id allocator. Signed-prekey rotations and EC OPKs both consume
+    /// ids from it, so ids are never reused by this device.
     next_ec: EcPrekeyId,
+    /// Shared PQ id allocator. LR-PQ rotations and PQ OPKs both consume ids
+    /// from it, preventing ambiguous collisions in the single `pq_prekey_id`.
     next_pq: PqPrekeyId,
 }
 
@@ -277,11 +310,31 @@ impl PrekeyStore {
         Ok(Self {
             signed: SignedPrekey::generate(identity, 1)?,
             last_resort_pq: LastResortPqPrekey::generate(identity, 1)?,
+            previous_signed: HashMap::new(),
+            previous_last_resort_pq: HashMap::new(),
             one_time_ec: HashMap::new(),
             one_time_pq: HashMap::new(),
             next_ec: 2,
             next_pq: 2,
         })
+    }
+
+    fn allocate_ec_id(&mut self) -> Result<EcPrekeyId, PrimitiveError> {
+        let id = self.next_ec;
+        self.next_ec = self
+            .next_ec
+            .checked_add(1)
+            .ok_or(PrimitiveError::LimitExceeded)?;
+        Ok(id)
+    }
+
+    fn allocate_pq_id(&mut self) -> Result<PqPrekeyId, PrimitiveError> {
+        let id = self.next_pq;
+        self.next_pq = self
+            .next_pq
+            .checked_add(1)
+            .ok_or(PrimitiveError::LimitExceeded)?;
+        Ok(id)
     }
 
     pub fn replenish(
@@ -290,15 +343,11 @@ impl PrekeyStore {
         ec_count: usize,
         pq_count: usize,
     ) -> Result<(), PrimitiveError> {
+        if ec_count > MAX_STORED_PREKEYS || pq_count > MAX_STORED_PREKEYS {
+            return Err(PrimitiveError::LimitExceeded);
+        }
         while self.one_time_ec.len() < ec_count {
-            let id = self.next_ec;
-            self.next_ec = self
-                .next_ec
-                .checked_add(1)
-                .ok_or(PrimitiveError::LimitExceeded)?;
-            if self.next_ec < 2 {
-                return Err(PrimitiveError::LimitExceeded);
-            }
+            let id = self.allocate_ec_id()?;
             self.one_time_ec.insert(
                 id,
                 OneTimeEcPrekey {
@@ -308,21 +357,94 @@ impl PrekeyStore {
             );
         }
         while self.one_time_pq.len() < pq_count {
-            let id = self.next_pq;
-            self.next_pq = self
-                .next_pq
-                .checked_add(1)
-                .ok_or(PrimitiveError::LimitExceeded)?;
-            if self.next_pq < 2 {
-                return Err(PrimitiveError::LimitExceeded);
-            }
+            let id = self.allocate_pq_id()?;
             self.one_time_pq
                 .insert(id, OneTimePqPrekey::generate(identity, id)?);
         }
         Ok(())
     }
 
-    /// Publish a bundle. Prefers one-time PQ over last-resort.
+    /// Rotate the signed EC prekey. The previous current key is retained for
+    /// delayed initiations, bounded by `retain_previous`.
+    pub fn rotate_signed_prekey(
+        &mut self,
+        identity: &IdentityKeyPair,
+        retain_previous: usize,
+    ) -> Result<EcPrekeyId, PrimitiveError> {
+        if retain_previous > MAX_RETAINED_ROTATED_PREKEYS {
+            return Err(PrimitiveError::LimitExceeded);
+        }
+        let id = self.allocate_ec_id()?;
+        let replacement = SignedPrekey::generate(identity, id)?;
+        let old = std::mem::replace(&mut self.signed, replacement);
+        self.previous_signed.insert(old.id, old);
+        prune_oldest(&mut self.previous_signed, retain_previous);
+        Ok(id)
+    }
+
+    /// Rotate the signed last-resort PQ prekey. The previous current key is
+    /// retained temporarily for delayed initiations.
+    pub fn rotate_last_resort_pq(
+        &mut self,
+        identity: &IdentityKeyPair,
+        retain_previous: usize,
+    ) -> Result<PqPrekeyId, PrimitiveError> {
+        if retain_previous > MAX_RETAINED_ROTATED_PREKEYS {
+            return Err(PrimitiveError::LimitExceeded);
+        }
+        let id = self.allocate_pq_id()?;
+        let replacement = LastResortPqPrekey::generate(identity, id)?;
+        let old = std::mem::replace(&mut self.last_resort_pq, replacement);
+        self.previous_last_resort_pq.insert(old.id, old);
+        prune_oldest(&mut self.previous_last_resort_pq, retain_previous);
+        Ok(id)
+    }
+
+    /// Explicitly expire all retained signed EC keys older than `min_id`.
+    pub fn expire_signed_before(&mut self, min_id: EcPrekeyId) {
+        self.previous_signed.retain(|id, _| *id >= min_id);
+    }
+
+    /// Explicitly expire all retained LR-PQ keys older than `min_id`.
+    pub fn expire_last_resort_pq_before(&mut self, min_id: PqPrekeyId) {
+        self.previous_last_resort_pq.retain(|id, _| *id >= min_id);
+    }
+
+    pub fn retained_signed_count(&self) -> usize {
+        self.previous_signed.len()
+    }
+
+    pub fn retained_last_resort_pq_count(&self) -> usize {
+        self.previous_last_resort_pq.len()
+    }
+
+    /// Resolve the exact signed prekey referenced by an initiation packet.
+    pub fn signed_prekey(&self, id: EcPrekeyId) -> Result<&SignedPrekey, PrimitiveError> {
+        if self.signed.id == id {
+            return Ok(&self.signed);
+        }
+        self.previous_signed
+            .get(&id)
+            .ok_or(PrimitiveError::InvalidSecretKey)
+    }
+
+    pub fn is_last_resort_pq(&self, id: PqPrekeyId) -> bool {
+        self.last_resort_pq.id == id || self.previous_last_resort_pq.contains_key(&id)
+    }
+
+    pub fn last_resort_pq(&self, id: PqPrekeyId) -> Result<&LastResortPqPrekey, PrimitiveError> {
+        if self.last_resort_pq.id == id {
+            return Ok(&self.last_resort_pq);
+        }
+        self.previous_last_resort_pq
+            .get(&id)
+            .ok_or(PrimitiveError::InvalidSecretKey)
+    }
+
+    /// Publish a convenience bundle. This method does **not** reserve a one-time
+    /// prekey; repeated calls may display the same local OPK. A production
+    /// service must upload the inventory and atomically allocate/pop one OPK per
+    /// bundle request. See `public_*_inventory` and PREKEY_SERVER_CONTRACT.md.
     pub fn public_bundle(
         &self,
         identity: &IdentityKeyPair,
@@ -363,6 +485,31 @@ impl PrekeyStore {
         })
     }
 
+    /// Export public EC OPK inventory for upload to an allocating server.
+    pub fn public_ec_inventory(&self) -> Vec<PublicEcOneTimePrekey> {
+        self.one_time_ec
+            .values()
+            .map(|k| PublicEcOneTimePrekey {
+                id: k.id,
+                public: k.secret.public_key(),
+            })
+            .collect()
+    }
+
+    /// Export public PQ OPK inventory for upload to an allocating server.
+    pub fn public_pq_inventory(&self) -> Result<Vec<PublicPqOneTimePrekey>, PrimitiveError> {
+        self.one_time_pq
+            .values()
+            .map(|k| {
+                Ok(PublicPqOneTimePrekey {
+                    id: k.id,
+                    public: k.public()?.as_bytes().to_vec(),
+                    signature: k.signature,
+                })
+            })
+            .collect()
+    }
+
     /// Inspect a one-time EC prekey without consuming it.
     pub fn peek_ec(&self, id: EcPrekeyId) -> Result<&OneTimeEcPrekey, PrimitiveError> {
         self.one_time_ec
@@ -399,17 +546,24 @@ impl PrekeyStore {
         self.one_time_pq.len()
     }
 
-    /// Persist the store (includes remaining one-time secrets). Caller protects the blob.
+    /// Persist the store (includes remaining/retained private prekeys).
+    /// Caller must protect this blob at rest.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = b"VCPREK01".to_vec();
-        out.extend_from_slice(&self.signed.id.to_le_bytes());
-        out.extend_from_slice(&self.signed.secret.to_bytes());
-        out.extend_from_slice(&self.signed.signature);
-        out.extend_from_slice(&self.last_resort_pq.id.to_le_bytes());
-        out.extend_from_slice(self.last_resort_pq.secret.as_seed());
-        out.extend_from_slice(&self.last_resort_pq.signature);
+        let mut out = b"VCPREK02".to_vec();
+        write_signed(&mut out, &self.signed);
+        write_last_resort(&mut out, &self.last_resort_pq);
         out.extend_from_slice(&self.next_ec.to_le_bytes());
         out.extend_from_slice(&self.next_pq.to_le_bytes());
+
+        out.extend_from_slice(&(self.previous_signed.len() as u32).to_le_bytes());
+        for k in self.previous_signed.values() {
+            write_signed(&mut out, k);
+        }
+        out.extend_from_slice(&(self.previous_last_resort_pq.len() as u32).to_le_bytes());
+        for k in self.previous_last_resort_pq.values() {
+            write_last_resort(&mut out, k);
+        }
+
         out.extend_from_slice(&(self.one_time_ec.len() as u32).to_le_bytes());
         for (id, k) in &self.one_time_ec {
             out.extend_from_slice(&id.to_le_bytes());
@@ -424,80 +578,184 @@ impl PrekeyStore {
         out
     }
 
-    /// Restore from [`Self::serialize`].
+    /// Restore v2 state. V1 blobs are accepted for migration with empty retained sets.
     pub fn deserialize(data: &[u8]) -> Result<Self, PrimitiveError> {
-        if data.len() < 8 + 4 + 32 + 64 + 4 + 64 + 64 + 8 + 8 {
+        if data.len() < 8 {
             return Err(PrimitiveError::InvalidLength);
         }
-        if &data[0..8] != b"VCPREK01" {
+        if &data[..8] == b"VCPREK01" {
+            return Self::deserialize_v1(data);
+        }
+        if &data[..8] != b"VCPREK02" {
             return Err(PrimitiveError::InvalidLength);
         }
         let mut i = 8;
-        let take = |i: &mut usize, n: usize| -> Result<&[u8], PrimitiveError> {
-            if *i + n > data.len() {
+        let signed = read_signed(data, &mut i)?;
+        let last_resort_pq = read_last_resort(data, &mut i)?;
+        let next_ec = read_u32(data, &mut i)?;
+        let next_pq = read_u32(data, &mut i)?;
+
+        let previous_signed_n = read_count(data, &mut i, MAX_RETAINED_ROTATED_PREKEYS)?;
+        let mut previous_signed = HashMap::new();
+        for _ in 0..previous_signed_n {
+            let k = read_signed(data, &mut i)?;
+            if k.id == signed.id || previous_signed.insert(k.id, k).is_some() {
                 return Err(PrimitiveError::InvalidLength);
             }
-            let s = &data[*i..*i + n];
-            *i += n;
-            Ok(s)
-        };
-        let signed_id = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
-        let mut signed_sec = [0u8; 32];
-        signed_sec.copy_from_slice(take(&mut i, 32)?);
-        let mut signed_sig = [0u8; 64];
-        signed_sig.copy_from_slice(take(&mut i, 64)?);
-        let lr_id = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
-        let mut lr_seed = [0u8; 64];
-        lr_seed.copy_from_slice(take(&mut i, 64)?);
-        let mut lr_sig = [0u8; 64];
-        lr_sig.copy_from_slice(take(&mut i, 64)?);
-        let next_ec = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
-        let next_pq = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
-        let ec_n = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap()) as usize;
+        }
+
+        let previous_lr_n = read_count(data, &mut i, MAX_RETAINED_ROTATED_PREKEYS)?;
+        let mut previous_last_resort_pq = HashMap::new();
+        for _ in 0..previous_lr_n {
+            let k = read_last_resort(data, &mut i)?;
+            if k.id == last_resort_pq.id || previous_last_resort_pq.insert(k.id, k).is_some() {
+                return Err(PrimitiveError::InvalidLength);
+            }
+        }
+
+        let ec_n = read_count(data, &mut i, MAX_STORED_PREKEYS)?;
         let mut one_time_ec = HashMap::new();
         for _ in 0..ec_n {
-            let id = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
+            let id = read_u32(data, &mut i)?;
             let mut sec = [0u8; 32];
-            sec.copy_from_slice(take(&mut i, 32)?);
-            one_time_ec.insert(
-                id,
-                OneTimeEcPrekey {
+            sec.copy_from_slice(take(data, &mut i, 32)?);
+            if one_time_ec
+                .insert(
                     id,
-                    secret: X25519Secret::from_bytes(sec),
-                },
-            );
+                    OneTimeEcPrekey {
+                        id,
+                        secret: X25519Secret::from_bytes(sec),
+                    },
+                )
+                .is_some()
+            {
+                return Err(PrimitiveError::InvalidLength);
+            }
         }
-        let pq_n = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap()) as usize;
+
+        let pq_n = read_count(data, &mut i, MAX_STORED_PREKEYS)?;
         let mut one_time_pq = HashMap::new();
         for _ in 0..pq_n {
-            let id = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
+            let id = read_u32(data, &mut i)?;
+            if id == last_resort_pq.id || previous_last_resort_pq.contains_key(&id) {
+                return Err(PrimitiveError::InvalidLength);
+            }
             let mut seed = [0u8; 64];
-            seed.copy_from_slice(take(&mut i, 64)?);
+            seed.copy_from_slice(take(data, &mut i, 64)?);
             let mut sig = [0u8; 64];
-            sig.copy_from_slice(take(&mut i, 64)?);
-            one_time_pq.insert(
-                id,
-                OneTimePqPrekey {
+            sig.copy_from_slice(take(data, &mut i, 64)?);
+            if one_time_pq
+                .insert(
                     id,
-                    secret: crate::primitives::kem::MlKemSecret::from_seed_bytes(seed),
-                    signature: sig,
-                },
-            );
+                    OneTimePqPrekey {
+                        id,
+                        secret: MlKemSecret::from_seed_bytes(seed),
+                        signature: sig,
+                    },
+                )
+                .is_some()
+            {
+                return Err(PrimitiveError::InvalidLength);
+            }
         }
         if i != data.len() {
             return Err(PrimitiveError::InvalidLength);
         }
+        validate_next_ids(
+            next_ec,
+            next_pq,
+            &signed,
+            &previous_signed,
+            &one_time_ec,
+            &last_resort_pq,
+            &previous_last_resort_pq,
+            &one_time_pq,
+        )?;
         Ok(Self {
-            signed: SignedPrekey {
-                id: signed_id,
-                secret: X25519Secret::from_bytes(signed_sec),
-                signature: signed_sig,
-            },
-            last_resort_pq: LastResortPqPrekey {
-                id: lr_id,
-                secret: crate::primitives::kem::MlKemSecret::from_seed_bytes(lr_seed),
-                signature: lr_sig,
-            },
+            signed,
+            last_resort_pq,
+            previous_signed,
+            previous_last_resort_pq,
+            one_time_ec,
+            one_time_pq,
+            next_ec,
+            next_pq,
+        })
+    }
+
+    fn deserialize_v1(data: &[u8]) -> Result<Self, PrimitiveError> {
+        if data.len() < 8 + 4 + 32 + 64 + 4 + 64 + 64 + 8 + 8 {
+            return Err(PrimitiveError::InvalidLength);
+        }
+        let mut i = 8;
+        let signed = read_signed(data, &mut i)?;
+        let last_resort_pq = read_last_resort(data, &mut i)?;
+        let next_ec = read_u32(data, &mut i)?;
+        let next_pq = read_u32(data, &mut i)?;
+        let ec_n = read_count(data, &mut i, MAX_STORED_PREKEYS)?;
+        let mut one_time_ec = HashMap::new();
+        for _ in 0..ec_n {
+            let id = read_u32(data, &mut i)?;
+            let mut sec = [0u8; 32];
+            sec.copy_from_slice(take(data, &mut i, 32)?);
+            if one_time_ec
+                .insert(
+                    id,
+                    OneTimeEcPrekey {
+                        id,
+                        secret: X25519Secret::from_bytes(sec),
+                    },
+                )
+                .is_some()
+            {
+                return Err(PrimitiveError::InvalidLength);
+            }
+        }
+        let pq_n = read_count(data, &mut i, MAX_STORED_PREKEYS)?;
+        let mut one_time_pq = HashMap::new();
+        for _ in 0..pq_n {
+            let id = read_u32(data, &mut i)?;
+            if id == last_resort_pq.id {
+                return Err(PrimitiveError::InvalidLength);
+            }
+            let mut seed = [0u8; 64];
+            seed.copy_from_slice(take(data, &mut i, 64)?);
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(take(data, &mut i, 64)?);
+            if one_time_pq
+                .insert(
+                    id,
+                    OneTimePqPrekey {
+                        id,
+                        secret: MlKemSecret::from_seed_bytes(seed),
+                        signature: sig,
+                    },
+                )
+                .is_some()
+            {
+                return Err(PrimitiveError::InvalidLength);
+            }
+        }
+        if i != data.len() {
+            return Err(PrimitiveError::InvalidLength);
+        }
+        let previous_signed = HashMap::new();
+        let previous_last_resort_pq = HashMap::new();
+        validate_next_ids(
+            next_ec,
+            next_pq,
+            &signed,
+            &previous_signed,
+            &one_time_ec,
+            &last_resort_pq,
+            &previous_last_resort_pq,
+            &one_time_pq,
+        )?;
+        Ok(Self {
+            signed,
+            last_resort_pq,
+            previous_signed,
+            previous_last_resort_pq,
             one_time_ec,
             one_time_pq,
             next_ec,
@@ -506,14 +764,110 @@ impl PrekeyStore {
     }
 
     pub fn get_pq_secret(&self, id: PqPrekeyId) -> Result<&MlKemSecret, PrimitiveError> {
-        if id == self.last_resort_pq.id {
-            return Ok(&self.last_resort_pq.secret);
+        if let Ok(k) = self.last_resort_pq(id) {
+            return Ok(&k.secret);
         }
         self.one_time_pq
             .get(&id)
             .map(|k| &k.secret)
             .ok_or(PrimitiveError::InvalidSecretKey)
     }
+}
+
+fn prune_oldest<T>(map: &mut HashMap<u32, T>, keep: usize) {
+    while map.len() > keep {
+        if let Some(oldest) = map.keys().copied().min() {
+            map.remove(&oldest);
+        } else {
+            break;
+        }
+    }
+}
+
+fn write_signed(out: &mut Vec<u8>, k: &SignedPrekey) {
+    out.extend_from_slice(&k.id.to_le_bytes());
+    out.extend_from_slice(&k.secret.to_bytes());
+    out.extend_from_slice(&k.signature);
+}
+
+fn write_last_resort(out: &mut Vec<u8>, k: &LastResortPqPrekey) {
+    out.extend_from_slice(&k.id.to_le_bytes());
+    out.extend_from_slice(k.secret.as_seed());
+    out.extend_from_slice(&k.signature);
+}
+
+fn read_signed(data: &[u8], i: &mut usize) -> Result<SignedPrekey, PrimitiveError> {
+    let id = read_u32(data, i)?;
+    let mut sec = [0u8; 32];
+    sec.copy_from_slice(take(data, i, 32)?);
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(take(data, i, 64)?);
+    Ok(SignedPrekey {
+        id,
+        secret: X25519Secret::from_bytes(sec),
+        signature: sig,
+    })
+}
+
+fn read_last_resort(data: &[u8], i: &mut usize) -> Result<LastResortPqPrekey, PrimitiveError> {
+    let id = read_u32(data, i)?;
+    let mut seed = [0u8; 64];
+    seed.copy_from_slice(take(data, i, 64)?);
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(take(data, i, 64)?);
+    Ok(LastResortPqPrekey {
+        id,
+        secret: MlKemSecret::from_seed_bytes(seed),
+        signature: sig,
+    })
+}
+
+fn take<'a>(data: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8], PrimitiveError> {
+    if n > data.len().saturating_sub(*i) {
+        return Err(PrimitiveError::InvalidLength);
+    }
+    let s = &data[*i..*i + n];
+    *i += n;
+    Ok(s)
+}
+
+fn read_u32(data: &[u8], i: &mut usize) -> Result<u32, PrimitiveError> {
+    Ok(u32::from_le_bytes(take(data, i, 4)?.try_into().unwrap()))
+}
+
+fn read_count(data: &[u8], i: &mut usize, max: usize) -> Result<usize, PrimitiveError> {
+    let n = read_u32(data, i)? as usize;
+    if n > max {
+        return Err(PrimitiveError::LimitExceeded);
+    }
+    Ok(n)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_next_ids(
+    next_ec: u32,
+    next_pq: u32,
+    signed: &SignedPrekey,
+    previous_signed: &HashMap<EcPrekeyId, SignedPrekey>,
+    one_time_ec: &HashMap<EcPrekeyId, OneTimeEcPrekey>,
+    last_resort_pq: &LastResortPqPrekey,
+    previous_last_resort_pq: &HashMap<PqPrekeyId, LastResortPqPrekey>,
+    one_time_pq: &HashMap<PqPrekeyId, OneTimePqPrekey>,
+) -> Result<(), PrimitiveError> {
+    let max_ec = std::iter::once(signed.id)
+        .chain(previous_signed.keys().copied())
+        .chain(one_time_ec.keys().copied())
+        .max()
+        .unwrap_or(0);
+    let max_pq = std::iter::once(last_resort_pq.id)
+        .chain(previous_last_resort_pq.keys().copied())
+        .chain(one_time_pq.keys().copied())
+        .max()
+        .unwrap_or(0);
+    if next_ec <= max_ec || next_pq <= max_pq {
+        return Err(PrimitiveError::InvalidLength);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -547,6 +901,15 @@ mod tests {
     }
 
     #[test]
+    fn bundle_decode_rejects_noncanonical_pq_one_time_flag() {
+        let ik = IdentityKeyPair::generate().unwrap();
+        let store = PrekeyStore::new(&ik).unwrap();
+        let mut encoded = store.public_bundle(&ik).unwrap().encode();
+        *encoded.last_mut().unwrap() = 2;
+        assert!(PublicPrekeyBundle::decode(&encoded).is_err());
+    }
+
+    #[test]
     fn serialize_reload_preserves_consumed_set() {
         let ik = IdentityKeyPair::generate().unwrap();
         let mut store = PrekeyStore::new(&ik).unwrap();
@@ -559,6 +922,56 @@ mod tests {
         assert_eq!(store2.one_time_ec_count(), 1);
         assert_eq!(store2.one_time_pq_count(), 2);
         assert_eq!(store2.signed.id, store.signed.id);
+    }
+
+    #[test]
+    fn signed_rotation_retains_delayed_key_then_expires_it() {
+        let ik = IdentityKeyPair::generate().unwrap();
+        let mut store = PrekeyStore::new(&ik).unwrap();
+        let old = store.signed.id;
+        let new = store.rotate_signed_prekey(&ik, 1).unwrap();
+        assert_ne!(new, old);
+        assert_eq!(store.signed_prekey(old).unwrap().id, old);
+        store.rotate_signed_prekey(&ik, 1).unwrap();
+        assert!(store.signed_prekey(old).is_err());
+    }
+
+    #[test]
+    fn last_resort_rotation_retains_delayed_key_then_expires_it() {
+        let ik = IdentityKeyPair::generate().unwrap();
+        let mut store = PrekeyStore::new(&ik).unwrap();
+        let old = store.last_resort_pq.id;
+        let new = store.rotate_last_resort_pq(&ik, 1).unwrap();
+        assert_ne!(new, old);
+        assert!(store.is_last_resort_pq(old));
+        assert_eq!(store.last_resort_pq(old).unwrap().id, old);
+        store.rotate_last_resort_pq(&ik, 1).unwrap();
+        assert!(!store.is_last_resort_pq(old));
+    }
+
+    #[test]
+    fn rotated_state_roundtrips() {
+        let ik = IdentityKeyPair::generate().unwrap();
+        let mut store = PrekeyStore::new(&ik).unwrap();
+        let old_spk = store.signed.id;
+        let old_pq = store.last_resort_pq.id;
+        store.rotate_signed_prekey(&ik, 2).unwrap();
+        store.rotate_last_resort_pq(&ik, 2).unwrap();
+        store.replenish(&ik, 2, 2).unwrap();
+        let restored = PrekeyStore::deserialize(&store.serialize()).unwrap();
+        assert!(restored.signed_prekey(old_spk).is_ok());
+        assert!(restored.last_resort_pq(old_pq).is_ok());
+        assert_eq!(restored.one_time_ec_count(), 2);
+        assert_eq!(restored.one_time_pq_count(), 2);
+    }
+
+    #[test]
+    fn public_inventory_lists_all_one_time_keys() {
+        let ik = IdentityKeyPair::generate().unwrap();
+        let mut store = PrekeyStore::new(&ik).unwrap();
+        store.replenish(&ik, 5, 6).unwrap();
+        assert_eq!(store.public_ec_inventory().len(), 5);
+        assert_eq!(store.public_pq_inventory().unwrap().len(), 6);
     }
 
     #[test]

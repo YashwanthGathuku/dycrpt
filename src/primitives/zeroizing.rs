@@ -246,6 +246,45 @@ mod tests {
     }
 
     #[test]
+    fn secret_bytes_len_as_ref_and_zeroize_now() {
+        let mut s = SecretBytes::from_slice(b"abc");
+        assert_eq!(s.len(), 3);
+        assert!(!s.is_empty());
+        assert_eq!(s.as_ref(), b"abc");
+        s.zeroize_now();
+        assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
+        assert!(SecretBytes::from_slice(b"").is_empty());
+    }
+
+    #[test]
+    fn secret_bytes32_from_slice_as_bytes_deref_and_zeroize() {
+        assert!(SecretBytes32::from_slice(&[1u8; 31]).is_none());
+        assert!(SecretBytes32::from_slice(&[1u8; 33]).is_none());
+        let s = SecretBytes32::from_slice(&[7u8; 32]).unwrap();
+        assert_eq!(s.as_bytes(), &[7u8; 32]);
+        assert_eq!(&*s, &[7u8; 32]);
+        let mut s = s;
+        s[0] = 8;
+        assert_eq!(s.as_bytes()[0], 8);
+        s.zeroize_now();
+        assert_eq!(s.as_bytes(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn secure_zero_32_clears() {
+        let mut buf = [0xAAu8; 32];
+        secure_zero_32(&mut buf);
+        assert_eq!(buf, [0u8; 32]);
+    }
+
+    #[test]
+    fn zeroizing_scope_into_inner_returns_the_value() {
+        let scope = ZeroizingScope::new([3u8; 4]);
+        assert_eq!(scope.into_inner(), [3u8; 4]);
+    }
+
+    #[test]
     fn with_secret_32_runs() {
         let k = [9u8; 32];
         let out = with_secret_32(&k, |s| s[0]);

@@ -204,3 +204,123 @@ Total passing tests in that unfiltered invocation: **140 + 8 + 2 + 2 + 7 + 19 + 
 - Ciphertext / wire compatibility with libsignal
 - `cargo-fuzz` / `libfuzzer-sys` **on this Windows GNU host** (optional feature; `host_runner` **does** build and ran 20_000 iters)
 - Parent VoiceChat app (not in this workspace)
+
+## Assurance run — 2026-08-28 (review branch `hardening/f1-f4-review-fixes-2026-08-28`)
+
+Toolchain: rustc 1.85.0 (per `rust-toolchain.toml`), x86_64-unknown-linux-gnu.
+
+| Gate | Command | Result |
+|---|---|---|
+| Format | `cargo fmt --all -- --check` | clean |
+| Lint (default) | `cargo clippy --all-targets -- -D warnings` | 0 |
+| Lint (all features) | `cargo clippy --all-targets --all-features -- -D warnings` | 0 |
+| Lint (release bin) | `cargo build --release --bin ct_timing` | 0 warnings |
+| Tests | `cargo test --tests --all-features -- --skip ten_thousand` | 318 passed, 0 failed |
+| 10k handshakes | `cargo test --release --all-features ten_thousand` | 1 passed, 11.66 s |
+| Parity | `cargo run -p crypto-parity --bin crypto-parity` | P0=0 core=100.0 ops=100.0 vc=100.0 |
+| Fuzz (CI) | `cargo run --manifest-path fuzz/Cargo.toml --bin host_runner -- 100000` | ok; corpus_accepts=9 mutated_accepts=27073 random_accepts=12599 |
+| Fuzz (long) | `host_runner 5000000` | ok, 38 s; mutated_accepts=1361211 random_accepts=627561 |
+| Timing | `ct_timing --samples 500000` | samples=500000 welch_t=0.7675 max_abs_t=10 passed=true |
+
+Patch series verified by `git am` onto a clean checkout of
+`hardening/p0-audit-fixes-2026-08-22`: applies without conflict, 318 tests pass.
+
+### Gate caveats recorded for the auditor
+
+1. **`ct_timing` argument form.** It parses `--samples N`. A positional argument
+   is silently ignored and the 250,000 default is used. A CI line reading
+   `ct_timing 500000` measures half the intended sample count and still reports
+   `passed: true`.
+2. **`ct_timing` probe coverage.** One probe only: `x25519-secret-class`. It does
+   not cover AEAD tag comparison, wire decoders, skipped-message-key lookup, or
+   XEdDSA scalar decoding. A green timing gate is evidence about X25519 secret
+   handling and nothing else.
+3. **`host_runner` is not a coverage-guided fuzzer.** It is a structure-aware
+   mutational walk with no instrumentation feedback. The `libfuzzer` targets in
+   `fuzz/fuzz_targets/` remain the real fuzzing surface and still require
+   `cargo-fuzz` on nightly; CI builds them but does not run them.
+4. **Prior fuzz history is void.** Before this branch, `fuzz/Cargo.toml` lacked a
+   `[workspace]` table, so every CI fuzz invocation exited non-zero at manifest
+   resolution before compiling. Any earlier green fuzz run in this repository's
+   history should be treated as no evidence at all.
+
+## Mutation testing — first run, 2026-08-28
+
+Tool: `cargo-mutants` 26.0.0 (27.x requires rustc >= 1.88; this repo pins 1.85).
+
+`cargo-mutants` injects a small fault per run — flip a comparison, replace a return value — and
+reruns the suite. A mutant that survives is a fault the test suite provably cannot detect. This
+is the general form of the F1 finding: F1 was one real, undetectable fault, and the mutation
+score says how many more there are.
+
+### Practical blocker found first
+
+The initial run reported an unusable cycle time: **55s build + 539s test per mutant**, i.e. ~7
+hours for 45 mutants on one file. Cause: the `ten_thousand` randomized handshake gate takes
+11.7s in release and ~533s in debug, which is 99% of the debug lib-suite runtime. Every other
+lib test totals 6s.
+
+`.cargo/mutants.toml` now skips that one test inside mutation runs only. It is **not** disabled —
+it still runs in release via its own CI step. Cycle time went from ~10 minutes to ~1 minute per
+mutant.
+
+### Result: src/primitives/xeddsa.rs
+
+| Run | Caught | Missed | Unviable | Score |
+|---|---|---|---|---|
+| Before | 37 | 4 | 4 | 90.2% |
+| After killing tests | 41 | 0 | 4 | **100%** |
+
+All four survivors were in input validation and domain separation, in the same file that produced
+the F1 signature-malleability finding:
+
+1. `replace le_int_ge_p -> bool with false` — the XEdDSA 2.5 requirement to reject `u >= p` was
+   **never exercised**. A build accepting every public-key encoding would have passed the entire
+   suite.
+2. `replace < with <= in le_int_ge_p` — the canonicality boundary was untested at `p - 1` / `p` /
+   `p + 1`.
+3, 4. `replace hash_i -> [u8; 64] with [0; 64]` / `with [1; 64]` — domain separation between
+   `hash_1` (nonce derivation) and the plain challenge hash was never asserted. A constant `hash_i`
+   passed every test.
+
+Each is now killed by a test asserting the specific property. Note the pattern: every survivor
+was on a *rejecting* path. The existing tests covered what the code accepts and almost nothing
+about what it must refuse.
+
+### Remaining work
+
+Only one file of ~50 has been measured. The v1 exit criterion is >= 85% across
+`src/primitives/`, `src/ratchet/`, `src/pqxdh/`, `src/replay/` and `src/storage/`, with every
+survivor either killed or justified in `KNOWN_LIMITATIONS.md`.
+
+```bash
+cargo install cargo-mutants --version 26.0.0 --locked
+cargo mutants --file 'src/primitives/**' --file 'src/ratchet/**' -- --lib
+```
+
+Budget hours, not minutes: each mutant rebuilds the crate. Run it on a machine you can leave.
+
+## Mutation testing — Double Ratchet, 2026-09-01
+
+Command (this machine: GNU 1.85 + gcc linker, `cargo-mutants` 26.0.0, `-j 2`):
+
+```text
+cargo mutants -f src/ratchet/mod.rs -j 2 -o mutants-ratchet.out -- --lib
+```
+
+```text
+Found 89 mutants to test
+ok       Unmutated baseline in 69s build + 8s test
+89 mutants tested in 17m: 14 missed, 59 caught, 16 unviable
+```
+
+Score: **59 / (59 + 14) = 80.8%**. Below the v1 ≥ 85% bar for `src/ratchet/`.
+
+Fourteen survivors, all on wipe/count/rejection/unused-API paths — same shape as F1 and the XEdDSA 90.2% run. Full classification and the killing-test list: `docs/MUTATION_TESTING.md`.
+
+XEdDSA unit tests after the four killing tests, this session:
+
+```text
+cargo +1.85.0-x86_64-pc-windows-gnu test --offline --lib -- xeddsa::
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 200 filtered out; finished in 3.76s
+```

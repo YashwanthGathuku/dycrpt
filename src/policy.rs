@@ -2,11 +2,15 @@
 //!
 //! Default advertised preference is ClassicalV1. Hybrid and header-encryption
 //! are compiled when their features are on, but are not auto-selected.
-//! An app may opt into Hybrid via explicit `DeviceConfig.profile`.
+//!
+//! Protocol v2 is intentionally wire-incompatible with the original prototype:
+//! it authenticates protocol/profile/session-routing metadata and separates the
+//! local session handle from the shared network session tag. Existing v1 live
+//! sessions must be re-handshaken rather than silently upgraded.
 
 use crate::primitives::error::PrimitiveError;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -59,9 +63,14 @@ impl CryptoProfile {
     }
 }
 
-/// Profiles this build can speak. Negotiation uses [`PROFILE_PREFERENCE`].
-/// Hybrid / HE are listed when compiled so an app can opt in explicitly.
 pub fn available_profiles() -> Vec<CryptoProfile> {
+    // `mut` is required whenever either experimental profile feature is on, and
+    // unused otherwise. Narrow and justified, rather than the crate-wide
+    // `unused_mut = "allow"` this replaced (review 2026-08-28).
+    #[cfg_attr(
+        not(any(feature = "header-encrypt", feature = "hybrid")),
+        allow(unused_mut)
+    )]
     let mut v = PROFILE_PREFERENCE.to_vec();
     #[cfg(feature = "header-encrypt")]
     {
@@ -125,6 +134,11 @@ pub fn enforce_suite(expected: CryptoProfile, actual: CryptoProfile) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_version_is_hardened_v2() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
 
     #[test]
     fn default_peers_select_classical() {

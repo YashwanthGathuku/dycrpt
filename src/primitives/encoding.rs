@@ -61,6 +61,21 @@ mod tests {
     }
 
     #[test]
+    fn encode_kem_roundtrip_and_rejects_wrong_id() {
+        let (_sk, pk) = crate::primitives::kem::MlKemSecret::generate().unwrap();
+        let enc = encode_kem(&pk);
+        assert_eq!(enc.len(), 1 + MLKEM768_PUBLIC_LEN);
+        assert_eq!(enc[0], KEM_ID_MLKEM768);
+        assert_eq!(decode_kem(&enc).unwrap().as_bytes(), pk.as_bytes());
+        let mut bad = enc.clone();
+        bad[0] = 0x01;
+        assert!(matches!(
+            decode_kem(&bad),
+            Err(PrimitiveError::InvalidPublicKey)
+        ));
+    }
+
+    #[test]
     fn decode_ec_rejects_bad_id() {
         let mut enc = encode_ec(&X25519Secret::generate().unwrap().public_key());
         enc[0] = 0x02;

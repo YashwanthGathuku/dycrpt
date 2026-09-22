@@ -133,7 +133,8 @@ pub fn verify(
     let mut s_bytes = [0u8; 32];
     s_bytes.copy_from_slice(&signature[32..]);
 
-    // Reject s with excess bits (s >= 2^|q|, |q| = 253).
+    // Reject s with excess bits (s >= 2^|q|, |q| = 253). This is the check the
+    // XEdDSA spec (Rev 1, 2.5) states literally.
     if s_bytes[31] & 0b1110_0000 != 0 {
         return Err(PrimitiveError::SignatureInvalid);
     }
@@ -142,7 +143,16 @@ pub fn verify(
     let _r_on_curve = CompressedEdwardsY(r_bytes)
         .decompress()
         .ok_or(PrimitiveError::SignatureInvalid)?;
-    let s = Scalar::from_bytes_mod_order(s_bytes);
+    // The spec's excess-bits check alone is NOT sufficient to make the encoding
+    // unique. `from_bytes_mod_order` silently reduces mod q, and because
+    // 2q < 2^253 the value s + q always survives the bit filter above and
+    // reduces back to s. That makes every signature malleable: an attacker can
+    // derive a second, distinct, valid 64-byte encoding of any signature
+    // without the private key. We therefore require a canonical s (s < q),
+    // which is strictly stronger than the spec and matches hardened Ed25519
+    // implementations such as ed25519-dalek.
+    let s: Scalar = Option::from(Scalar::from_canonical_bytes(s_bytes))
+        .ok_or(PrimitiveError::SignatureInvalid)?;
 
     let a_bytes = {
         let mut b = a_point.compress().to_bytes();
@@ -207,6 +217,145 @@ mod tests {
         let other = X25519Secret::generate().unwrap().public_key();
         let sig = sign(&sk, b"msg").unwrap();
         assert!(verify(&other, b"msg", &sig).is_err());
+    }
+
+    /// Group order q = 2^252 + 27742317777372353535851937790883648493 (LE).
+    const ORDER_LE: [u8; 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
+        0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x10,
+    ];
+
+    fn add_le(a: &[u8; 32], b: &[u8; 32]) -> ([u8; 32], bool) {
+        let mut out = [0u8; 32];
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let v = a[i] as u16 + b[i] as u16 + carry;
+            out[i] = (v & 0xff) as u8;
+            carry = v >> 8;
+        }
+        (out, carry != 0)
+    }
+
+    /// Regression for the signature-malleability finding (review 2026-08-28).
+    ///
+    /// Before the canonical-s check, `s + q` passed the excess-bits filter and
+    /// reduced back to `s`, so every signature had a second valid encoding.
+    /// Reproduced 200/200 at the time. This must stay at 0/N.
+    #[test]
+    fn non_canonical_s_plus_order_is_rejected() {
+        let mut considered = 0usize;
+        for _ in 0..200 {
+            let sk = X25519Secret::generate().unwrap();
+            let pk = sk.public_key();
+            let msg = b"prekey-binding-payload";
+            let sig = sign(&sk, msg).unwrap();
+            verify(&pk, msg, &sig).expect("genuine signature must verify");
+
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&sig[32..]);
+            let (s2, overflow) = add_le(&s, &ORDER_LE);
+            if overflow {
+                continue;
+            }
+            considered += 1;
+
+            let mut mauled = sig;
+            mauled[32..].copy_from_slice(&s2);
+            assert_ne!(sig, mauled, "s + q must be a distinct encoding");
+            assert!(
+                verify(&pk, msg, &mauled).is_err(),
+                "MALLEABLE: s + q accepted as a second valid signature"
+            );
+        }
+        assert!(considered > 0, "probe never exercised the s + q path");
+    }
+
+    /// Mutation-testing survivors, 2026-08-28.
+    ///
+    /// `cargo mutants` on this file scored 37/41. All four survivors were in
+    /// input validation and domain separation — code that every existing test
+    /// happened to exercise only on the accepting path. The tests below kill
+    /// them. Each one asserts a property no other test in this module did.
+    #[test]
+    fn non_canonical_public_key_u_ge_p_is_rejected() {
+        // Kills: `replace le_int_ge_p -> bool with false`.
+        // XEdDSA 2.5 requires rejecting u >= p. Nothing tested it, so a build
+        // that accepted every u would have passed the whole suite.
+        let sk = X25519Secret::generate().unwrap();
+        let sig = sign(&sk, b"m").unwrap();
+
+        // p = 2^255 - 19, and the two values immediately above it.
+        let p: [u8; 32] = [
+            0xED, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0x7F,
+        ];
+        let mut p_plus_1 = p;
+        p_plus_1[0] = 0xEE;
+        let mut high_bit = [0u8; 32];
+        high_bit[31] = 0x80;
+
+        for (name, bytes) in [("p", p), ("p+1", p_plus_1), ("2^255", high_bit)] {
+            let pk = X25519Public::from_bytes(bytes).expect("constructor accepts raw bytes");
+            assert!(
+                verify(&pk, b"m", &sig).is_err(),
+                "u = {name} is non-canonical and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn le_int_ge_p_boundary_is_exact() {
+        // Kills: `replace < with <= in le_int_ge_p`.
+        // p - 1 must be accepted as canonical; p and p + 1 must not.
+        let p: [u8; 32] = [
+            0xED, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0x7F,
+        ];
+        let mut p_minus_1 = p;
+        p_minus_1[0] = 0xEC;
+        let mut p_plus_1 = p;
+        p_plus_1[0] = 0xEE;
+
+        assert!(!le_int_ge_p(&p_minus_1), "p - 1 is < p");
+        assert!(le_int_ge_p(&p), "p is not < p");
+        assert!(le_int_ge_p(&p_plus_1), "p + 1 is > p");
+        assert!(!le_int_ge_p(&[0u8; 32]), "0 is < p");
+    }
+
+    #[test]
+    fn hash_i_is_domain_separated_and_prefix_dependent() {
+        // Kills: `replace hash_i -> [u8; 64] with [0; 64]` and `with [1; 64]`.
+        // The signature scheme relies on hash_1 (nonce derivation) being in a
+        // different domain from the plain challenge hash. Nothing asserted it,
+        // so a constant hash_i would have passed every existing test.
+        let data = b"same input";
+        assert_ne!(
+            hash_i(1, data),
+            hash_plain(data),
+            "hash_1 must not collide with the undomained hash"
+        );
+        assert_ne!(
+            hash_i(1, data),
+            hash_i(2, data),
+            "different i must give different domains"
+        );
+        assert_ne!(hash_i(1, data), [0u8; 64]);
+        assert_ne!(hash_i(1, data), [1u8; 64]);
+        // The prefix really is (2^b - 1 - i), so i changes only the first byte.
+        assert_ne!(hash_i(0, data), hash_i(255, data));
+    }
+
+    /// s = q itself must be rejected (it reduces to 0).
+    #[test]
+    fn s_equal_to_order_is_rejected() {
+        let sk = X25519Secret::generate().unwrap();
+        let pk = sk.public_key();
+        let mut sig = sign(&sk, b"msg").unwrap();
+        sig[32..].copy_from_slice(&ORDER_LE);
+        assert!(verify(&pk, b"msg", &sig).is_err());
     }
 
     #[test]

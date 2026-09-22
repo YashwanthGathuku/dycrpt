@@ -1,5 +1,12 @@
 /target
 **/target/
+mutants.out/
+mutants-ratchet.out/
+mutants-pqxdh.out/
+mutants-replay.out/
+mutants-encrypted-file.out/
+mutants-primitives.out/
+.venv/
 formal/tla/states/
 states/
 *.exe
