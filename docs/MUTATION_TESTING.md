@@ -7,7 +7,7 @@
 
 v1 exit criterion (from `docs/dycrpt-v1-scope-and-comparison.md` Gate 3): **≥ 85%** on `src/primitives/`, `src/ratchet/`, `src/pqxdh/`, `src/replay/`, and `src/storage/`. Every survivor is either killed with a new test or justified in `KNOWN_LIMITATIONS.md`.
 
-This file records measured files. It is not a v1 Gate 3 pass.
+This file records measured files. The v1 default surface is at or above 85%. Gated hybrid / header-encrypt / Braid code is not part of that measurement.
 
 ---
 
@@ -224,7 +224,7 @@ Same as F1 and as the XEdDSA 90.2% run:
 
 Round-trip, tamper, and a handful of deserialize tests are all present and all passing. They do not pin the outer skip bound, the skipped-count ceiling, skipped-key cardinality after a real skip, or zeroization.
 
-When the rest of `src/ratchet/**` (835 mutants, including hybrid/header-encrypt), `src/pqxdh/`, `src/replay/`, and `src/storage/` are measured, expect the same clustering on validation and rejection paths.
+`src/pqxdh/`, `src/replay/`, `src/storage/encrypted_file.rs`, and the remaining default primitives were measured on 2026-09-08. The same clustering showed up and was killed or documented. What is still unmeasured is `src/ratchet/**` outside `mod.rs` (hybrid, header-encrypt, SPQR, Braid; about 835 mutants) and `src/primitives/mlkem_inc.rs`. Those are not the v1 default surface.
 
 ---
 
