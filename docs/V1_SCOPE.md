@@ -68,7 +68,7 @@ This freeze does **not** make the crate shippable. Remaining gates from `dycrpt-
 
 | Gate | Pass condition |
 |---|---|
-| 2. Known-answer vectors | `cargo test kat` runs ≥ 100 external vectors (Wycheproof X25519/HMAC, full RFC 7748, full RFC 5869). |
+| 2. Known-answer vectors | `cargo test kat` runs ≥ 100 external vectors (Wycheproof X25519/HMAC, full RFC 7748, full RFC 5869). **2026-09-08:** 881 checks passed (Wycheproof X25519 + HMAC-SHA256 + HMAC-SHA512, all RFC 7748 X25519 vectors, RFC 5869 A.1–A.3). X448 and HKDF-SHA1 are not in this crate. See `docs/KAT.md`. |
 | 3. Mutation | ≥ 85% on `src/primitives/`, `src/ratchet/`, `src/pqxdh/`, `src/replay/`, `src/storage/`. Survivors killed or recorded in `KNOWN_LIMITATIONS.md`. |
 | 4. Isolated differential | libsignal linked only in a separate AGPL test binary; ≥ 10,000 transcripts, zero spec-required divergences. |
 | 5. Adversarial | host_runner, cargo-fuzz, `ct_timing`, 10k handshake gate as specified there. |

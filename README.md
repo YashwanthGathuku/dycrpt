@@ -8,7 +8,7 @@ Built so apps, devices, and **agent runtimes** can embed E2E without taking AGPL
 
 **This crate is not production-ready.** Internal tests and engineering gates are not a substitute for an independent cryptography review. See [`docs/PRODUCTION.md`](docs/PRODUCTION.md) and [`docs/AUDIT_SCOPE.md`](docs/AUDIT_SCOPE.md).
 
-**Continue work:** [`docs/PUBLIC_LAUNCH.md`](docs/PUBLIC_LAUNCH.md) (what to say and what to do next), then [`docs/HANDOFF.md`](docs/HANDOFF.md) and [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md).
+**Continue work:** [`docs/PUBLIC_LAUNCH.md`](docs/PUBLIC_LAUNCH.md) (what to say and what to do next), [`docs/LAUNCH_RECORD.md`](docs/LAUNCH_RECORD.md) (what was measured), [`docs/KAT.md`](docs/KAT.md) (`cargo test kat`), then [`docs/HANDOFF.md`](docs/HANDOFF.md) and [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md).
 
 ## Profiles
 

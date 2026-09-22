@@ -62,14 +62,14 @@ A public GitHub repo is not proof. Proof is:
 | Artifact | Status now |
 |---|---|
 | LICENSE + LICENSE-APACHE | Present (`LICENSE` MIT, `LICENSE-APACHE` Apache-2.0) |
-| README that does not sound like a libsignal port | Weak (“Signal-family”) |
-| `cargo test` + mutation scores you can cite | Partial (3 files) |
-| Known-answer vectors (Wycheproof / RFCs) | Almost none |
+| README that does not sound like a libsignal port | Rewritten (public-domain specs, not a port, not Signal-network compatible) |
+| `cargo test` + mutation scores you can cite | v1 default surface measured 2026-09-08. See `docs/MUTATION_TESTING.md`. Hybrid ratchet not measured. |
+| Known-answer vectors (Wycheproof / RFCs) | `cargo test kat` — 881 external checks, 2026-09-08. See `docs/KAT.md`. X448 and HKDF-SHA1 are not in this crate. |
 | One platform on a real device | Never run |
 | Independent audit | Never |
 | crates.io (or equivalent) package | `publish = false` |
 
-Until KATs and one hardware loop exist, “open source so everyone can use it” is a git remote, not a product. License files are in the tree; they do not flip `PRODUCTION_READY`.
+KATs now exist (`docs/KAT.md`). One hardware loop still does not. License files and passing vectors do not flip `PRODUCTION_READY`.
 
 ---
 
@@ -87,13 +87,17 @@ This is the only queue. Do not start groups, sealed sender, or “AI ratchet” 
 
 **Done when:** `LICENSE` and `LICENSE-APACHE` exist; README has the allowed sentence; no “replicated libsignal” anywhere in tracked files. Remaining Step 0 choice: whether to make the GitHub repo public.
 
-### Step 1 — Proof that tests can fail (ongoing)
+### Step 1 — Proof that tests can fail — **measured 2026-09-08**
 
-Mutation on `src/pqxdh/`, `src/replay/`, `src/storage/encrypted_file.rs`, remaining primitives. Kill or document every survivor. Cite scores in README only as “measured on date X,” never as “fully verified.”
+Mutation on `src/pqxdh/`, `src/replay/`, `src/storage/encrypted_file.rs`, and the remaining default primitives. Survivors were killed or written into `docs/KNOWN_LIMITATIONS.md`. Full record: `docs/LAUNCH_RECORD.md`. Scores: `docs/MUTATION_TESTING.md`. Cite them as “measured on 2026-09-08,” never as “fully verified.”
 
-### Step 2 — Proof the math matches the spec (KATs)
+Gated hybrid / header-encrypt / Braid code was not part of this pass.
 
-Wycheproof X25519 + HMAC, full RFC 7748, full RFC 5869. `cargo test kat`. This is what a stranger clones and runs.
+### Step 2 — Proof the math matches the spec (KATs) — **ran 2026-09-08**
+
+`cargo test kat`. Wycheproof X25519, HMAC-SHA256, and HMAC-SHA512, plus every RFC 7748 X25519 vector (including the 1,000,000 iteration) and every RFC 5869 HKDF-SHA256 case. 881 external checks passed. Record: `docs/KAT.md`.
+
+X448 and HKDF-SHA1 are not implemented here, so those RFC sections did not run. Do not describe the suite as the whole of either RFC.
 
 ### Step 3 — Proof it runs in the world (hardware)
 
