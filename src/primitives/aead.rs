@@ -207,6 +207,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_plaintext_roundtrips_at_exact_tag_length() {
+        let key = AeadKey::from_bytes([8u8; 32]);
+        let nonce = [2u8; 12];
+        let ct = seal(&key, &nonce, b"", b"ad").unwrap();
+        assert_eq!(ct.len(), TAG_LEN);
+        assert_eq!(open(&key, &nonce, &ct, b"ad").unwrap(), b"");
+
+        let xnonce = [5u8; XNONCE_LEN];
+        let xct = xseal(&key, &xnonce, b"", b"ad").unwrap();
+        assert_eq!(xct.len(), TAG_LEN);
+        assert_eq!(xopen(&key, &xnonce, &xct, b"ad").unwrap(), b"");
+    }
+
+    #[test]
     fn xchacha_wrong_ad_fails() {
         let key = AeadKey::from_bytes([3u8; 32]);
         let nonce = [4u8; XNONCE_LEN];

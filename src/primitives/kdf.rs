@@ -198,6 +198,43 @@ mod tests {
     }
 
     #[test]
+    fn hkdf_rejects_empty_and_accepts_exact_max() {
+        let mut empty = [];
+        assert!(matches!(
+            hkdf_extract_expand(None, b"ikm", LABELS::DR_ROOT, &mut empty),
+            Err(PrimitiveError::HkdfLength)
+        ));
+        // Literal 8160 so `255 * 32` → `255 + 32` cannot hide behind the same expression.
+        let mut exact = vec![0u8; 8160];
+        hkdf_extract_expand(None, b"ikm", LABELS::DR_ROOT, &mut exact).unwrap();
+        assert_ne!(exact, vec![0u8; 8160]);
+        assert_eq!(255 * 32, 8160);
+    }
+
+    #[test]
+    fn hkdf_expand_matches_extract_with_empty_salt() {
+        let prk = b"prk-material-32-bytes-long!!!!";
+        let mut via_expand = [0u8; 32];
+        let mut via_extract = [0u8; 32];
+        hkdf_expand(prk, LABELS::DR_CHAIN, &mut via_expand).unwrap();
+        hkdf_extract_expand(None, prk, LABELS::DR_CHAIN, &mut via_extract).unwrap();
+        assert_eq!(via_expand, via_extract);
+        assert_ne!(via_expand, [0u8; 32]);
+    }
+
+    #[test]
+    fn hmac_sha512_rfc4231_case1() {
+        let key = [0x0bu8; 20];
+        let mac = hmac_sha512(&key, b"Hi There");
+        assert_eq!(
+            mac,
+            hex!(
+                "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"
+            )
+        );
+    }
+
+    #[test]
     fn sha256_parts_matches_concatenation() {
         let a = b"protocol";
         let b = b"session-tag";

@@ -220,6 +220,7 @@ Same as F1 and as the XEdDSA 90.2% run:
 | `src/pqxdh/mod.rs` (2026-09-08) | 100% | Drop excluded; OPK-id rejection tests added |
 | `src/replay/mod.rs` (2026-09-08, after killing tests) | 100% | Were: const bounds, independent component rejects, accessors, deserialize ceilings |
 | `src/storage/encrypted_file.rs` (2026-09-08, after killing tests) | **89.6%** | 13 documented: 512 MiB / 80 MiB exact bounds, redundant min-length arithmetic |
+| Remaining default primitives + `storage/{mod,monotonic,trusted_anchor}.rs` (2026-09-08) | **100%** | Were: AEAD tag-length bound, HKDF length, HMAC-SHA512, accessors, MemoryStorage abort/clear |
 
 Round-trip, tamper, and a handful of deserialize tests are all present and all passing. They do not pin the outer skip bound, the skipped-count ceiling, skipped-key cardinality after a real skip, or zeroization.
 
@@ -292,9 +293,10 @@ rejecting paths too. Two files, two independent runs, one consistent gap.
 ### Still unmeasured
 
 The other ~835 mutants under `src/ratchet/**` (hybrid and header-encrypt
-profiles, `spqr/`, `braid/`, `triple/`), remaining `src/primitives/` (except
-xeddsa), and the rest of `src/storage/` (`mod.rs`, `monotonic.rs`,
-`trusted_anchor.rs`). The v1 exit criterion is ≥ 85% across all of them.
+profiles, `spqr/`, `braid/`, `triple/`) and `src/primitives/mlkem_inc.rs`
+(Braid incremental KEM, not on the v1 default surface). The v1 exit criterion
+is ≥ 85% across the **v1** surface. That surface is now measured. The gated
+ratchet profiles are not part of v1.
 
 ## `src/pqxdh/mod.rs` — 100% (2026-09-08)
 
@@ -407,6 +409,39 @@ same-instance `get`/`keys` after commit (kills `apply_staged` → `()`), abort
 then begin, empty follow-up commit, empty/oversized keys on `put`/`delete`/
 `append_record`, V1 magic → `InvalidNonce`, truncated snapshot error variants,
 `decode_map` count/key/value headers.
+
+## Default primitives + small storage — 100% (2026-09-08)
+
+One run, `--lib` only. `mlkem_inc.rs` is out (hybrid/Braid, not v1).
+
+```text
+cargo mutants -j 2 -o mutants-primitives.out -- --lib \
+  -f src/primitives/aead.rs -f src/primitives/kdf.rs -f src/primitives/x25519.rs \
+  -f src/primitives/encoding.rs -f src/primitives/signature.rs \
+  -f src/primitives/zeroizing.rs -f src/primitives/random.rs \
+  -f src/primitives/kem.rs -f src/primitives/error.rs \
+  -f src/storage/mod.rs -f src/storage/monotonic.rs -f src/storage/trusted_anchor.rs
+```
+
+| Run | Examined | Caught | Missed | Unviable | Score |
+|---|---|---|---|---|---|
+| Baseline | 184 | 99 | 52 | 33 | **65.6%** |
+| After killing tests and Drop excludes | 181 | 148 | 0 | 33 | **100%** |
+
+`x25519`, `kem`, `error`, `monotonic`, and `trusted_anchor` had no missed mutants on the baseline. The 52 were unused accessors and a few real bounds:
+
+| Cluster | Killing tests |
+|---|---|
+| AES-GCM / XChaCha `ciphertext.len() < TAG_LEN` → `==` / `<=` | `empty_plaintext_roundtrips_at_exact_tag_length` |
+| `encode_kem` / `decode_kem` id and `1 + PUBLIC_LEN` | `encode_kem_roundtrip_and_rejects_wrong_id` |
+| HKDF empty / exact `255*32` / `*` → `+` / `hkdf_expand -> Ok(())` | `hkdf_rejects_empty_and_accepts_exact_max`, `hkdf_expand_matches_extract_with_empty_salt` |
+| `hmac_sha512 -> [0; 64]` | `hmac_sha512_rfc4231_case1` (RFC 4231 case 1) |
+| `random_32 -> Ok([0; 32])` | `random_32_is_not_a_constant` |
+| Ed25519 `to_bytes` | `to_bytes_roundtrips_seed_and_public_key` |
+| `SecretBytes` len / `as_ref` / `zeroize_now` / `from_slice` / deref | zeroizing unit tests |
+| `MemoryStorage` abort / `clear` / inherent `keys` / `last_seen` / `zeroize_staged` | storage unit tests |
+
+Excluded, not missed: `Drop` for `StateBlob`, `SignatureSecret`, and `ZeroizingScope`. Same rationale as the other wipe-on-drop impls. `state_blob_zeroize_clears_bytes` pins the `Zeroize` impl those drops call.
 
 ## src/storage/coordinated.rs — 2026-08-28 (review)
 

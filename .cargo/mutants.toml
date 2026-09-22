@@ -36,10 +36,10 @@ exclude_globs = ["src/testing/**", "src/bin/**", "src/ffi/jni.rs"]
 # thing it measures.
 #
 # These are excluded rather than "killed". The behaviour they delegate to IS
-# tested: `skipped_keys_zeroize_clears_the_store` asserts `SkippedKeys::zeroize`
-# actually empties the store, and `shared_secret_zeroize_clears_sk_and_ad`
-# asserts `PqxdhSharedSecret::zeroize` clears the secret and AD. The only
-# untested claim left is the one-line delegation from `drop` to `zeroize`.
+# tested: `skipped_keys_zeroize_clears_the_store`, `shared_secret_zeroize_clears_sk_and_ad`,
+# `state_blob_zeroize_clears_bytes`, and the live `zeroize_now` / `secure_zero*` helpers.
+# `SignatureSecret`'s `Drop` only wipes a stack copy of `to_bytes()`. The only
+# untested claim left is the one-line delegation from `drop` to that wipe.
 #
 # Reviewed 2026-08-28. Revisit if a drop-observability harness (tracking
 # allocator, or a sentinel type) is ever added.
@@ -48,6 +48,9 @@ exclude_re = [
     "impl Drop for SkippedMutationJournal",
     "impl Drop for PqxdhSharedSecret",
     "impl Drop for EncryptedFileStorage",
+    "impl Drop for StateBlob",
+    "impl Drop for SignatureSecret",
+    "impl Drop for ZeroizingScope",
     # Windows directory fsync is best-effort: PermissionDenied / os error 5
     # already returns Ok after the snapshot file has been sync_all'd and
     # renamed. Tests cannot inject a directory-handle failure, so every

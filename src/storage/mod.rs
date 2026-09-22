@@ -282,5 +282,62 @@ mod tests {
         let mut keys = TransactionalStorage::keys(&store).unwrap();
         keys.sort();
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+        let mut inherent = store.keys();
+        inherent.sort();
+        assert_eq!(inherent, keys);
+    }
+
+    #[test]
+    fn abort_without_a_transaction_fails_and_wrong_id_does_not_discard() {
+        let mut store = MemoryStorage::default();
+        assert!(store.abort(TransactionId(1)).is_err());
+        let tx = store.begin().unwrap();
+        store
+            .put(tx, b"k", &StateBlob(b"kept".to_vec()))
+            .unwrap();
+        assert!(store.abort(TransactionId(tx.0.wrapping_add(9))).is_err());
+        store.commit(tx).unwrap();
+        assert_eq!(store.get(b"k").unwrap().unwrap().0, b"kept");
+    }
+
+    #[test]
+    fn clear_wipes_committed_and_staged() {
+        let mut store = MemoryStorage::default();
+        let tx = store.begin().unwrap();
+        store.put(tx, b"k", &StateBlob(b"v".to_vec())).unwrap();
+        store.commit(tx).unwrap();
+        let tx = store.begin().unwrap();
+        store
+            .put(tx, b"staged", &StateBlob(b"nope".to_vec()))
+            .unwrap();
+        store.clear();
+        assert!(store.get(b"k").unwrap().is_none());
+        assert!(store.keys().is_empty());
+        let tx = store.begin().expect("clear must drop the open transaction");
+        store.abort(tx).unwrap();
+    }
+
+    #[test]
+    fn zeroize_staged_clears_the_map() {
+        let mut staged = std::collections::HashMap::new();
+        staged.insert(b"k".to_vec(), Some(b"secret".to_vec()));
+        zeroize_staged(&mut staged);
+        assert!(staged.is_empty());
+    }
+
+    #[test]
+    fn state_blob_zeroize_clears_bytes() {
+        let mut blob = StateBlob(vec![9, 8, 7]);
+        blob.zeroize();
+        assert!(blob.0.is_empty());
+    }
+
+    #[test]
+    fn rollback_guard_reports_the_highest_epoch() {
+        let mut g = RollbackGuard::default();
+        assert_eq!(g.last_seen(), 0);
+        g.observe(StorageEpoch(3)).unwrap();
+        g.observe(StorageEpoch(5)).unwrap();
+        assert_eq!(g.last_seen(), 5);
     }
 }

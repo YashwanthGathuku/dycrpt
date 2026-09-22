@@ -88,6 +88,21 @@ mod tests {
     }
 
     #[test]
+    fn to_bytes_roundtrips_seed_and_public_key() {
+        let seed = [7u8; 32];
+        let sk = SignatureSecret::from_bytes(&seed).unwrap();
+        assert_eq!(sk.to_bytes(), seed);
+        let pk = sk.public_key();
+        let raw = pk.to_bytes();
+        assert_ne!(raw, [0u8; 32]);
+        assert_ne!(raw, [1u8; 32]);
+        assert_eq!(
+            SignaturePublic::from_bytes(&raw).unwrap().to_bytes(),
+            raw
+        );
+    }
+
+    #[test]
     fn invalid_public_key() {
         // All-zero is not a valid compressed Ed25519 point in the usual encoding.
         // Some libraries accept it; we rely on dalek's validation.

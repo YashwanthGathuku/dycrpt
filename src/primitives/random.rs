@@ -38,6 +38,15 @@ mod tests {
     }
 
     #[test]
+    fn random_32_is_not_a_constant() {
+        let a = random_32().unwrap();
+        let b = random_32().unwrap();
+        assert_ne!(a, [0u8; 32]);
+        assert_ne!(a, [1u8; 32]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn fill_random_is_fallible_not_panicking() {
         // Regression guard for the review-2026-08-28 finding: this call site
         // must go through a fallible RNG API. If someone reverts to
