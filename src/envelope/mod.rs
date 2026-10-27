@@ -104,7 +104,7 @@ impl Envelope {
     /// the cleartext envelope when metadata is not encrypted.
     ///
     /// Format (all multi-byte integers little-endian):
-    /// ```
+    /// ```text
     /// version:        u8
     /// suite:          u8
     /// conv_id_len:    u16
